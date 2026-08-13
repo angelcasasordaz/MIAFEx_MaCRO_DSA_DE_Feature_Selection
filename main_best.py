@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Framework de comparacion FS (multi-dataset, multi-run, cache)")
 
     general = parser.add_argument_group("General")
-    general.add_argument("--exp-id", type=int, default=630, help="ID numerico del experimento")
+    general.add_argument("--exp-id", type=int, default=601, help="ID numerico del experimento")
     general.add_argument("--output-root", default=".", help="Raiz para Figures/Results")
 
     dataset = parser.add_argument_group("Dataset")
