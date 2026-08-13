@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PyCharm / IntelliJ local project files
+.idea/
+*.iml
+
+# Generated experiment outputs
+Results/
+Figures/
+outputs/
