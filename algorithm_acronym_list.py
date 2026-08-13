@@ -1,84 +1,76 @@
-"""MEALPY optimizer acronym registry for the installed MEALPY version."""
+"""Optimizer acronym resolution for the installed MEALPY version and project custom optimizers."""
 from __future__ import annotations
 
-from typing import Dict
+from functools import lru_cache
 
 import mealpy
 
 
-CUSTOM_OPTIMIZERS = ["MaCRO-DE", "DSADE", "DSADE_AWAD", "DBO"]
-CUSTOM_OPTIMIZER_KEYS = {name.upper().replace("_", "-"): name for name in CUSTOM_OPTIMIZERS}
-CUSTOM_OPTIMIZER_KEYS["MACRO_DE"] = "MaCRO-DE"
-CUSTOM_OPTIMIZER_KEYS["DSA-DE"] = "DSADE"
-CUSTOM_OPTIMIZER_KEYS["DSADE-AWAD"] = "DSADE_AWAD"
+CUSTOM_OPTIMIZERS = ("MaCRO-DE", "DSADE", "DSADE_AWAD", "DBO")
+CUSTOM_OPTIMIZER_ALIASES = {
+    "MACRO-DE": "MaCRO-DE",
+    "MACRO_DE": "MaCRO-DE",
+    "DSADE": "DSADE",
+    "DSA-DE": "DSADE",
+    "DSA_DE": "DSADE",
+    "DSADE_AWAD": "DSADE_AWAD",
+    "DSADE-AWAD": "DSADE_AWAD",
+    "DBO": "DBO",
+}
 
 
-def _installed_optimizer_names() -> set[str]:
-    return set(mealpy.get_all_optimizers(verbose=False).keys())
+@lru_cache(maxsize=1)
+def _available_optimizer_names() -> dict[str, str]:
+    optimizers = mealpy.get_all_optimizers(verbose=False)
+    return {optimizer_name.casefold(): optimizer_name for optimizer_name in optimizers.keys()}
 
 
-def _build_mealpy_registry() -> Dict[str, str]:
-    installed = _installed_optimizer_names()
-    registry = {}
-    for class_name in installed:
-        if class_name.startswith("Original") and len(class_name) > len("Original"):
-            acronym = class_name[len("Original"):].upper()
-            registry.setdefault(acronym, class_name)
-
-    preferred = {
-        "PSO": "OriginalPSO",
-        "GWO": "OriginalGWO",
-        "WOA": "OriginalWOA",
-        "DE": "OriginalDE",
-        "HHO": "OriginalHHO",
-        "FOX": "OriginalFOX",
-        "RIME": "OriginalRIME",
-        "RUN": "OriginalRUN",
-    }
-    for acronym, class_name in preferred.items():
-        if class_name in installed:
-            registry[acronym] = class_name
-    return dict(sorted(registry.items()))
-
-
-MEALPY_OPTIMIZER_REGISTRY = _build_mealpy_registry()
-_MEALPY_CLASS_NAMES = _installed_optimizer_names()
+def _resolve_custom_optimizer(name: str) -> str | None:
+    key = str(name).strip().upper()
+    return CUSTOM_OPTIMIZER_ALIASES.get(key)
 
 
 def resolve_optimizer_name(name: str) -> str:
-    raw = str(name)
-    key = raw.upper()
-    custom_key = key.replace("_", "-")
-    if custom_key in CUSTOM_OPTIMIZER_KEYS:
-        return CUSTOM_OPTIMIZER_KEYS[custom_key]
-    if key in CUSTOM_OPTIMIZER_KEYS:
-        return CUSTOM_OPTIMIZER_KEYS[key]
-    if key in MEALPY_OPTIMIZER_REGISTRY:
-        return MEALPY_OPTIMIZER_REGISTRY[key]
-    if raw in _MEALPY_CLASS_NAMES:
-        return raw
-    matching = next((class_name for class_name in _MEALPY_CLASS_NAMES if class_name.upper() == key), None)
-    if matching is not None:
-        return matching
-    raise ValueError(f"Optimizador no soportado o no instalado en MEALPY: {raw}")
+    """Return the installed MEALPY class name or canonical project custom optimizer name."""
+    raw_name = str(name).strip()
+    custom_name = _resolve_custom_optimizer(raw_name)
+    if custom_name is not None:
+        return custom_name
+
+    candidates = [
+        raw_name,
+        f"Original{raw_name}",
+        f"Base{raw_name}",
+        f"Dev{raw_name}",
+    ]
+    available_names = _available_optimizer_names()
+    for candidate in candidates:
+        resolved_name = available_names.get(candidate.casefold())
+        if resolved_name is not None:
+            return resolved_name
+
+    raise ValueError(f"Unknown MEALPY optimizer '{name}'. Tried: {', '.join(candidates)}")
 
 
 def optimizer_acronym(name: str) -> str:
-    resolved = resolve_optimizer_name(name)
-    for acronym, class_name in MEALPY_OPTIMIZER_REGISTRY.items():
-        if class_name == resolved:
-            return acronym
-    if resolved in CUSTOM_OPTIMIZERS:
-        return resolved
-    if resolved.startswith("Original") and len(resolved) > len("Original"):
-        return resolved[len("Original"):].upper()
-    return resolved
+    """Return the user-facing acronym/name for plots, tables, and console output."""
+    resolved_name = resolve_optimizer_name(name)
+    if resolved_name in CUSTOM_OPTIMIZERS:
+        return resolved_name
+    if resolved_name.startswith("Original") and len(resolved_name) > len("Original"):
+        return resolved_name[len("Original"):]
+    return resolved_name
 
 
 def list_available_optimizers() -> str:
-    lines = []
-    for acronym, class_name in MEALPY_OPTIMIZER_REGISTRY.items():
-        lines.append(f"{acronym:<8} -> {class_name}")
+    """List installed MEALPY optimizers plus project custom optimizers."""
+    rows = []
+    for optimizer_name in sorted(_available_optimizer_names().values(), key=str.casefold):
+        display_name = optimizer_acronym(optimizer_name)
+        rows.append((display_name, optimizer_name))
+
+    width = max((len(display_name) for display_name, _ in rows), default=0)
+    lines = [f"{display_name:<{width}} -> {optimizer_name}" for display_name, optimizer_name in rows]
     lines.append("")
     lines.append("Custom:")
     lines.extend(CUSTOM_OPTIMIZERS)
