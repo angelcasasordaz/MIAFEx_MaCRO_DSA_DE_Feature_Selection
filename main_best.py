@@ -1,14 +1,43 @@
 import argparse
 import hashlib
+import importlib
+import importlib.util
+import importlib.metadata
 import json
 import logging
 import os
 import pickle
+import sys
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import inspect
 from typing import Dict, List
+
+SUPPORTED_PYTHON = (3, 13, 15)
+DEFAULT_COMPUTE_MODE = "torch-gpu"
+DEFAULT_ML_BACKEND = "auto"
+COMPUTE_MODES = ("cpu", "torch-gpu", "gpu-full")
+ML_BACKENDS = ("auto", "sklearn", "cuml")
+
+
+def check_python_version() -> bool:
+    """Warn early when the interpreter does not match the supported environment."""
+    supported = sys.version_info[:3] == SUPPORTED_PYTHON
+    if not supported:
+        warnings.warn(
+            "MIAFEx targets Python 3.13.15 for the pinned dependency set; "
+            f"the current interpreter is Python {sys.version_info.major}."
+            f"{sys.version_info.minor}.{sys.version_info.micro}. "
+            "Recreate .venv with Python 3.13.15 before installing requirements.txt.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return supported
+
+
+PYTHON_VERSION_SUPPORTED = check_python_version()
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -104,6 +133,152 @@ class Paths:
     res_dir: str
     cache_dir: str
 
+
+@dataclass(frozen=True)
+class BackendAvailability:
+    torch_installed: bool
+    torch_cuda_available: bool
+    gpu_device_name: str | None
+    cupy_available: bool
+    cuml_available: bool
+    torch_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    compute_mode: str
+    requested_ml_backend: str
+    selected_ml_backend: str
+    miafex_device: str
+    availability: BackendAvailability
+
+
+def _module_available(module_name: str) -> bool:
+    """Check an optional dependency without importing or initializing it."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _package_version(distribution_name: str) -> str:
+    try:
+        return importlib.metadata.version(distribution_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def detect_backend_availability() -> BackendAvailability:
+    """Detect GPU capabilities while keeping CuPy and cuML imports lazy."""
+    torch_installed = _module_available("torch")
+    torch_cuda_available = False
+    gpu_device_name = None
+    torch_error = None
+
+    if torch_installed:
+        try:
+            torch = importlib.import_module("torch")
+            torch_cuda_available = bool(torch.cuda.is_available())
+            if torch_cuda_available:
+                gpu_device_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+        except Exception as exc:
+            torch_error = f"{type(exc).__name__}: {exc}"
+
+    return BackendAvailability(
+        torch_installed=torch_installed,
+        torch_cuda_available=torch_cuda_available,
+        gpu_device_name=gpu_device_name,
+        cupy_available=_module_available("cupy"),
+        cuml_available=_module_available("cuml"),
+        torch_error=torch_error,
+    )
+
+
+def resolve_execution_config(args: argparse.Namespace) -> ExecutionConfig:
+    availability = detect_backend_availability()
+    miafex_device = "cpu"
+    if args.compute_mode in {"torch-gpu", "gpu-full"} and availability.torch_cuda_available:
+        miafex_device = "cuda"
+
+    # Keep the established sklearn classifiers until explicit cuML adapters exist.
+    selected_ml_backend = "sklearn" if args.ml_backend == "auto" else args.ml_backend
+    return ExecutionConfig(
+        compute_mode=args.compute_mode,
+        requested_ml_backend=args.ml_backend,
+        selected_ml_backend=selected_ml_backend,
+        miafex_device=miafex_device,
+        availability=availability,
+    )
+
+
+def print_backend_report(config: ExecutionConfig) -> None:
+    availability = config.availability
+    python_status = "supported" if PYTHON_VERSION_SUPPORTED else "unsupported; use Python 3.13.15"
+    print("=" * 60)
+    print(" Execution backend")
+    print("=" * 60)
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    print(f"{'Python':<24}: {python_version} ({python_status})")
+    for label, distribution_name in (
+        ("NumPy", "numpy"),
+        ("SciPy", "scipy"),
+        ("pandas", "pandas"),
+        ("scikit-learn", "scikit-learn"),
+        ("matplotlib", "matplotlib"),
+        ("MAFESE", "mafese"),
+        ("MEALPY", "mealpy"),
+        ("Permetrics", "permetrics"),
+        ("PyTorch", "torch"),
+        ("torchvision", "torchvision"),
+        ("transformers", "transformers"),
+        ("timm", "timm"),
+    ):
+        print(f"{label:<24}: {_package_version(distribution_name)}")
+    print(f"{'PyTorch CUDA available':<24}: {'yes' if availability.torch_cuda_available else 'no'}")
+    print(f"{'GPU device':<24}: {availability.gpu_device_name or 'none detected'}")
+    print(f"{'CuPy available':<24}: {'yes' if availability.cupy_available else 'no'}")
+    print(f"{'cuML available':<24}: {'yes' if availability.cuml_available else 'no'}")
+    print(f"{'Selected compute mode':<24}: {config.compute_mode}")
+    print(f"{'ML backend request':<24}: {config.requested_ml_backend}")
+    print(f"{'Selected ML backend':<24}: {config.selected_ml_backend}")
+    print(f"{'MIAFEx torch device':<24}: {config.miafex_device}")
+    print(f"{'Feature selection':<24}: CPU (MEALPY/MAFESE unchanged)")
+    print(f"{'Classifier implementation':<24}: sklearn (unchanged)")
+
+    if availability.torch_error:
+        print(f"[backend] PyTorch CUDA detection failed: {availability.torch_error}")
+    if config.compute_mode in {"torch-gpu", "gpu-full"} and not availability.torch_cuda_available:
+        print("[backend] CUDA was requested but is unavailable; using the project's existing CPU fallback.")
+    if config.compute_mode == "gpu-full":
+        if not availability.cupy_available:
+            print("[backend] gpu-full: CuPy is not installed; optional CuPy support is disabled.")
+        if not availability.cuml_available:
+            print("[backend] gpu-full: cuML is not installed; optional cuML support is disabled.")
+        print("[backend] gpu-full is capability-only for now; optimizer and classifier logic is unchanged.")
+    if config.selected_ml_backend == "cuml":
+        print("[backend] cuML was selected as a future backend; classifiers remain sklearn until adapters are implemented.")
+    print("=" * 60)
+
+
+def validate_execution_config(config: ExecutionConfig) -> None:
+    if config.selected_ml_backend != "cuml":
+        return
+    if config.compute_mode != "gpu-full":
+        raise ValueError("--ml-backend cuml requires --compute-mode gpu-full.")
+    if not config.availability.cuml_available:
+        raise RuntimeError(
+            "--ml-backend cuml was requested, but cuML is not installed. "
+            "Select auto/sklearn or install a CUDA-compatible cuML build after checking the driver/CUDA version."
+        )
+    try:
+        importlib.import_module("cuml")
+    except Exception as exc:
+        raise RuntimeError(
+            "--ml-backend cuml was requested and the module was found, but it could not be imported. "
+            "Check that the cuML build matches the NVIDIA driver and CUDA environment."
+        ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Framework de comparacion FS (multi-dataset, multi-run, cache)")
 
@@ -139,6 +314,23 @@ def parse_args() -> argparse.Namespace:
     feature_selection.add_argument("--pop-size", type=int, default=50, help="Tamano de poblacion")
 
     execution = parser.add_argument_group("Execution")
+    execution.add_argument(
+        "--compute-mode",
+        default=DEFAULT_COMPUTE_MODE,
+        choices=COMPUTE_MODES,
+        help="Backend mode: cpu, torch-gpu (recommended), or gpu-full (optional capability detection)",
+    )
+    execution.add_argument(
+        "--ml-backend",
+        default=DEFAULT_ML_BACKEND,
+        choices=ML_BACKENDS,
+        help="ML backend selector; auto preserves sklearn, cuml is a future integration hook",
+    )
+    execution.add_argument(
+        "--show-backends",
+        action="store_true",
+        help="Print Python/GPU/backend availability and exit without running an experiment",
+    )
     execution.add_argument("--seed-base", type=int, default=1234, help="Semilla base por run")
     execution.add_argument("--reuse-cache", action="store_true", help="Usar cache si existe")
     execution.add_argument("--figures-only", action="store_true", help="Regenerar solo graficas desde cache existente")
@@ -310,7 +502,7 @@ def resolve_miafex_csv(args: argparse.Namespace) -> str:
                 num_epochs=args.miafex_epochs,
                 batch_size=args.miafex_batch_size,
                 learning_rate=args.miafex_learning_rate,
-                device=None,
+                device=args.miafex_device,
             )
         elif not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(
@@ -327,7 +519,7 @@ def resolve_miafex_csv(args: argparse.Namespace) -> str:
                 checkpoint_path=checkpoint_path,
                 output_dir=args.miafex_output,
                 batch_size=args.miafex_batch_size,
-                device=None,
+                device=args.miafex_device,
                 run_ml_baselines=False,
             )
         else:
@@ -1615,6 +1807,14 @@ def main():
     args = parse_args()
     logging.disable(logging.INFO)
     logging.getLogger("mealpy").setLevel(logging.WARNING)
+
+    execution_config = resolve_execution_config(args)
+    print_backend_report(execution_config)
+    validate_execution_config(execution_config)
+    args.miafex_device = execution_config.miafex_device
+
+    if args.show_backends:
+        return
 
     if args.list_miafex_datasets:
         print_miafex_datasets(discover_miafex_datasets())

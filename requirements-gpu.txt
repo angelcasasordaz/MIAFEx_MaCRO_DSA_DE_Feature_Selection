@@ -1,0 +1,5 @@
+# Optional GPU-only dependencies for gpu-full.
+#
+# CuPy and cuML are intentionally not listed or pinned yet. Their package/channel
+# selection must match the target NVIDIA driver and CUDA environment. The current
+# gpu-full mode only detects these optional modules and does not use them.
