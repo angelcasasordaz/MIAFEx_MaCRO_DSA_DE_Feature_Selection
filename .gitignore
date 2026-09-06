@@ -225,3 +225,19 @@ __marimo__/
 Results/
 Figures/
 outputs/
+
+# Local datasets and generated MIAFEx artifacts
+datasets/**
+!datasets/**/.gitkeep
+
+checkpoints/**
+!checkpoints/**/.gitkeep
+
+datasets_features/**
+!datasets_features/**/.gitkeep
+
+dataset_audit/
+diagnostics/
+
+# Python/runtime cache
+*.py[cod]

@@ -1,3 +1,5 @@
+# MIAFEx + Metaheuristic Feature Selection Framework
+# Standard library imports
 import argparse
 import hashlib
 import importlib
@@ -8,37 +10,16 @@ import logging
 import os
 import pickle
 import sys
+import tempfile
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import ExitStack
 from dataclasses import dataclass
 import inspect
 from typing import Dict, List
 
-SUPPORTED_PYTHON = (3, 13, 15)
-DEFAULT_COMPUTE_MODE = "torch-gpu"
-DEFAULT_ML_BACKEND = "auto"
-COMPUTE_MODES = ("cpu", "torch-gpu", "gpu-full")
-ML_BACKENDS = ("auto", "sklearn", "cuml")
-
-
-def check_python_version() -> bool:
-    """Warn early when the interpreter does not match the supported environment."""
-    supported = sys.version_info[:3] == SUPPORTED_PYTHON
-    if not supported:
-        warnings.warn(
-            "MIAFEx targets Python 3.13.15 for the pinned dependency set; "
-            f"the current interpreter is Python {sys.version_info.major}."
-            f"{sys.version_info.minor}.{sys.version_info.micro}. "
-            "Recreate .venv with Python 3.13.15 before installing requirements.txt.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    return supported
-
-
-PYTHON_VERSION_SUPPORTED = check_python_version()
-
+# Third-party imports
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
@@ -51,6 +32,7 @@ from sklearn.base import clone
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
+# Local project imports
 from dbo_optimizer import DBOOptimizer
 from dsade_optimizer import DSADE
 from dsade_awad_optimizer import DSADE_AWAD
@@ -70,35 +52,115 @@ except Exception as exc:
     extract_miafex_features = None
     MIAFEX_IMPORT_ERROR = exc
 
-plt.rcParams.update({
-    "figure.facecolor": "white",
-    "axes.facecolor": "white",
-    "savefig.facecolor": "white",
-})
+def available_memory_bytes() -> int | None:
+    """Available RAM (not total RAM), or None if the OS cannot report it."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return max(0, int(line.split()[1]) * 1024)
+    except (OSError, ValueError):
+        pass
+    try:
+        return max(0, int(importlib.import_module("psutil").virtual_memory().available))
+    except (ImportError, AttributeError, OSError, ValueError):
+        pass
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages >= 0 and page_size > 0:
+            return int(pages * page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
 
-DEFAULT_OPTIMIZERS = [
-    "PSO",
-    "GWO",
-    "WOA",
+
+def automatic_worker_count() -> int:
+    """Cap workers by usable CPUs and available RAM; always allow one worker."""
+    cpus = os.cpu_count() or 1
+    try:
+        cpus = min(cpus, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    cpu_limit = max(1, int(cpus * AUTO_WORKER_CPU_FRACTION))
+    available = available_memory_bytes()
+    if available is None:
+        return cpu_limit
+    ram_limit = max(1, (available - AUTO_RAM_RESERVE_BYTES) // AUTO_WORKER_RAM_BYTES)
+    return min(cpu_limit, ram_limit)
+
+
+# User-editable configuration: the controlled test used by PyCharm's Run action.
+# Dataset and pipeline
+DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
+PIPELINE_MODE = "feature_selection"  # Existing CSVs only; also supports "extract" and "full".
+MIAFEX_DATASETS = None
+# ["Brain_MRI"]
+# None: all valid discovered datasets.
+MAFESE_DATASET_SUITE = "test14"
+
+# MIAFEx artifacts and neural-network settings
+MIAFEX_DATASET_ROOT = "datasets"
+MIAFEX_CHECKPOINT_ROOT = "checkpoints/miafex"
+FEATURE_DATASET_ROOT = "datasets_features/miafex"
+MIAFEX_TRAIN = "auto"  # Options: "auto", "yes", "no"
+MIAFEX_EXTRACT = "auto"  # Options: "auto", "yes", "no"
+MIAFEX_EPOCHS = 10  # Neural-network training epochs.
+MIAFEX_BATCH_SIZE = 8
+MIAFEX_LEARNING_RATE = 1e-5
+
+# Feature selection: supported optimizers/classifiers remain available via config/CLI.
+OPTIMIZERS = [
     "DE",
-    "HHO",
-    "FOX",
-    "RIME",
-    "RUN",
+    "JADE",
+    "SHADE",
+    # "PSO",
+    # "GWO",
+    # "WOA",
+    # "HHO",
+    # "BRO",
+    # "DBO",
+    # "FLA",
     "MaCRO-DE",
-    "DSADE",
 ]
-DEFAULT_ESTIMATORS = ["knn", "svm"]
-DEFAULT_TRANSFER_FUNCTIONS = [
-    "vstf_01",
-    "vstf_02",
-    "vstf_03",
-    "vstf_04",
-    "sstf_01",
-    "sstf_02",
-    "sstf_03",
-    "sstf_04",
-]
+ESTIMATORS = ["knn", "svm"]
+TRANSFER_FUNCTIONS = ["vstf_01"]
+RUNS = 20
+FS_EPOCHS = 150  # Metaheuristic feature-selection iterations.
+POP_SIZE = 50
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+SEED_BASE = 1234
+DSADE_BETA_MIN = 0.2
+DSADE_BETA_MAX = 0.8
+DSADE_PCR = 0.2
+DSADE_MAHAL_Q = 0.68
+
+# Experiment and cache reuse
+EXP_ID = 602
+REUSE_CACHE = True
+REUSE_CACHE_FROM_EXP_ID = 602  # None: current EXP only; another ID: read-only fallback.
+FIGURES_ONLY = False
+
+# Workers: native BLAS/OpenMP thread settings are deliberately unchanged.
+PARALLEL = True
+AUTO_WORKER_CPU_FRACTION = 2 / 3
+AUTO_WORKER_RAM_BYTES = 192 * 1024**2
+AUTO_RAM_RESERVE_BYTES = 512 * 1024**2
+N_WORKERS = automatic_worker_count()  # Also capped by pending runs at execution time.
+PROGRESS_INTERVAL_SECONDS = 60.0
+
+# Backend and output
+DEFAULT_COMPUTE_MODE = "torch-gpu"
+DEFAULT_ML_BACKEND = "auto"
+OUTPUT_ROOT = "."
+
+# Supported values and compatibility aliases (edit the configuration above).
+COMPUTE_MODES = ("cpu", "torch-gpu", "gpu-full")
+ML_BACKENDS = ("auto", "sklearn", "cuml")
+DEFAULT_OPTIMIZERS = OPTIMIZERS
+DEFAULT_ESTIMATORS = ESTIMATORS
+DEFAULT_TRANSFER_FUNCTIONS = TRANSFER_FUNCTIONS
 
 TEST_datasets_clasific_14 = [
     "BreastCancer",
@@ -126,6 +188,14 @@ SUPPORTED_TRANSFER_FUNCTIONS = [
     "sstf_04",
 ]
 
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+})
+
+
+# Helper types and validation functions
 @dataclass
 class Paths:
     exp_tag: str
@@ -213,12 +283,11 @@ def resolve_execution_config(args: argparse.Namespace) -> ExecutionConfig:
 
 def print_backend_report(config: ExecutionConfig) -> None:
     availability = config.availability
-    python_status = "supported" if PYTHON_VERSION_SUPPORTED else "unsupported; use Python 3.13.15"
     print("=" * 60)
     print(" Execution backend")
     print("=" * 60)
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    print(f"{'Python':<24}: {python_version} ({python_status})")
+    print(f"{'Python':<24}: {python_version}")
     for label, distribution_name in (
         ("NumPy", "numpy"),
         ("SciPy", "scipy"),
@@ -279,39 +348,53 @@ def validate_execution_config(config: ExecutionConfig) -> None:
         ) from exc
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Framework de comparacion FS (multi-dataset, multi-run, cache)")
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="MIAFEx feature datasets + MAFESE/MEALPY feature selection",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
     general = parser.add_argument_group("General")
-    general.add_argument("--exp-id", type=int, default=601, help="ID numerico del experimento")
-    general.add_argument("--output-root", default=".", help="Raiz para Figures/Results")
+    general.add_argument("--exp-id", type=int, default=EXP_ID, help="ID numerico del experimento")
+    general.add_argument("--output-root", default=OUTPUT_ROOT, help="Raiz para Figures/Results")
+    general.add_argument("--pipeline-mode", default=PIPELINE_MODE, choices=["extract", "feature_selection", "full"],
+                         help="extract: prepare/reuse features only; feature_selection: existing CSVs only; full: both stages")
 
     dataset = parser.add_argument_group("Dataset")
-    dataset.add_argument("--dataset-source", default="mafese", choices=["mafese", "miafex"], help="Origen de datasets")
-    dataset.add_argument("--dataset-suite", default="test14", choices=["test14"], help="Suite de datasets")
-    dataset.add_argument("--dataset-name", default=None, help="Nombre del dataset cuando --dataset-source=miafex")
-    dataset.add_argument("--features-csv", default=None, help="CSV de features generado por MIAFEx")
-    dataset.add_argument("--list-miafex-datasets", action="store_true", help="Listar datasets MIAFEx disponibles en datasets/")
-    dataset.add_argument("--test-size", type=float, default=0.2, help="Holdout ratio")
-    dataset.add_argument("--random-state", type=int, default=2, help="Semilla de split")
+    dataset.add_argument("--dataset-source", default=DATASET_SOURCE, choices=["mafese", "miafex"], help="Origen de datasets")
+    dataset.add_argument("--dataset-suite", default=MAFESE_DATASET_SUITE, choices=["test14"], help="Suite de datasets")
+    selection = dataset.add_mutually_exclusive_group()
+    selection.add_argument("--dataset-name", default=None, help="Seleccionar un unico dataset MIAFEx")
+    selection.add_argument("--miafex-datasets", nargs="+", default=MIAFEX_DATASETS,
+                           help="Seleccionar datasets MIAFEx; None usa todos los descubiertos")
+    dataset.add_argument("--features-csv", default=None,
+                         help="Ubicacion legacy: usa train_features.csv y test_features.csv junto a esta ruta; nunca divide un CSV unico")
+    dataset.add_argument("--train-features-csv", default=None, help="Override del CSV de entrenamiento MIAFEx para un unico dataset")
+    dataset.add_argument("--test-features-csv", default=None, help="Override del CSV de prueba MIAFEx para un unico dataset")
+    dataset.add_argument("--list-miafex-datasets", action="store_true", help="Listar datasets de imagenes validos bajo --miafex-dataset-root")
+    dataset.add_argument("--test-size", type=float, default=TEST_SIZE, help="Holdout ratio")
+    dataset.add_argument("--random-state", type=int, default=RANDOM_STATE, help="Semilla de split")
 
     miafex = parser.add_argument_group("MIAFEx")
     miafex.add_argument("--dataset-root", default=None, help="Raiz del dataset MIAFEx con subdirectorios train/ y test/")
-    miafex.add_argument("--train-miafex", default="no", choices=["yes", "no"], help="Entrenar MIAFEx antes de MEALPY")
-    miafex.add_argument("--extract-miafex", default="no", choices=["yes", "no"], help="Extraer features MIAFEx antes de MEALPY")
-    miafex.add_argument("--miafex-output", default="./outputs/miafex", help="Directorio para artefactos MIAFEx")
-    miafex.add_argument("--miafex-epochs", type=int, default=10, help="Epocas para entrenar MIAFEx")
-    miafex.add_argument("--miafex-batch-size", type=int, default=16, help="Batch size para MIAFEx")
-    miafex.add_argument("--miafex-learning-rate", type=float, default=1e-5, help="Learning rate para MIAFEx")
+    miafex.add_argument("--miafex-dataset-root", default=MIAFEX_DATASET_ROOT, help="Raiz que contiene los datasets de imagenes")
+    miafex.add_argument("--miafex-checkpoint-root", default=MIAFEX_CHECKPOINT_ROOT, help="Raiz de checkpoints; un subdirectorio por dataset")
+    miafex.add_argument("--feature-dataset-root", default=FEATURE_DATASET_ROOT, help="Raiz de features reutilizables; un subdirectorio por dataset")
+    miafex.add_argument("--train-miafex", default=MIAFEX_TRAIN, choices=["auto", "yes", "no"], help="auto: reutilizar checkpoint existente; yes: entrenar; no: no entrenar")
+    miafex.add_argument("--extract-miafex", default=MIAFEX_EXTRACT, choices=["auto", "yes", "no"], help="auto: reutilizar CSV existente; yes: extraer; no: exigir CSV existente")
+    miafex.add_argument("--miafex-output", default=None, help="Override compatible del directorio de checkpoint para un unico dataset")
+    miafex.add_argument("--miafex-epochs", type=int, default=MIAFEX_EPOCHS, help="Epocas de entrenamiento de la red neuronal MIAFEx")
+    miafex.add_argument("--miafex-batch-size", type=int, default=MIAFEX_BATCH_SIZE, help="Batch size para MIAFEx")
+    miafex.add_argument("--miafex-learning-rate", type=float, default=MIAFEX_LEARNING_RATE, help="Learning rate para MIAFEx")
 
     feature_selection = parser.add_argument_group("Feature Selection")
-    feature_selection.add_argument("--optimizers", nargs="+", default=list(DEFAULT_OPTIMIZERS), help="Lista de optimizadores")
+    feature_selection.add_argument("--optimizers", nargs="+", default=list(OPTIMIZERS), help="Lista de optimizadores")
     feature_selection.add_argument("--list-optimizers", action="store_true", help="Listar optimizadores MEALPY/custom disponibles")
-    feature_selection.add_argument("--estimators", nargs="+", default=DEFAULT_ESTIMATORS, help="Lista de clasificadores")
-    feature_selection.add_argument("--transfer-functions", nargs="+", default=DEFAULT_TRANSFER_FUNCTIONS, help="Lista de transfer functions")
-    feature_selection.add_argument("--runs", type=int, default=30, help="Ejecuciones independientes por combinacion")
-    feature_selection.add_argument("--epochs", type=int, default=100, help="Iteraciones del optimizador")
-    feature_selection.add_argument("--pop-size", type=int, default=50, help="Tamano de poblacion")
+    feature_selection.add_argument("--estimators", nargs="+", default=list(ESTIMATORS), help="Lista de clasificadores")
+    feature_selection.add_argument("--transfer-functions", nargs="+", default=list(TRANSFER_FUNCTIONS), help="Lista de transfer functions")
+    feature_selection.add_argument("--runs", type=int, default=RUNS, help="Ejecuciones independientes por combinacion")
+    feature_selection.add_argument("--epochs", "--fs-epochs", dest="epochs", type=int, default=FS_EPOCHS, help="Iteraciones de seleccion de features (metaheuristica), no epocas MIAFEx")
+    feature_selection.add_argument("--pop-size", type=int, default=POP_SIZE, help="Tamano de poblacion")
 
     execution = parser.add_argument_group("Execution")
     execution.add_argument(
@@ -331,18 +414,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print Python/GPU/backend availability and exit without running an experiment",
     )
-    execution.add_argument("--seed-base", type=int, default=1234, help="Semilla base por run")
-    execution.add_argument("--reuse-cache", action="store_true", help="Usar cache si existe")
-    execution.add_argument("--figures-only", action="store_true", help="Regenerar solo graficas desde cache existente")
-    execution.add_argument("--parallel", default="yes", choices=["yes", "no"], help="Ejecutar runs en paralelo: yes/no")
-    execution.add_argument("--n-workers", type=int, default=12, help="Numero de procesos paralelos si --parallel yes")
+    execution.add_argument("--seed-base", type=int, default=SEED_BASE, help="Semilla base por run")
+    execution.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=REUSE_CACHE, help="Usar cache si existe")
+    execution.add_argument("--reuse-cache-from-exp-id", type=lambda value: None if value.lower() == "none" else int(value),
+                           default=REUSE_CACHE_FROM_EXP_ID,
+                           help="EXP fuente de solo lectura si no hay cache actual compatible; 'none' desactiva importacion")
+    execution.add_argument("--figures-only", action="store_true", default=FIGURES_ONLY, help="Regenerar solo graficas desde cache existente")
+    execution.add_argument("--parallel", default="yes" if PARALLEL else "no", choices=["yes", "no"], help="Ejecutar runs en paralelo: yes/no")
+    execution.add_argument("--n-workers", type=int, default=N_WORKERS, help="Maximo de procesos; se limita automaticamente a los runs pendientes")
 
     macro_dsade = parser.add_argument_group("MaCRO-DE / DSADE")
-    macro_dsade.add_argument("--dsade-beta-min", type=float, default=0.2)
-    macro_dsade.add_argument("--dsade-beta-max", type=float, default=0.8)
-    macro_dsade.add_argument("--dsade-pcr", type=float, default=0.2)
-    macro_dsade.add_argument("--dsade-mahal-q", type=float, default=0.68)
-    return parser.parse_args()
+    macro_dsade.add_argument("--dsade-beta-min", type=float, default=DSADE_BETA_MIN)
+    macro_dsade.add_argument("--dsade-beta-max", type=float, default=DSADE_BETA_MAX)
+    macro_dsade.add_argument("--dsade-pcr", type=float, default=DSADE_PCR)
+    macro_dsade.add_argument("--dsade-mahal-q", type=float, default=DSADE_MAHAL_Q)
+    return parser.parse_args(argv)
 
 def resolve_optimizers(args: argparse.Namespace) -> List[str]:
     return list(dict.fromkeys(resolve_optimizer_name(name) for name in args.optimizers))
@@ -361,13 +447,14 @@ def validate_selection_options(args: argparse.Namespace) -> None:
             f"Validas: {', '.join(SUPPORTED_TRANSFER_FUNCTIONS)}"
         )
 
-def make_paths(args: argparse.Namespace) -> Paths:
-    exp_tag = f"EXP{args.exp_id:03d}"
+def make_paths(args: argparse.Namespace, *, exp_id: int | None = None, create: bool = True) -> Paths:
+    exp_tag = f"EXP{args.exp_id if exp_id is None else exp_id:03d}"
     fig_dir = os.path.join(args.output_root, "Figures", exp_tag)
     res_dir = os.path.join(args.output_root, "Results", exp_tag)
     cache_dir = os.path.join(res_dir, "cache")
-    for p in (fig_dir, res_dir, cache_dir):
-        os.makedirs(p, exist_ok=True)
+    if create:
+        for p in (fig_dir, res_dir, cache_dir):
+            os.makedirs(p, exist_ok=True)
     return Paths(exp_tag=exp_tag, fig_dir=fig_dir, res_dir=res_dir, cache_dir=cache_dir)
 
 def resolve_mafese_dataset_names(args: argparse.Namespace) -> List[str]:
@@ -376,7 +463,27 @@ def resolve_mafese_dataset_names(args: argparse.Namespace) -> List[str]:
     raise ValueError(f"Suite de datasets no soportada: {args.dataset_suite}")
 
 
-def discover_miafex_datasets(base_dir="datasets") -> Dict[str, str]:
+def valid_miafex_dataset(dataset_root: str) -> bool:
+    """Require matching, populated ImageFolder classes in train and test."""
+    class_names = []
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+    for split in ("train", "test"):
+        folder = os.path.join(dataset_root, split)
+        if not os.path.isdir(folder):
+            return False
+        classes = {item.name: item.path for item in os.scandir(folder)
+                   if item.is_dir() and not item.name.startswith(".")}
+        if not classes or any(
+            not any(filename.lower().endswith(image_extensions)
+                    for _, _, files in os.walk(path) for filename in files)
+            for path in classes.values()
+        ):
+            return False
+        class_names.append(set(classes))
+    return class_names[0] == class_names[1]
+
+
+def discover_miafex_datasets(base_dir=MIAFEX_DATASET_ROOT) -> Dict[str, str]:
     if not os.path.isdir(base_dir):
         return {}
 
@@ -385,20 +492,18 @@ def discover_miafex_datasets(base_dir="datasets") -> Dict[str, str]:
         if not item.is_dir():
             continue
         dataset_root = item.path
-        train_dir = os.path.join(dataset_root, "train")
-        test_dir = os.path.join(dataset_root, "test")
-        if os.path.isdir(train_dir) and os.path.isdir(test_dir):
+        if valid_miafex_dataset(dataset_root):
             discovered[item.name] = dataset_root
     return dict(sorted(discovered.items(), key=lambda row: row[0].lower()))
 
 
-def print_miafex_datasets(datasets: Dict[str, str]) -> None:
+def print_miafex_datasets(datasets: Dict[str, str], base_dir=MIAFEX_DATASET_ROOT) -> None:
     if not datasets:
-        print("No MIAFEx image datasets found in: datasets/")
+        print(f"No MIAFEx image datasets found in: {base_dir}")
         print()
         print("Expected structure:")
-        print("datasets/DatasetName/train/")
-        print("datasets/DatasetName/test/")
+        print(os.path.join(base_dir, "DatasetName", "train", "<class>"))
+        print(os.path.join(base_dir, "DatasetName", "test", "<class>"))
         return
     print("Available MIAFEx datasets:")
     for idx, name in enumerate(datasets, start=1):
@@ -409,19 +514,67 @@ def resolve_miafex_dataset_root(args: argparse.Namespace) -> None:
     if args.dataset_root:
         return
 
-    discovered = discover_miafex_datasets()
+    discovered = discover_miafex_datasets(args.miafex_dataset_root)
     if args.dataset_name in discovered:
         args.dataset_root = discovered[args.dataset_name]
         return
 
     available = ", ".join(discovered.keys()) if discovered else "none"
     raise ValueError(
-        f"Dataset MIAFEx '{args.dataset_name}' no encontrado en datasets/. "
+        f"Dataset MIAFEx '{args.dataset_name}' no encontrado en {args.miafex_dataset_root}. "
         f"Datasets disponibles: {available}"
     )
 
 
-def load_miafex_csv(csv_path: str):
+def resolve_miafex_dataset_args(args: argparse.Namespace) -> Dict[str, argparse.Namespace]:
+    """Select datasets and scope the existing single-dataset options per dataset."""
+    discovered = discover_miafex_datasets(args.miafex_dataset_root)
+    available = dict(discovered)
+    if args.pipeline_mode == "feature_selection" or args.figures_only:
+        # Feature-only runs can work even when the original images are offline.
+        if os.path.isdir(args.feature_dataset_root):
+            for item in os.scandir(args.feature_dataset_root):
+                if item.is_dir() and all(os.path.isfile(os.path.join(item.path, f"{split}_features.csv"))
+                                        for split in ("train", "test")):
+                    available.setdefault(item.name, os.path.join(args.miafex_dataset_root, item.name))
+
+    selected = [args.dataset_name] if args.dataset_name else args.miafex_datasets
+    if selected is None:
+        selected = ([os.path.basename(os.path.normpath(args.dataset_root))] if args.dataset_root
+                    else sorted(available, key=str.lower))
+    if not selected:
+        raise ValueError(f"No MIAFEx datasets selected or discovered under {args.miafex_dataset_root}.")
+    if any(not isinstance(name, str) or name in {".", ".."} or not name
+           or "/" in name or "\\" in name for name in selected):
+        raise ValueError("MIAFEx dataset selections must be directory names, not paths.")
+    selected = list(dict.fromkeys(selected))
+    if len(selected) != 1 and any((args.dataset_root, args.features_csv, args.train_features_csv,
+                                   args.test_features_csv, args.miafex_output)):
+        raise ValueError("Dataset, feature-CSV and checkpoint directory overrides require a single selected dataset.")
+
+    resolved = {}
+    for name in selected:
+        scoped = argparse.Namespace(**vars(args))
+        scoped.dataset_name = name
+        if not scoped.dataset_root:
+            if name in available:
+                scoped.dataset_root = available[name]
+            elif not (scoped.features_csv or (scoped.train_features_csv and scoped.test_features_csv)) and not args.figures_only:
+                raise ValueError(f"Unknown MIAFEx dataset '{name}'. Available: {', '.join(sorted(available)) or 'none'}")
+            else:
+                scoped.dataset_root = os.path.join(args.miafex_dataset_root, name)
+        scoped.miafex_output = args.miafex_output or os.path.join(args.miafex_checkpoint_root, name)
+        feature_dir = (os.path.dirname(args.features_csv) or ".") if args.features_csv else os.path.join(args.feature_dataset_root, name)
+        scoped.train_features_csv = args.train_features_csv or os.path.join(feature_dir, "train_features.csv")
+        scoped.test_features_csv = args.test_features_csv or os.path.join(feature_dir, "test_features.csv")
+        if os.path.realpath(scoped.train_features_csv) == os.path.realpath(scoped.test_features_csv):
+            raise ValueError("Train and test feature CSVs must have different paths.")
+        scoped.features_csv = args.features_csv or scoped.train_features_csv
+        resolved[name] = scoped
+    return resolved
+
+
+def read_miafex_csv(csv_path: str):
     if not csv_path:
         raise ValueError("--features-csv es requerido cuando --dataset-source=miafex")
     if not os.path.isfile(csv_path):
@@ -446,6 +599,14 @@ def load_miafex_csv(csv_path: str):
     except ValueError as exc:
         raise ValueError("Las columnas de features del CSV de MIAFEx deben ser numericas.") from exc
 
+    if not np.isfinite(X).all() or y_series.isna().any():
+        raise ValueError(f"Non-finite features or missing labels in: {csv_path}")
+    return X_df, y_series
+
+
+def load_miafex_csv(csv_path: str):
+    """Read an individual CSV; paired partitions use load_miafex_feature_data."""
+    X_df, y_series = read_miafex_csv(csv_path)
     y_values = y_series.to_numpy()
     if pd.api.types.is_numeric_dtype(y_series):
         y = y_values
@@ -456,80 +617,124 @@ def load_miafex_csv(csv_path: str):
     if classes.size < 2:
         raise ValueError("El CSV de MIAFEx debe contener al menos 2 clases.")
 
-    return X, y
+    return X_df.to_numpy(dtype=np.float64), y
 
 
-def resolve_miafex_csv(args: argparse.Namespace) -> str:
-    run_training = args.train_miafex == "yes"
-    run_extraction = args.extract_miafex == "yes"
+def miafex_feature_paths(args: argparse.Namespace) -> Dict[str, str]:
+    return {"train": args.train_features_csv, "test": args.test_features_csv}
 
-    if (run_training or run_extraction) and MIAFEX_IMPORT_ERROR is not None:
-        raise ImportError(
-            "No se pudieron importar las funciones MIAFEx requeridas para entrenar/extraer. "
-            "Revisa la instalacion de torch/transformers en el entorno."
-        ) from MIAFEX_IMPORT_ERROR
 
-    if not run_extraction:
-        if not args.features_csv:
-            raise ValueError(
-                "--features-csv es requerido cuando --extract-miafex no. "
-                "Usa --extract-miafex yes para generarlo desde dataset-root/test."
-            )
-        if not os.path.isfile(args.features_csv):
-            raise FileNotFoundError(f"CSV de features no encontrado: {os.path.abspath(args.features_csv)}")
-
-    if run_training or run_extraction:
-        if not args.dataset_root:
-            raise ValueError("--dataset-root es requerido cuando --train-miafex yes o --extract-miafex yes")
-        if not os.path.isdir(args.dataset_root):
-            raise FileNotFoundError(f"dataset-root inexistente: {os.path.abspath(args.dataset_root)}")
-
-        train_dir = os.path.join(args.dataset_root, "train")
-        test_dir = os.path.join(args.dataset_root, "test")
-        if not os.path.isdir(train_dir):
-            raise FileNotFoundError(f"Directorio train inexistente: {os.path.abspath(train_dir)}")
-        if not os.path.isdir(test_dir):
-            raise FileNotFoundError(f"Directorio test inexistente: {os.path.abspath(test_dir)}")
-
-        os.makedirs(args.miafex_output, exist_ok=True)
-        checkpoint_path = os.path.join(args.miafex_output, "miafex_checkpoint.pth")
-
-        if run_training:
-            checkpoint_path = train_miafex(
-                train_root=train_dir,
-                output_dir=args.miafex_output,
-                num_classes=None,
-                num_epochs=args.miafex_epochs,
-                batch_size=args.miafex_batch_size,
-                learning_rate=args.miafex_learning_rate,
-                device=args.miafex_device,
-            )
-        elif not os.path.isfile(checkpoint_path):
-            raise FileNotFoundError(
-                "Checkpoint MIAFEx inexistente. Ejecuta con --train-miafex yes o coloca el archivo en: "
-                f"{os.path.abspath(checkpoint_path)}"
-            )
-
-        if not os.path.isfile(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint MIAFEx inexistente: {os.path.abspath(checkpoint_path)}")
-
-        if run_extraction:
-            csv_path = extract_miafex_features(
-                data_dir=test_dir,
-                checkpoint_path=checkpoint_path,
-                output_dir=args.miafex_output,
-                batch_size=args.miafex_batch_size,
-                device=args.miafex_device,
-                run_ml_baselines=False,
-            )
-        else:
-            csv_path = args.features_csv
+def load_miafex_feature_data(csv_paths: Dict[str, str]) -> Data:
+    """Load the prepared partitions directly; never concatenate or resplit them."""
+    X_train, y_train = read_miafex_csv(csv_paths["train"])
+    X_test, y_test = read_miafex_csv(csv_paths["test"])
+    if list(X_train.columns) != list(X_test.columns):
+        raise ValueError("Train/test feature columns must match in both names and order.")
+    if pd.api.types.is_numeric_dtype(y_train) != pd.api.types.is_numeric_dtype(y_test):
+        raise ValueError("Train/test labels must use the same type and class mapping.")
+    if pd.api.types.is_numeric_dtype(y_train):
+        y_train, y_test = y_train.to_numpy(), y_test.to_numpy()
+        if not np.isfinite(y_train).all() or not np.isfinite(y_test).all():
+            raise ValueError("Train/test labels must be finite.")
+        if not set(np.unique(y_test)).issubset(np.unique(y_train)):
+            raise ValueError("Test labels contain classes absent from the training partition.")
     else:
-        csv_path = args.features_csv
+        encoder = LabelEncoder().fit(y_train.astype(str))
+        y_train = encoder.transform(y_train.astype(str))
+        try:
+            y_test = encoder.transform(y_test.astype(str))
+        except ValueError as exc:
+            raise ValueError("Test labels contain classes absent from the training partition.") from exc
+    if np.unique(y_train).size < 2:
+        raise ValueError("The training feature CSV must contain at least two classes.")
+    data = Data()
+    data.set_train_test(
+        X_train=X_train.to_numpy(dtype=np.float64), y_train=y_train,
+        X_test=X_test.to_numpy(dtype=np.float64), y_test=y_test,
+    )
+    return data
 
-    if not os.path.isfile(csv_path):
-        raise FileNotFoundError(f"CSV de features no encontrado: {os.path.abspath(csv_path)}")
-    return csv_path
+
+def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
+    """Prepare/reuse one dataset using the existing training and extraction code."""
+    csv_paths = miafex_feature_paths(args)
+    missing = [path for path in csv_paths.values() if not os.path.isfile(path)]
+    if args.pipeline_mode == "feature_selection":
+        if missing:
+            raise FileNotFoundError(
+                f"Prepared train/test feature CSVs missing: {', '.join(missing)}. "
+                "Generate it with --pipeline-mode extract or full first."
+            )
+        print(f"[features] {args.dataset_name}: reusing {csv_paths} (feature_selection only)")
+        return csv_paths
+
+    checkpoint_path = os.path.join(args.miafex_output, "miafex_checkpoint.pth")
+    run_training = args.train_miafex == "yes" or (args.train_miafex == "auto" and not os.path.isfile(checkpoint_path))
+    run_extraction = args.extract_miafex == "yes" or (args.extract_miafex == "auto" and bool(missing))
+    if not run_extraction and missing:
+        raise FileNotFoundError(f"Prepared feature CSVs missing with --extract-miafex no: {', '.join(missing)}")
+    if run_extraction and not run_training and not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint missing with --train-miafex no: {os.path.abspath(checkpoint_path)}")
+    if run_training or run_extraction:
+        if MIAFEX_IMPORT_ERROR is not None:
+            raise ImportError("MIAFEx training/extraction dependencies could not be imported.") from MIAFEX_IMPORT_ERROR
+        if not valid_miafex_dataset(args.dataset_root):
+            raise ValueError(f"Invalid MIAFEx train/test class folders: {args.dataset_root}")
+
+    if run_training:
+        print(f"[checkpoint] {args.dataset_name}: training for {args.miafex_epochs} neural-network epochs")
+        checkpoint_path = train_miafex(
+            train_root=os.path.join(args.dataset_root, "train"),
+            output_dir=args.miafex_output,
+            num_classes=None,
+            num_epochs=args.miafex_epochs,
+            batch_size=args.miafex_batch_size,
+            learning_rate=args.miafex_learning_rate,
+            device=args.miafex_device,
+        )
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"MIAFEx training did not produce a checkpoint: {checkpoint_path}")
+    elif os.path.isfile(checkpoint_path):
+        print(f"[checkpoint] {args.dataset_name}: reusing {checkpoint_path}")
+
+    if run_extraction:
+        # Stage each split separately: the existing extractor writes fixed names.
+        # Publish only after both extractions and their schema checks succeed.
+        with ExitStack() as stack:
+            staged = {}
+            for split, csv_path in csv_paths.items():
+                output_dir = os.path.dirname(csv_path) or "."
+                os.makedirs(output_dir, exist_ok=True)
+                temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix=f".extract-{split}-", dir=output_dir))
+                print(f"[features] {args.dataset_name}: extracting {split}/ images to {csv_path}")
+                staged[split] = extract_miafex_features(
+                    data_dir=os.path.join(args.dataset_root, split),
+                    checkpoint_path=checkpoint_path,
+                    output_dir=temporary,
+                    batch_size=args.miafex_batch_size,
+                    device=args.miafex_device,
+                    run_ml_baselines=False,
+                )
+            load_miafex_feature_data(staged)
+            mappings = []
+            for path in staged.values():
+                mapping_path = os.path.join(os.path.dirname(path), "class_to_idx.json")
+                if os.path.isfile(mapping_path):
+                    with open(mapping_path, encoding="utf-8") as stream:
+                        mappings.append(json.load(stream))
+            if mappings and (len(mappings) != 2 or mappings[0] != mappings[1]):
+                raise ValueError("Train/test extraction class mappings do not match.")
+            for split, path in staged.items():
+                for original, filename in (("miafex_features.npy", f"{split}_features.npy"),
+                                           ("class_to_idx.json", f"{split}_class_to_idx.json")):
+                    artifact = os.path.join(os.path.dirname(path), original)
+                    if os.path.isfile(artifact):
+                        os.replace(artifact, os.path.join(os.path.dirname(csv_paths[split]), filename))
+                os.replace(path, csv_paths[split])
+    else:
+        print(f"[features] {args.dataset_name}: reusing {csv_paths}")
+
+    return csv_paths
 
 
 class SafeOriginalDMOA(OriginalDMOA):
@@ -623,7 +828,8 @@ def build_optimizer(name: str, args: argparse.Namespace):
         return SafeOriginalDMOA(epoch=args.epochs, pop_size=args.pop_size)
     return resolved_name
 
-def build_cache_signature(args: argparse.Namespace) -> str:
+def _legacy_cache_settings(args: argparse.Namespace) -> dict:
+    """Original signature fields, retained to locate validated pre-migration caches."""
     payload = {
         "dataset_source": args.dataset_source,
         "dataset_name": args.dataset_name,
@@ -650,7 +856,38 @@ def build_cache_signature(args: argparse.Namespace) -> str:
         "dsade_pcr": float(args.dsade_pcr),
         "dsade_mahal_q": float(args.dsade_mahal_q),
     }
+    if args.dataset_source == "miafex":
+        # Do not resume results produced by the obsolete single-CSV resplit flow.
+        payload["miafex_partition_mode"] = "prepared_train_test_v1"
+        payload["train_features_csv"] = args.train_features_csv
+        payload["test_features_csv"] = args.test_features_csv
+    return payload
+
+
+def _hash_cache_settings(payload: dict) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+
+
+def build_cache_signature(args: argparse.Namespace) -> str:
+    payload = _legacy_cache_settings(args)
+    # Scheduling, output locations and stage switches do not identify the science.
+    # Keep RUNS and all scientific settings, including the prepared CSV paths.
+    for key in ("train_miafex", "extract_miafex", "miafex_output", "dataset_root", "features_csv"):
+        payload.pop(key)
+    if args.dataset_source == "mafese":
+        payload["dataset_suite"] = args.dataset_suite
+    return _hash_cache_settings(payload)
+
+
+def legacy_cache_signatures(args: argparse.Namespace) -> List[str]:
+    # These stage switches were execution-only even in the old format. Keep
+    # lookup bounded to hashes we can prove compatible, never arbitrary pickles.
+    payload = _legacy_cache_settings(args)
+    signatures = []
+    for train in dict.fromkeys((args.train_miafex, "auto", "yes", "no")):
+        for extract in dict.fromkeys((args.extract_miafex, "auto", "yes", "no")):
+            signatures.append(_hash_cache_settings(dict(payload, train_miafex=train, extract_miafex=extract)))
+    return signatures
 
 def build_alg_label(method: str, transfer_function: str, classifier: str, show_tf: bool, show_cls: bool) -> str:
     parts = [method.upper()]
@@ -746,6 +983,8 @@ def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: a
         fit_kwargs["verbose"] = False
     if "fs_problem" in fit_params:
         fit_kwargs["fs_problem"] = RobustClassificationFeatureSelectionProblem
+    # MAFESE's internal fitness validation uses only these training rows.
+    # The prepared test partition is supplied only to final evaluation below.
     selector.fit(data.X_train, data.y_train, **fit_kwargs)
     runtime = time.time() - t0
 
@@ -819,6 +1058,9 @@ def execute_pending_runs(
     args: argparse.Namespace,
     pending_runs: List[int],
     on_run_complete=None,
+    dataset_name: str = "",
+    completed_runs: int = 0,
+    started_at: float | None = None,
 ):
     if args.parallel != "yes" or len(pending_runs) <= 1:
         completed = []
@@ -849,20 +1091,72 @@ def execute_pending_runs(
         for run in pending_runs
     ]
     completed = []
-    completed_by_run = {}
-    next_run = min(pending_runs)
+    started_at = time.monotonic() if started_at is None else started_at
+    next_heartbeat = time.monotonic() + PROGRESS_INTERVAL_SECONDS
+    progress_label = build_alg_label(
+        optimizer_display_label(method), tf, estimator, len(args.transfer_functions) > 1, True,
+    )
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(run_single_parallel_task, task) for task in tasks]
-        for future in as_completed(futures):
-            run, out = future.result()
-            completed_by_run[run] = out
-            while next_run in completed_by_run:
-                item = (next_run, completed_by_run.pop(next_run))
+        futures = {executor.submit(run_single_parallel_task, task) for task in tasks}
+        while futures:
+            ready, _ = wait(
+                futures, timeout=max(0.0, next_heartbeat - time.monotonic()),
+                return_when=FIRST_COMPLETED,
+            )
+            failure = None
+            for future in ready:
+                futures.remove(future)
+                try:
+                    item = future.result()
+                except Exception as exc:
+                    failure = exc
+                    continue
                 if on_run_complete is not None:
                     on_run_complete(*item)
                 completed.append(item)
-                next_run += 1
-    return completed
+            # Save successful completions in this batch before propagating a worker failure.
+            if failure is not None:
+                raise failure
+            now = time.monotonic()
+            if futures and now >= next_heartbeat:
+                # ProcessPoolExecutor marks prefetched work as running too; cap by worker slots.
+                active = min(max_workers, len(futures))
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] PROGRESS | {dataset_name} | {progress_label} | "
+                    f"completed={completed_runs + len(completed)}/{args.runs} | active={active} | "
+                    f"pending={len(futures) - active} | elapsed={format_elapsed(now - started_at)} | status=running",
+                    flush=True,
+                )
+                next_heartbeat = now + PROGRESS_INTERVAL_SECONDS
+    return sorted(completed, key=lambda item: item[0])
+
+
+def format_elapsed(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def format_run_ids(run_ids: List[int]) -> str:
+    """Display zero-based cache IDs as compact, one-based run ranges."""
+    ranges = []
+    for run in sorted(run_ids):
+        if ranges and run == ranges[-1][1] + 1:
+            ranges[-1][1] = run
+        else:
+            ranges.append([run, run])
+    return ",".join(str(start + 1) if start == end else f"{start + 1}..{end + 1}"
+                    for start, end in ranges) or "none"
+
+
+def completed_run_ids(payload: dict) -> List[int]:
+    """Legacy checkpoints contain a contiguous prefix; new ones identify each row."""
+    count = len(payload.get("AccRuns", []))
+    run_ids = list(payload.get("CompletedRunIDs", range(count)))
+    if (len(run_ids) != count or any(not isinstance(run, (int, np.integer)) or run < 0 for run in run_ids)
+            or len(set(run_ids)) != len(run_ids)):
+        raise ValueError("Invalid checkpoint: CompletedRunIDs must uniquely identify every result row.")
+    return run_ids
 
 
 def pad_mean_curves(curves: List[np.ndarray], target_len: int) -> np.ndarray:
@@ -886,9 +1180,17 @@ def build_label_payload(
     time_runs: List[float],
     curves: List[np.ndarray],
     epochs: int,
+    completed_run_ids: List[int] | None = None,
 ):
+    if completed_run_ids is not None:
+        # Completion order must not change the scientific aggregation or exported run order.
+        order = np.argsort(completed_run_ids)
+        acc_runs, ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves = (
+            [values[i] for i in order]
+            for values in (acc_runs, ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves)
+        )
     curve_mean = pad_mean_curves(curves, epochs)
-    return {
+    payload = {
         "Estimator": estimator,
         "AccMean": float(np.nanmean(acc_runs)),
         "F1Mean": float(np.nanmean(f1_runs)),
@@ -909,10 +1211,25 @@ def build_label_payload(
         "CurvesAll": curves,
         "CompletedRuns": len(acc_runs),
     }
+    if completed_run_ids is not None:
+        payload["CompletedRunIDs"] = sorted(completed_run_ids)
+    return payload
 
 def save_cache(path: str, payload: dict):
-    with open(path, "wb") as f:
-        pickle.dump(payload, f)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=os.path.dirname(os.path.abspath(path)),
+            prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            pickle.dump(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 def load_cache(path: str):
     with open(path, "rb") as f:
@@ -927,23 +1244,82 @@ def load_cache_safe(path: str, label: str):
         print(f"[cache-warning] No se pudo cargar {label} '{path}': {exc}")
         return None
 
-def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str) -> Dict[str, Dict]:
+
+def cache_files(paths: Paths, dataset_name: str, estimator: str, signature: str) -> tuple[str, str]:
+    prefix = os.path.join(paths.cache_dir, f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{signature}")
+    return f"{prefix}_results.pkl", f"{prefix}_progress.pkl"
+
+
+def resolve_cached_payload(paths: Paths, args: argparse.Namespace, dataset_name: str,
+                           estimator: str, signature: str, *, figures_only: bool = False):
+    """Current EXP wins; import a compatible fallback into current EXP atomically.
+
+    Source EXP is never created or written. None disables the source lookup;
+    the current EXP ID as source performs no duplicate lookup. --no-reuse-cache
+    retains the established current-progress resume but disables final/source
+    reuse. Figures-only explicitly reads caches regardless of that switch.
+    """
+    destination = cache_files(paths, dataset_name, estimator, signature)
+    signatures = list(dict.fromkeys([signature, *legacy_cache_signatures(args)]))
+    use_final = args.reuse_cache or figures_only
+
+    def read_best(location):
+        for candidate_sig in signatures:
+            final, progress = cache_files(location, dataset_name, estimator, candidate_sig)
+            payloads = [load_cache_safe(final, "cache final")] if use_final else []
+            payloads.append(load_cache_safe(progress, "checkpoint parcial"))
+            payloads = [payload for payload in payloads if isinstance(payload, dict)]
+            if payloads:
+                return max(payloads, key=payload_completed_runs), candidate_sig
+        return None, None
+
+    def publish(payload):
+        # Preserve label payloads, CompletedRunIDs and legacy contiguous prefixes.
+        # Progress first also makes an interrupted import resumable.
+        save_cache(destination[1], payload)
+        save_cache(destination[0], payload)
+
+    payload, found_sig = read_best(paths)
+    if payload is not None:
+        if found_sig != signature:
+            publish(payload)
+        print(f"CACHE HIT CURRENT | {paths.exp_tag} | {dataset_name} / {estimator}"
+              + (" | migrated legacy signature" if found_sig != signature else ""), flush=True)
+        return payload
+
+    source_id = args.reuse_cache_from_exp_id
+    if use_final and source_id is not None and source_id != args.exp_id:
+        source = make_paths(args, exp_id=source_id, create=False)
+        payload, found_sig = read_best(source)
+        if payload is not None:
+            publish(payload)
+            print(f"CACHE IMPORTED | {source.exp_tag} -> {paths.exp_tag} | {dataset_name} / {estimator}"
+                  + (" | migrated legacy signature" if found_sig != signature else ""), flush=True)
+            return payload
+        prefix = f"{source.exp_tag}_{dataset_name}_{estimator.lower()}_"
+        if os.path.isdir(source.cache_dir):
+            with os.scandir(source.cache_dir) as entries:
+                has_source = any(entry.is_file() and entry.name.startswith(prefix)
+                                 and entry.name.endswith(("_results.pkl", "_progress.pkl")) for entry in entries)
+            if has_source:
+                print(f"CACHE SOURCE INCOMPATIBLE | {source.exp_tag} | {dataset_name} / {estimator} | "
+                      "no readable cache with a compatible scientific signature", flush=True)
+    print(f"CACHE MISS | {paths.exp_tag} | {dataset_name} / {estimator}", flush=True)
+    return None
+
+
+def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]) -> Dict[str, Dict]:
     results_struct = {}
     missing = []
+    dataset_args = resolve_miafex_dataset_args(args) if args.dataset_source == "miafex" else {}
     for dataset_name in dataset_names:
         results_struct[dataset_name] = {}
+        dataset_cache_sig = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
         for estimator in args.estimators:
-            cache_file = os.path.join(
-                paths.cache_dir,
-                f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{cache_sig}_results.pkl",
+            payload = resolve_cached_payload(
+                paths, dataset_args.get(dataset_name, args), dataset_name, estimator, dataset_cache_sig,
+                figures_only=True,
             )
-            progress_file = os.path.join(
-                paths.cache_dir,
-                f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{cache_sig}_progress.pkl",
-            )
-            payload = load_cache_safe(cache_file, "cache final")
-            if payload is None:
-                payload = load_cache_safe(progress_file, "checkpoint parcial")
             if payload is None:
                 missing.append(f"{dataset_name}/{estimator}")
                 continue
@@ -962,7 +1338,8 @@ def payload_completed_runs(payload: dict) -> int:
     for row in payload.values():
         if not isinstance(row, dict):
             continue
-        total += int(row.get("CompletedRuns", len(row.get("AccRuns", []))))
+        total += (len(row["CompletedRunIDs"]) if "CompletedRunIDs" in row
+                  else int(row.get("CompletedRuns", len(row.get("AccRuns", [])))))
     return total
 
 
@@ -1527,13 +1904,15 @@ def generate_seven_global_charts(
     #         tick.set_color("red")
     #         tick.set_fontweight("bold")
     macro_idx = next(
-        i for i, opt in enumerate(opts)
-        if str(method_by_group.get(opt)).upper() == "MACRO-DE"
+        (i for i, opt in enumerate(opts)
+         if str(method_by_group.get(opt)).upper() == "MACRO-DE"),
+        None,
     )
 
-    rect = plt.Rectangle((-0.5, macro_idx - 0.5), len(datasets),1, fill=False, edgecolor="black", linewidth=2.5, zorder=100)
+    if macro_idx is not None:
+        rect = plt.Rectangle((-0.5, macro_idx - 0.5), len(datasets),1, fill=False, edgecolor="black", linewidth=2.5, zorder=100)
+        ax.add_patch(rect)
 
-    ax.add_patch(rect)
     ax.set_xlabel("Dataset")
     ax.set_ylabel("Metaheuristics")
     for i in range(len(opts)):
@@ -1759,7 +2138,7 @@ def generate_global_features_runtime(df, out_dir, opt_order):
         "09_global_features_runtime_tradeoff.png"
     )
 
-def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str):
+def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]):
     results_struct = load_results_from_cache(paths, args, dataset_names, cache_sig)
     summary_df = generate_summary_dataframe(results_struct, args)
     summary_csv = os.path.join(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv")
@@ -1778,32 +2157,39 @@ def _summary_value(items: List[str], label_func=str) -> str:
     return ", ".join(label_func(item) for item in items)
 
 
-def print_experiment_summary(args: argparse.Namespace, paths: Paths, dataset_names: List[str], cache_sig: str, miafex_csv_path: str | None):
+def print_experiment_summary(args: argparse.Namespace, paths: Paths, dataset_names: List[str], cache_sig: str | Dict[str, str], miafex_csv_path: Dict[str, Dict[str, str]] | None):
     print("=" * 60)
     print(" MIAFEx + Metaheuristic Feature Selection Framework")
     print("=" * 60)
     print(f"{'Experiment':<18}: {paths.exp_tag}")
     print(f"{'Dataset source':<18}: {args.dataset_source}")
+    print(f"{'Pipeline mode':<18}: {args.pipeline_mode}")
     if args.dataset_source == "mafese":
         print(f"{'Dataset suite':<18}: {args.dataset_suite} ({len(dataset_names)} datasets)")
         print(f"{'Datasets':<18}: {_summary_value(dataset_names)}")
     else:
-        print(f"{'Dataset':<18}: {args.dataset_name}")
+        print(f"{'Datasets':<18}: {_summary_value(dataset_names)}")
         print(f"{'MIAFEx training':<18}: {args.train_miafex}")
         print(f"{'Feature extraction':<18}: {args.extract_miafex}")
-        print(f"{'Features CSV':<18}: {miafex_csv_path}")
+        print(f"{'MIAFEx epochs':<18}: {args.miafex_epochs} (neural-network training)")
+        for name, csv_paths in (miafex_csv_path or {}).items():
+            for split, csv_path in csv_paths.items():
+                print(f"{'Features CSV':<18}: {name}/{split} -> {csv_path}")
     print(f"{'Optimizers':<18}: {_summary_value(args.optimizers, optimizer_display_label)}")
     print(f"{'Classifiers':<18}: {_summary_value(args.estimators, lambda x: str(x).upper())}")
     print(f"{'Transfer functions':<18}: {_summary_value(args.transfer_functions, lambda x: str(x).upper())}")
     print(f"{'Runs':<18}: {args.runs}")
-    print(f"{'Epochs':<18}: {args.epochs}")
+    print(f"{'FS iterations':<18}: {args.epochs} (metaheuristic)")
     print(f"{'Population':<18}: {args.pop_size}")
     print(f"{'Parallel':<18}: {args.parallel}")
+    print(f"{'Worker limit':<18}: {args.n_workers}")
+    print(f"{'Cache source EXP':<18}: {args.reuse_cache_from_exp_id}")
     print(f"{'Cache signature':<18}: {cache_sig}")
     print("=" * 60)
 
 
 def main():
+    started_at = time.monotonic()
     args = parse_args()
     logging.disable(logging.INFO)
     logging.getLogger("mealpy").setLevel(logging.WARNING)
@@ -1817,36 +2203,47 @@ def main():
         return
 
     if args.list_miafex_datasets:
-        print_miafex_datasets(discover_miafex_datasets())
+        print_miafex_datasets(discover_miafex_datasets(args.miafex_dataset_root), args.miafex_dataset_root)
         return
     if args.list_optimizers:
         print(list_available_optimizers())
         return
 
-    validate_selection_options(args)
-    args.optimizers = resolve_optimizers(args)
-    if args.runs < 1:
-        raise ValueError("--runs debe ser >= 1")
-    if args.n_workers < 1:
-        raise ValueError("--n-workers debe ser >= 1")
-    if args.dataset_source == "miafex":
-        if not args.dataset_name:
-            raise ValueError("--dataset-name es requerido cuando --dataset-source=miafex")
-        resolve_miafex_dataset_root(args)
-
-    paths = make_paths(args)
-    cache_sig = build_cache_signature(args)
-    show_tf = len(args.transfer_functions) > 1
-    show_cls = len(args.estimators) > 1
+    if args.pipeline_mode == "extract":
+        if args.dataset_source != "miafex":
+            raise ValueError("--pipeline-mode extract requires --dataset-source miafex; MAFESE already supplies feature datasets.")
+        if args.figures_only:
+            raise ValueError("--figures-only cannot be combined with --pipeline-mode extract.")
+    else:
+        validate_selection_options(args)
+        args.optimizers = resolve_optimizers(args)
+        if args.runs < 1:
+            raise ValueError("--runs debe ser >= 1")
+        if args.n_workers < 1:
+            raise ValueError("--n-workers debe ser >= 1")
 
     if args.dataset_source == "mafese":
         dataset_names = resolve_mafese_dataset_names(args)
-        miafex_arrays = None
         miafex_csv_path = None
+        cache_sig = build_cache_signature(args)
     else:
-        dataset_names = [args.dataset_name]
-        miafex_csv_path = resolve_miafex_csv(args)
-        miafex_arrays = load_miafex_csv(miafex_csv_path)
+        dataset_args = resolve_miafex_dataset_args(args)
+        dataset_names = list(dataset_args)
+        miafex_csv_path = {name: miafex_feature_paths(scoped) for name, scoped in dataset_args.items()}
+        # Plot regeneration is cache-only and never prepares neural artifacts.
+        if not args.figures_only:
+            for name, scoped in dataset_args.items():
+                miafex_csv_path[name] = resolve_miafex_csv(scoped)
+        if args.pipeline_mode == "extract":
+            print("Completed MIAFEx feature preparation; feature selection was not run.")
+            for name, csv_path in miafex_csv_path.items():
+                print(f"  {name}: {csv_path}")
+            return
+        cache_sig = {name: build_cache_signature(scoped) for name, scoped in dataset_args.items()}
+
+    paths = make_paths(args)
+    show_tf = len(args.transfer_functions) > 1
+    show_cls = len(args.estimators) > 1
 
     print_experiment_summary(args, paths, dataset_names, cache_sig, miafex_csv_path)
 
@@ -1865,6 +2262,7 @@ def main():
     results_struct = {}
     for dataset_name in dataset_names:
         results_struct[dataset_name] = {}
+        dataset_cache_sig = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
         if args.dataset_source == "mafese":
             mafese_data = get_dataset(dataset_name)
             if mafese_data is None:
@@ -1874,35 +2272,20 @@ def main():
                 )
             X = np.asarray(mafese_data.X, dtype=np.float64)
             y = np.asarray(mafese_data.y).astype(np.int32)
+            data = Data(X, y)
+            try:
+                data.split_train_test(test_size=args.test_size, random_state=args.random_state, stratify=y)
+            except ValueError:
+                data.split_train_test(test_size=args.test_size, random_state=args.random_state)
         else:
-            X, y = miafex_arrays
-        data = Data(X, y)
-        try:
-            data.split_train_test(test_size=args.test_size, random_state=args.random_state, stratify=y)
-        except ValueError:
-            data.split_train_test(test_size=args.test_size, random_state=args.random_state)
+            data = load_miafex_feature_data(miafex_csv_path[dataset_name])
 
         for estimator in args.estimators:
-            cache_file = os.path.join(
-                paths.cache_dir,
-                f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{cache_sig}_results.pkl",
-            )
-            progress_file = os.path.join(
-                paths.cache_dir,
-                f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{cache_sig}_progress.pkl",
-            )
-            cache_payload = load_cache_safe(cache_file, "cache final") if args.reuse_cache else None
-            progress_payload = load_cache_safe(progress_file, "checkpoint parcial")
-            if cache_payload is not None and (
-                progress_payload is None
-                or payload_completed_runs(cache_payload) >= payload_completed_runs(progress_payload)
-            ):
-                print(f"[cache] {dataset_name} / {estimator}")
-                cls_payload = cache_payload
-            else:
-                cls_payload = progress_payload or {}
-                if progress_payload is not None:
-                    print(f"[resume] Reanudando {dataset_name} / {estimator} desde checkpoint parcial")
+            cache_file, progress_file = cache_files(paths, dataset_name, estimator, dataset_cache_sig)
+            cls_payload = resolve_cached_payload(
+                paths, dataset_args[dataset_name] if args.dataset_source == "miafex" else args,
+                dataset_name, estimator, dataset_cache_sig,
+            ) or {}
             for method in args.optimizers:
                 for tf in args.transfer_functions:
                     label = build_alg_label(method, tf, estimator, show_tf, show_cls)
@@ -1916,13 +2299,19 @@ def main():
                     time_runs = list(np.asarray(prev.get("TimeRuns", []), dtype=float))
                     curves = list(prev.get("CurvesAll", []))
 
-                    done = len(acc_runs)
-                    if done >= args.runs:
+                    run_ids = completed_run_ids(prev)
+                    pending_runs = [run for run in range(args.runs) if run not in run_ids]
+                    progress_label = build_alg_label(optimizer_display_label(method), tf, estimator, show_tf, True)
+                    print(
+                        f"[resume] {dataset_name} | {progress_label} | completed={len(run_ids)}/{args.runs} | "
+                        f"recovered={format_run_ids(run_ids)} | missing={format_run_ids(pending_runs)}",
+                        flush=True,
+                    )
+                    if not pending_runs:
                         print(f"Running {dataset_name} | {label} | runs={args.runs} (already complete)")
                         continue
-                    print(f"Running {dataset_name} | {label} | runs={args.runs} (resume from {done})")
+                    print(f"Running {dataset_name} | {label} | runs={args.runs} (recovered {len(run_ids)})", flush=True)
 
-                    pending_runs = list(range(done, args.runs))
                     def checkpoint_run(run, out):
                         acc_runs.append(out["as_test"])
                         ps_runs.append(out["ps_test"])
@@ -1932,10 +2321,7 @@ def main():
                         feat_runs.append(out["n_features"])
                         time_runs.append(out["runtime"])
                         curves.append(out["curve"])
-                        print(
-                            f"  Run {run + 1:02d} | Acc={acc_runs[-1]:.2f}% | F1={f1_runs[-1]:.4f} | "
-                            f"Fit={fit_runs[-1]:.4f} | Feat={feat_runs[-1]} | Time={time_runs[-1]:.2f}s"
-                        )
+                        run_ids.append(run)
 
                         cls_payload[label] = build_label_payload(
                             estimator,
@@ -1948,9 +2334,17 @@ def main():
                             time_runs,
                             curves,
                             args.epochs,
+                            completed_run_ids=run_ids,
                         )
                         save_cache(progress_file, cls_payload)
                         save_cache(cache_file, cls_payload)
+                        print(
+                            f"  {dataset_name} | {progress_label} | Run {run + 1:02d}/{args.runs} | "
+                            f"Accuracy={out['as_test']:.2f}% | F1={out['f1_test']:.4f} | "
+                            f"Fitness={out['fit_final']:.4f} | Features={out['n_features']} | "
+                            f"run time={out['runtime']:.2f}s | total elapsed={format_elapsed(time.monotonic() - started_at)}",
+                            flush=True,
+                        )
 
                     if args.parallel == "yes" and len(pending_runs) > 1:
                         print(f"  Parallel: yes | workers={min(args.n_workers, len(pending_runs))}")
@@ -1962,6 +2356,9 @@ def main():
                             args,
                             pending_runs,
                             on_run_complete=checkpoint_run,
+                            dataset_name=dataset_name,
+                            completed_runs=len(run_ids),
+                            started_at=started_at,
                         )
                     else:
                         for run in pending_runs:
@@ -1981,6 +2378,7 @@ def main():
                         time_runs,
                         curves,
                         args.epochs,
+                        completed_run_ids=run_ids,
                     )
                     save_cache(progress_file, cls_payload)
                     save_cache(cache_file, cls_payload)
