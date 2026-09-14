@@ -16,6 +16,7 @@ Each replacement is staged and hash-verified before the originals are removed.
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+import argparse
 import hashlib
 from pathlib import Path
 import random
@@ -194,7 +195,7 @@ def validate_tree(root, plan):
     actual, hashes = Counter(), {split: set() for split in SPLITS}
     for split in SPLITS:
         folder = root / split
-        if {p.name for p in folder.iterdir()} != set(plan.classes):
+        if {p.name for p in folder.iterdir() if p.name != ".gitkeep"} != set(plan.classes):
             raise ValueError(f"Class folders do not match in {folder}")
         for name in plan.classes:
             for path in (folder / name).iterdir():
@@ -215,6 +216,7 @@ def install(plan):
         for split in SPLITS:
             for name in plan.classes:
                 (prepared / split / name).mkdir(parents=True)
+            (prepared / split / ".gitkeep").touch()
         used = defaultdict(set)
         for record, split in plan.assignments:
             folder = prepared / split / record.class_name
@@ -273,11 +275,25 @@ def report(plan):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    parser.add_argument("--dataset-root", type=Path, default=DATASETS_ROOT)
+    parser.add_argument("--check", action="store_true",
+                        help="Verify existing train/test trees without changing any files.")
+    args = parser.parse_args()
     plans = []
     # Preflight every dataset before changing any of them.
-    for name in DATASETS:
+    for name in args.datasets:
         print(f"Inspecting {name}...", flush=True)
-        plans.append(make_plan(DATASETS_ROOT / name))
+        plans.append(make_plan(args.dataset_root / name))
+    if args.check:
+        for plan in plans:
+            if plan.mode != "preserved existing split":
+                raise ValueError(f"{plan.root.name}: preparation required ({plan.mode}); no files changed.")
+            validate_tree(plan.root, plan)
+            report(plan)
+        print(f"\nAll {len(plans)} datasets verified; no files changed.")
+        return
     for plan in plans:
         print(f"Preparing {plan.root.name}...", flush=True)
         install(plan)

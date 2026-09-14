@@ -1,5 +1,21 @@
-# Optional GPU-only dependencies for gpu-full.
-#
-# CuPy and cuML are intentionally not listed or pinned yet. Their package/channel
-# selection must match the target NVIDIA driver and CUDA environment. The current
-# gpu-full mode only detects these optional modules and does not use them.
+# PyTorch CUDA 12.6 runtime for the implemented torch-gpu MIAFEx path.
+# Linux x86_64, Python 3.11 / 3.13; requires a compatible NVIDIA host driver.
+# Base PyPI torch==2.7.1 already depends on these exact CUDA packages on Linux.
+# Spell them out to reproduce the GPU runtime without adding unused CuPy/cuML.
+-r requirements.txt
+
+nvidia-cuda-nvrtc-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cuda-runtime-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cuda-cupti-cu12==12.6.80 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cudnn-cu12==9.5.1.17 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cublas-cu12==12.6.4.1 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cufft-cu12==11.3.0.4 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-curand-cu12==10.3.7.77 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cusolver-cu12==11.7.1.2 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cusparse-cu12==12.5.4.2 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cusparselt-cu12==0.6.3 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-nccl-cu12==2.26.2 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-nvtx-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-nvjitlink-cu12==12.6.85 ; platform_system == "Linux" and platform_machine == "x86_64"
+nvidia-cufile-cu12==1.11.1.6 ; platform_system == "Linux" and platform_machine == "x86_64"
+triton==3.3.1 ; platform_system == "Linux" and platform_machine == "x86_64"

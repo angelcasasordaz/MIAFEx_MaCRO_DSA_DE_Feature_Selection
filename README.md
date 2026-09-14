@@ -6,9 +6,10 @@ feature selection with MaCRO-DE and other metaheuristic algorithms.
 ## Experiment configuration
 
 Edit the grouped configuration block near the top of `main_best.py`.
-CLI arguments override those defaults. Pressing Run now selects existing
-**Brain_MRI MIAFEx features + DE + KNN**, with **1 run, 100 FS epochs,
-50 agents, and parallel execution disabled**. The pipeline mode is
+CLI arguments override those defaults. The current defaults select all discovered
+MIAFEx datasets, DE/JADE/SHADE/MaCRO-DE, KNN/SVM, 5 runs, 100 FS epochs,
+50 agents, and parallel execution. Use explicit dataset/optimizer arguments for
+a small validation run. The pipeline mode is
 `feature_selection`; it never retrains MIAFEx or regenerates features.
 `EXP_ID` and `REUSE_CACHE_FROM_EXP_ID` both remain `602`.
 
@@ -53,9 +54,14 @@ feature CSVs already exist.
 Cache reuse is enabled; `--no-reuse-cache` disables final/source reuse while
 preserving current progress resume. `--parallel yes` enables concurrent runs.
 `N_WORKERS = automatic_worker_count()` uses two-thirds of usable CPUs and
-available RAM after a 512 MiB reserve, budgeting 192 MiB per worker. The worker
-limit is also capped by pending runs. Native BLAS/OpenMP threading is unchanged;
-the automatic process limit is a resource cap, not a measured optimal count.
+available RAM after a 512 MiB reserve, budgeting 1 GiB per worker (the imported
+stack alone measured about 735 MiB per fresh process). The worker
+limit is also capped by pending runs. Each wrapper run limits BLAS/OpenMP and
+joblib to one thread during selection and final evaluation, including serial
+runs. The limits are restored afterwards, so MIAFEx extraction keeps its own
+thread settings. Workers use `spawn` to avoid inheriting initialized native
+thread pools. The automatic process limit is a resource cap, not a measured
+optimal count; `--n-workers` can lower it on memory-constrained machines.
 
 Cache lookup prefers the current EXP. `REUSE_CACHE_FROM_EXP_ID` (or
 `--reuse-cache-from-exp-id`) selects a read-only fallback; `None`/`none` disables
@@ -87,7 +93,7 @@ python main_best.py --list-miafex-datasets
 
 ## Python environment
 
-Python 3.13.15 is the target interpreter. The compiled scientific and deep-learning
+Python 3.11 and 3.13 are supported; the IDE uses 3.13.15. The compiled scientific and deep-learning
 packages in `requirements.txt` are pinned to releases that provide CPython 3.13
 Linux wheels, avoiding unsupported source builds of older releases such as
 `numpy==1.26.4`.
@@ -98,7 +104,6 @@ Create a clean virtual environment on Ubuntu with:
 sudo apt update
 sudo apt install python3.13 python3.13-venv
 cd /path/to/MIAFEx_MaCRO_DSA_DE_Feature_Selection
-rm -rf .venv
 python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -149,6 +154,114 @@ actual MIAFEx device.
 
 ## Optional GPU dependencies
 
-Common dependencies remain in `requirements.txt`. CUDA-specific additions belong
-in `requirements-gpu.txt`. CuPy and cuML are intentionally not pinned yet: choose
-their packages only after checking the NVIDIA driver and CUDA environment.
+`requirements-gpu.txt` includes `requirements.txt` and explicitly pins the CUDA
+12.6 libraries and Triton required by the existing PyPI PyTorch 2.7.1 wheel on
+Linux x86_64. These are already transitive dependencies of base PyTorch on that
+platform: the GPU file records the runtime explicitly rather than adding unused
+CuPy/cuML. It supports Python 3.11 and 3.13. Other platforms use the base
+requirements; this file only specifies a GPU runtime for Linux x86_64.
+The matched PyTorch/torchvision versions and CUDA 12.6 option are listed in the
+[official PyTorch installation matrix](https://pytorch.org/get-started/previous-versions/#v271).
+An NVIDIA host driver compatible with CUDA 12.6 is required for actual GPU use.
+The runtime pins do not install a driver, and CPU fallback remains available.
+
+Install and validate imports without training, extraction, or feature selection:
+
+```bash
+python -m pip install --only-binary=:all: -r requirements-gpu.txt
+python -m pip check
+python -c "import torch, torchvision, transformers, timm, mafese, mealpy; import miafex_model, train_miafex, extract_miafex_features; print(torch.__version__, torchvision.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Validation: Python 3.11.16 (isolated wheel installation) and 3.13.15 (existing
+IDE environment) passed project/stack imports, `pip check`, and resolution of
+`requirements-gpu.txt`. Both imported PyTorch/torchvision CUDA 12.6 builds;
+no CUDA device was available, so no GPU execution was tested. The system's
+separate Python 3.11.13 lacks `_lzma`; use a complete Python installation with
+the standard `lzma` module for torchvision.
+
+## Local dataset workflow
+
+Git tracks source/documentation and 14 image split `.gitkeep` placeholders; it
+tracks no image datasets, checkpoints, or generated features. The ignored
+`datasets/`, `checkpoints/`, and `datasets_features/` trees allow `.gitkeep`
+files through, including placeholders for `checkpoints/miafex/` and
+`datasets_features/miafex/`. Keep downloads and generated files in these roots.
+Do not use `git add -f` for data or experiment artifacts.
+
+1. Download the chosen dataset manually from the links recorded in
+   `Datasets médicos links.docx`. Keep the source archive locally (for example
+   in ignored `downloads/`), and record its release/version, URL, download date,
+   and SHA-256 in a local `dataset_audit/` note. The existing source mappings are:
+
+   | Local folder | Source from the repository's dataset list |
+   |---|---|
+   | `Brain_MRI` | [Brain tumor](https://www.kaggle.com/datasets/sami009mr/brain-tumor-dataset) |
+   | `Breast_Ultrasound` | [Breast ultrasound](https://www.kaggle.com/datasets/sabahesaraki/breast-ultrasound-images-dataset) |
+   | `Chest_CT` | [Chest CT](https://www.kaggle.com/datasets/mohamedhanyyy/chest-ctscan-images) |
+   | `Eye_Fundus` | [Cataract](https://www.kaggle.com/datasets/jr2ngb/cataractdataset) |
+   | `Gastrointestinal_Endoscopy` | [Kvasir](https://www.kaggle.com/datasets/abdallahwagih/kvasir-dataset-for-classification-and-segmentation) |
+   | `Histological_Biopsy` | [Lymphoma](https://www.kaggle.com/datasets/andrewmvd/malignant-lymphoma-classification) |
+   | `Ocular_Alignment` | [Strabismus](https://www.kaggle.com/datasets/ananthamoorthya/strabismus) |
+
+2. Place images under `datasets/<name>/<class>/...` for an unsplit dataset, or
+   `datasets/<name>/train/<class>/...` and `test/<class>/...` for supplied splits.
+   Remove archive wrapper directories and normalize split names (for example
+   `Training` to `train`, `Testing` to `test`). Keep class names identical across
+   splits. The preparer also recognizes `valid`, `val`, and `validation`.
+   For Brain_MRI, use `glioma_tumor`, `meningioma_tumor`, `no_tumor`, and
+   `pituitary_tumor`. Do not mix masks into classification image folders.
+
+3. Prepare only the selected dataset, then verify it without modifying files:
+
+   ```bash
+   python prepare_all_miafex_datasets.py --datasets Brain_MRI
+   python prepare_all_miafex_datasets.py --datasets Brain_MRI --check
+   ```
+
+   Valid existing membership is preserved. Missing/mirrored splits use the
+   existing seed-42, per-class 80/20 checksum-group split. Other invalid splits
+   retain test copies and merge validation into train. Byte-identical duplicates
+   cannot cross partitions; label conflicts are reported and kept together.
+   This checks byte overlap, not patient identity: retain any supplied patient
+   grouping when placing data. Preparation stages and verifies copies before
+   replacing the source tree; retain your original archive. `--check` fails if
+   repair is needed. Use this preparer rather than `prepare_brain_mri.py`, whose
+   legacy file-level split can separate duplicate image bytes.
+
+   Record exact membership/content locally, from the repository root:
+
+   ```bash
+   mkdir -p dataset_audit
+   find datasets/Brain_MRI/train datasets/Brain_MRI/test -type f ! -name .gitkeep -print0 | sort -z | xargs -0 sha256sum > dataset_audit/Brain_MRI.sha256
+   sha256sum -c dataset_audit/Brain_MRI.sha256
+   ```
+
+   Preserve this manifest with the source archive; the checksum command detects
+   changed/missing listed files, while `--check` verifies split structure and
+   overlap. Recreate and compare manifests to detect added files.
+
+4. Train/reuse MIAFEx and extract both prepared partitions, stopping before FS:
+
+   ```bash
+   python main_best.py --dataset-source miafex --miafex-datasets Brain_MRI --pipeline-mode extract --compute-mode torch-gpu --train-miafex auto --extract-miafex auto
+   ```
+
+   A first extraction may fetch the configured pretrained ViT weights. Training
+   reads `train/` only. The same checkpoint extracts both train and test into
+   `datasets_features/miafex/Brain_MRI/`, with CSVs, NPY arrays, and label maps.
+   Preserve the checkpoint, mappings, manifests, and command/configuration
+   together locally to reproduce inputs to selection. If images/splits change,
+   explicitly use `--train-miafex yes --extract-miafex yes`; automatic reuse checks
+   artifact existence, not content hashes. Use a new experiment ID afterwards.
+
+5. Run selection against those existing feature files. This explicit tiny
+   example uses one DE/KNN run, two epochs, and five agents:
+
+   ```bash
+   python main_best.py --dataset-source miafex --miafex-datasets Brain_MRI --pipeline-mode feature_selection --optimizers DE --estimators knn --transfer-functions vstf_01 --runs 1 --fs-epochs 2 --pop-size 5 --parallel no --exp-id 990001 --output-root outputs/brain_mri_tiny --no-reuse-cache --reuse-cache-from-exp-id none
+   ```
+
+   Choose a fresh output directory/experiment ID for a fresh execution; existing
+   progress can still resume with `--no-reuse-cache`. Feature selection preserves
+   the outer train/test partitions and never trains or extracts in this mode.

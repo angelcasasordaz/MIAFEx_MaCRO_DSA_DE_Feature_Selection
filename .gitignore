@@ -228,13 +228,31 @@ outputs/
 
 # Local datasets and generated MIAFEx artifacts
 datasets/**
+!datasets/**/
 !datasets/**/.gitkeep
 
 checkpoints/**
+!checkpoints/**/
 !checkpoints/**/.gitkeep
 
 datasets_features/**
+!datasets_features/**/
 !datasets_features/**/.gitkeep
+
+# Downloads and model/feature binaries remain local, even outside standard roots.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*features.csv
 
 dataset_audit/
 diagnostics/

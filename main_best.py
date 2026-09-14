@@ -14,7 +14,8 @@ import tempfile
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from multiprocessing import get_context
 from dataclasses import dataclass
 import inspect
 from typing import Dict, List
@@ -24,6 +25,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
+from joblib import parallel_config
+from threadpoolctl import threadpool_limits
 from mafese import Data, MhaSelector, get_dataset
 from mafese.utils.mealpy_util import FeatureSelectionProblem
 from mafese.utils.estimator import get_general_estimator
@@ -125,8 +128,8 @@ OPTIMIZERS = [
 ]
 ESTIMATORS = ["knn", "svm"]
 TRANSFER_FUNCTIONS = ["vstf_01"]
-RUNS = 20
-FS_EPOCHS = 150  # Metaheuristic feature-selection iterations.
+RUNS = 5
+FS_EPOCHS = 100  # Metaheuristic feature-selection iterations.
 POP_SIZE = 50
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
@@ -142,10 +145,11 @@ REUSE_CACHE = True
 REUSE_CACHE_FROM_EXP_ID = 602  # None: current EXP only; another ID: read-only fallback.
 FIGURES_ONLY = False
 
-# Workers: native BLAS/OpenMP thread settings are deliberately unchanged.
+# Parallelize independent runs; each wrapper uses one native/joblib thread.
 PARALLEL = True
 AUTO_WORKER_CPU_FRACTION = 2 / 3
-AUTO_WORKER_RAM_BYTES = 192 * 1024**2
+# Spawned workers import the full stack (~735 MiB before feature matrices).
+AUTO_WORKER_RAM_BYTES = 1024**3
 AUTO_RAM_RESERVE_BYTES = 512 * 1024**2
 N_WORKERS = automatic_worker_count()  # Also capped by pending runs at execution time.
 PROGRESS_INTERVAL_SECONDS = 60.0
@@ -925,8 +929,10 @@ class RobustClassificationFeatureSelectionProblem(FeatureSelectionProblem):
     def obj_func(self, solution):
         x = self.decode_solution(solution)["my_var"]
         cols = np.flatnonzero(x)
-        self.estimator.fit(self.data.X_train[:, cols], self.data.y_train)
-        y_valid_pred = self.estimator.predict(self.data.X_test[:, cols])
+        # take produces C-contiguous subsets directly; sklearn otherwise copies
+        # the Fortran-contiguous advanced-indexing result at every evaluation.
+        self.estimator.fit(np.take(self.data.X_train, cols, axis=1), self.data.y_train)
+        y_valid_pred = self.estimator.predict(np.take(self.data.X_test, cols, axis=1))
         obj = self._score(self.data.y_test, y_valid_pred)
         feature_ratio = np.sum(x) / self.n_dims
         fitness = self.fit_weights[0] * (1.0 - obj) + self.fit_weights[1] * feature_ratio
@@ -957,6 +963,14 @@ class RobustClassificationFeatureSelectionProblem(FeatureSelectionProblem):
             return float(evaluator.get_metric_by_name(self.obj_name, paras=paras)[self.obj_name])
 
 
+@contextmanager
+def wrapper_resources():
+    """Limit nested CPU pools for fit AND evaluation, restoring them afterwards."""
+    with threadpool_limits(limits=1), parallel_config(n_jobs=1):
+        yield
+
+
+@wrapper_resources()
 def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: argparse.Namespace, seed: int):
     logging.disable(logging.INFO)
     np.random.seed(seed)
@@ -1096,7 +1110,8 @@ def execute_pending_runs(
     progress_label = build_alg_label(
         optimizer_display_label(method), tf, estimator, len(args.transfer_functions) > 1, True,
     )
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    # Forking after PyTorch/OpenMP initialization can inherit locked native pools.
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=get_context("spawn")) as executor:
         futures = {executor.submit(run_single_parallel_task, task) for task in tasks}
         while futures:
             ready, _ = wait(
