@@ -3,7 +3,7 @@ from mealpy.optimizer import Optimizer
 from mealpy.utils.agent import Agent
 from scipy.stats import chi2
 
-class DSADE_AWAD(Optimizer):
+class DSADE(Optimizer):
     """
     Diversity-based Self-Adaptive Control in Differential Evolution (DSADE)
     with:
@@ -11,6 +11,8 @@ class DSADE_AWAD(Optimizer):
     - Mahalanobis grouping for mutation pool sampling
     - AWAD-aware survivor selection
     """
+
+    IMPLEMENTATION_REVISION = "awad-survivor-v2"
 
     def __init__(
         self,
@@ -215,8 +217,3 @@ class DSADE_AWAD(Optimizer):
         div_norm_now = float(np.clip(div_awad / (self.div_max_seen + self.EPSILON), 0.0, 1.0))
         self.div_norm_hist[epoch_idx] = div_norm_now
         self.div_norm_for_update = div_norm_now
-
-
-# Backward compatibility aliases
-DSADE_AWAD = DSADE_AWAD
-

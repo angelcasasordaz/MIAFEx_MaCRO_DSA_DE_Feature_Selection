@@ -22,7 +22,7 @@ RULE FOR main_best.py
 - For the original algorithm, use the acronym/family name: PSO, GWO, WOA, DE, HHO, etc.
 - For a variant, use the exact variant name: PPSO, RW_GWO, JADE, L_SHADE, etc.
 - The resolver should first try the name exactly as written; if it does not exist, try Original+name, Base+name, and Dev+name.
-- Project-specific optimizers (MaCRO-DE, DSADE, DSADE_AWAD, DBO) are handled separately.
+- Project-specific optimizers (MaCRO-DE, MaCRO-DE-t, DSADE, DBO) are handled separately.
 
 SOURCE NOTE
 - List based on the official MEALPY v3.0.2 README/source code.
@@ -314,7 +314,7 @@ SOURCE NOTE
 
 MaCRO-DE   ---> MaCRO-DE
 DSADE      ---> DSADE
-DSADE_AWAD ---> DSADE_AWAD
+MaCRO-DE-t ---> MaCRO-DE-t
 DBO        ---> DBO
 
 SELECTION EXAMPLE

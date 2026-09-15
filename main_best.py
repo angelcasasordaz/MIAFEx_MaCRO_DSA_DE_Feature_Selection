@@ -37,9 +37,9 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 
 # Local project imports
 from dbo_optimizer import DBOOptimizer
-from dsade_optimizer import DSADE
-from dsade_awad_optimizer import DSADE_AWAD
+from dsade_awad_optimizer import DSADE
 from macro_de_optimizer import MaCRO_DE
+from macro_de_t_optimizer import MaCRO_DE_t
 from algorithm_acronym_list import (
     list_available_optimizers,
     optimizer_acronym,
@@ -114,21 +114,24 @@ MIAFEX_LEARNING_RATE = 1e-5
 
 # Feature selection: supported optimizers/classifiers remain available via config/CLI.
 OPTIMIZERS = [
+    # "MaCRO-DE",
+    "MaCRO-DE-t",
     "DE",
     "JADE",
     "SHADE",
-    # "PSO",
-    # "GWO",
-    # "WOA",
-    # "HHO",
-    # "BRO",
-    # "DBO",
-    # "FLA",
-    "MaCRO-DE",
+    "PSO",
+    "GWO",
+    "WOA",
+    "HHO",
+    "BRO",
+    "DBO",
+    "RUN",
+    "FOX",
+    "FLA",
 ]
 ESTIMATORS = ["knn", "svm"]
 TRANSFER_FUNCTIONS = ["vstf_01"]
-RUNS = 5
+RUNS = 20
 FS_EPOCHS = 100  # Metaheuristic feature-selection iterations.
 POP_SIZE = 50
 TEST_SIZE = 0.2
@@ -808,13 +811,12 @@ def build_optimizer(name: str, args: argparse.Namespace):
             pcr=args.dsade_pcr,
             mahalanobis_q=args.dsade_mahal_q,
         )
-    if resolved_upper in {"DSADE_AWAD", "DSADE-AWAD"}:
-        return DSADE_AWAD(
+    if resolved_upper == "MACRO-DE-T":
+        return MaCRO_DE_t(
             epoch=args.epochs,
             pop_size=args.pop_size,
-            beta_min=args.dsade_beta_min,
-            beta_max=args.dsade_beta_max,
-            pcr=args.dsade_pcr,
+            wf=0.5,
+            cr=0.9,
             mahalanobis_q=args.dsade_mahal_q,
         )
     if resolved_upper in {"MACRO-DE", "MACRO_DE"}:
@@ -872,6 +874,15 @@ def _hash_cache_settings(payload: dict) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
 
 
+def optimizer_implementation_revisions(args: argparse.Namespace) -> dict:
+    revisions = {
+        "DSADE": DSADE.IMPLEMENTATION_REVISION,
+        "MaCRO-DE-t": MaCRO_DE_t.IMPLEMENTATION_REVISION,
+    }
+    resolved = {resolve_optimizer_name(name) for name in args.optimizers}
+    return {name: revision for name, revision in revisions.items() if name in resolved}
+
+
 def build_cache_signature(args: argparse.Namespace) -> str:
     payload = _legacy_cache_settings(args)
     # Scheduling, output locations and stage switches do not identify the science.
@@ -880,10 +891,17 @@ def build_cache_signature(args: argparse.Namespace) -> str:
         payload.pop(key)
     if args.dataset_source == "mafese":
         payload["dataset_suite"] = args.dataset_suite
+    revisions = optimizer_implementation_revisions(args)
+    if revisions:
+        payload["optimizer_implementation_revisions"] = revisions
     return _hash_cache_settings(payload)
 
 
 def legacy_cache_signatures(args: argparse.Namespace) -> List[str]:
+    # Unversioned caches cannot establish which survivor/routing science ran.
+    # This also blocks old progress, cross-EXP imports and figures-only reuse.
+    if optimizer_implementation_revisions(args):
+        return []
     # These stage switches were execution-only even in the old format. Keep
     # lookup bounded to hashes we can prove compatible, never arbitrary pickles.
     payload = _legacy_cache_settings(args)
@@ -1365,7 +1383,7 @@ def parse_result_label(label: str, args: argparse.Namespace) -> dict:
         optimizer_tokens.append(str(opt))
         optimizer_tokens.append(optimizer_acronym(opt))
     ordered_opts = sorted(
-        list(dict.fromkeys(optimizer_tokens + ["DSA-DE", "DSADE", "DSADE_AWAD", "DSADE-AWAD", "MaCRO-DE", "MACRO-DE", "DBO"])),
+        list(dict.fromkeys(optimizer_tokens + ["DSA-DE", "DSADE", "DSA_DE", "MaCRO-DE", "MaCRO-DE-t", "DBO"])),
         key=len,
         reverse=True,
     )
@@ -1409,17 +1427,17 @@ def optimizer_order_key(name: str) -> tuple:
     label = optimizer_display_label(name).upper()
     if label == "MACRO-DE":
         return (0, "")
-    if label == "DSA-DE":
+    if label in {"DSA-DE", "DSADE"}:
         return (1, "")
-    if label in {"DSADE-AWAD", "DSADE_AWAD"}:
+    if label == "MACRO-DE-T":
         return (2, "")
     return (3, label)
 
 def is_dsade_method(name: str) -> bool:
-    return str(name).upper() in {"MACRO-DE", "DSA-DE", "DSADE", "DSADE_AWAD", "DSADE-AWAD"}
+    return str(name).upper() in {"MACRO-DE", "MACRO-DE-T", "DSA-DE", "DSADE", "DSA_DE"}
 
 def is_exact_dsade_method(name: str) -> bool:
-    return str(name).upper() in {"DSA-DE", "DSADE"}
+    return str(name).upper() in {"DSA-DE", "DSADE", "DSA_DE"}
 
 def prepare_plot_groups(df: pd.DataFrame, opt_order: List[str]) -> tuple[pd.DataFrame, List[str], Dict[str, str], Dict[str, str]]:
     if df.empty:
