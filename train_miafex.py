@@ -62,9 +62,9 @@ def train_miafex(
     train_root,
     output_dir,
     num_classes=None,
-    num_epochs=10,
-    batch_size=16,
-    learning_rate=1e-5,
+    num_epochs=50,
+    batch_size=8,
+    learning_rate=1e-4,
     device=None,
 ):
     """
@@ -100,7 +100,7 @@ def train_miafex(
     print(f"[train] device={resolved_device}")
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.NAdam(model.parameters(), lr=learning_rate)
 
     loss_curve = []
     acc_curve = []
@@ -160,9 +160,9 @@ def _parse_args():
     parser.add_argument("--train-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--num-classes", type=int, default=None)
-    parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--num-epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--device", default=None)
     return parser.parse_args()
 

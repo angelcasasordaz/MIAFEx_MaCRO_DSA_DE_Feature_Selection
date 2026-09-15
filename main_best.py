@@ -93,10 +93,10 @@ def automatic_worker_count() -> int:
     return min(cpu_limit, ram_limit)
 
 
-# User-editable configuration: the controlled test used by PyCharm's Run action.
+# User-editable configuration: the full experiment used by PyCharm's Run action.
 # Dataset and pipeline
 DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
-PIPELINE_MODE = "feature_selection"  # Existing CSVs only; also supports "extract" and "full".
+PIPELINE_MODE = "full"  # Train/extract features, then run feature selection.
 MIAFEX_DATASETS = None
 # ["Brain_MRI"]
 # None: all valid discovered datasets.
@@ -106,11 +106,11 @@ MAFESE_DATASET_SUITE = "test14"
 MIAFEX_DATASET_ROOT = "datasets"
 MIAFEX_CHECKPOINT_ROOT = "checkpoints/miafex"
 FEATURE_DATASET_ROOT = "datasets_features/miafex"
-MIAFEX_TRAIN = "auto"  # Options: "auto", "yes", "no"
-MIAFEX_EXTRACT = "auto"  # Options: "auto", "yes", "no"
-MIAFEX_EPOCHS = 10  # Neural-network training epochs.
+MIAFEX_TRAIN = "yes"  # Options: "auto", "yes", "no"
+MIAFEX_EXTRACT = "yes"  # Options: "auto", "yes", "no"
+MIAFEX_EPOCHS = 50  # Neural-network training epochs.
 MIAFEX_BATCH_SIZE = 8
-MIAFEX_LEARNING_RATE = 1e-5
+MIAFEX_LEARNING_RATE = 1e-4
 
 # Feature selection: supported optimizers/classifiers remain available via config/CLI.
 OPTIMIZERS = [
@@ -132,8 +132,8 @@ OPTIMIZERS = [
 ESTIMATORS = ["knn", "svm"]
 TRANSFER_FUNCTIONS = ["vstf_01"]
 RUNS = 20
-FS_EPOCHS = 100  # Metaheuristic feature-selection iterations.
-POP_SIZE = 50
+FS_EPOCHS = 200  # Metaheuristic feature-selection iterations.
+POP_SIZE = 30
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 SEED_BASE = 1234
@@ -145,7 +145,7 @@ DSADE_MAHAL_Q = 0.68
 # Experiment and cache reuse
 EXP_ID = 603
 REUSE_CACHE = True
-REUSE_CACHE_FROM_EXP_ID = 602  # None: current EXP only; another ID: read-only fallback.
+REUSE_CACHE_FROM_EXP_ID = None  # None: current EXP only; another ID: read-only fallback.
 FIGURES_ONLY = False
 
 # Parallelize independent runs; each wrapper uses one native/joblib thread.

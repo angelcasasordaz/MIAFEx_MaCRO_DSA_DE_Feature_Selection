@@ -7,11 +7,15 @@ feature selection with MaCRO-DE and other metaheuristic algorithms.
 
 Edit the grouped configuration block near the top of `main_best.py`.
 CLI arguments override those defaults. The current defaults select all discovered
-MIAFEx datasets, DE/JADE/SHADE/MaCRO-DE, KNN/SVM, 5 runs, 100 FS epochs,
-50 agents, and parallel execution. Use explicit dataset/optimizer arguments for
-a small validation run. The pipeline mode is
-`feature_selection`; it never retrains MIAFEx or regenerates features.
-`EXP_ID` and `REUSE_CACHE_FROM_EXP_ID` both remain `602`.
+MIAFEx datasets, MaCRO-DE-t/DE/JADE/SHADE/PSO/GWO/WOA/HHO/BRO/DBO/RUN/FOX/FLA,
+KNN/SVM, `vstf_01`, 20 runs, 200 FS epochs, 30 agents, and parallel execution.
+`PIPELINE_MODE = "full"`, `MIAFEX_TRAIN = "yes"`, and `MIAFEX_EXTRACT = "yes"`
+force MIAFEx retraining and regeneration of both train/test feature partitions,
+then proceed to feature selection.
+`EXP_ID = 603`, `REUSE_CACHE = True`, and `REUSE_CACHE_FROM_EXP_ID = None`
+disable reuse from other experiments while preserving cache/resume within EXP 603.
+Existing compatible EXP 603 results/progress can still be reused; a fresh FS run
+assumes EXP 603 has no existing compatible results/progress.
 
 Set `MIAFEX_DATASETS = None` to discover all datasets, set a list, or pass
 `--miafex-datasets Brain_MRI Chest_CT` to select a subset. `--dataset-name`
@@ -49,8 +53,13 @@ forcing training does not refresh an existing CSV pair unless extraction is also
 forced. Feature-selection-only mode needs no checkpoint or image access when the
 feature CSVs already exist.
 
-`MIAFEX_EPOCHS` / `--miafex-epochs` controls neural-network training epochs.
-`FS_EPOCHS` / `--epochs` (also `--fs-epochs`) controls metaheuristic iterations.
+`MIAFEX_EPOCHS` / `--miafex-epochs` controls neural-network training epochs (50).
+`MIAFEX_BATCH_SIZE` / `--miafex-batch-size` defaults to 8, and
+`MIAFEX_LEARNING_RATE` / `--miafex-learning-rate` defaults to `1e-4`.
+Training uses PyTorch NAdam with `CrossEntropyLoss`. The `train_miafex.py`
+function and CLI share these defaults: 50 epochs, batch size 8, learning rate `1e-4`.
+`FS_EPOCHS` / `--epochs` (also `--fs-epochs`) controls metaheuristic iterations
+(200), and `POP_SIZE` / `--pop-size` defaults to 30 agents.
 Cache reuse is enabled; `--no-reuse-cache` disables final/source reuse while
 preserving current progress resume. `--parallel yes` enables concurrent runs.
 `N_WORKERS = automatic_worker_count()` uses two-thirds of usable CPUs and
