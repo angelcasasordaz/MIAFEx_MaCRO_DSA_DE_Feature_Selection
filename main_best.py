@@ -143,7 +143,7 @@ DSADE_PCR = 0.2
 DSADE_MAHAL_Q = 0.68
 
 # Experiment and cache reuse
-EXP_ID = 602
+EXP_ID = 603
 REUSE_CACHE = True
 REUSE_CACHE_FROM_EXP_ID = 602  # None: current EXP only; another ID: read-only fallback.
 FIGURES_ONLY = False
