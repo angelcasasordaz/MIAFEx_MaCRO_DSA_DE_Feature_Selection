@@ -57,6 +57,7 @@ class ParallelResumeTests(unittest.TestCase):
             "--output-root", str(self.root / "results"),
             "--optimizers", "PSO", "--estimators", "knn", "--runs", "6",
             "--fs-epochs", "3", "--n-workers", "4", "--parallel", "yes",
+            "--train-miafex", "auto", "--extract-miafex", "auto",
         ])
         for split in ("train", "test"):
             for label in ("a", "b"):
@@ -168,7 +169,7 @@ class ParallelResumeTests(unittest.TestCase):
         self.configure_invocation(self.args, "already-complete")
         self.invoke_main(self.args)
         self.assertEqual(self.executed_runs(self.args), {})
-        self.assertIn("completed=6/6 | recovered=1..6 | missing=none", self.output.getvalue())
+        self.assertIn("[experiment-complete]", self.output.getvalue())
 
     def test_legacy_contiguous_cache_resumes_without_repeating_completed_runs(self):
         scoped = framework.resolve_miafex_dataset_args(self.args)["Synthetic"]

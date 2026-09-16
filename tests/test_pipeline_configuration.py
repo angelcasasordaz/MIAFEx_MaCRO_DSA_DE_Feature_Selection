@@ -18,6 +18,7 @@ class PipelineConfigurationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.args = framework.parse_args([
             "--pipeline-mode", "full",
+            "--train-miafex", "auto", "--extract-miafex", "auto",
             "--miafex-dataset-root", str(self.root / "images"),
             "--miafex-checkpoint-root", str(self.root / "checkpoints"),
             "--feature-dataset-root", str(self.root / "features"),
@@ -68,16 +69,16 @@ class PipelineConfigurationTests(unittest.TestCase):
 
     def test_configuration_defaults_and_cli_overrides(self):
         args = framework.parse_args([])
-        self.assertEqual((args.dataset_source, args.pipeline_mode), ("miafex", "feature_selection"))
-        self.assertEqual(args.miafex_datasets, ["Brain_MRI"])
-        self.assertEqual(args.optimizers, ["DE"])
-        self.assertEqual(args.estimators, ["knn"])
-        self.assertEqual((args.runs, args.epochs, args.pop_size), (1, 100, 50))
+        self.assertEqual((args.dataset_source, args.pipeline_mode), ("miafex", "full"))
+        self.assertIsNone(args.miafex_datasets)
+        self.assertEqual(args.optimizers, framework.OPTIMIZERS)
+        self.assertEqual(args.estimators, ["knn", "svm"])
+        self.assertEqual((args.runs, args.epochs, args.pop_size), (20, 200, 30))
         self.assertEqual(args.transfer_functions, ["vstf_01"])
-        self.assertEqual((args.miafex_epochs, args.miafex_batch_size, args.epochs), (10, 8, 100))
+        self.assertEqual((args.miafex_epochs, args.miafex_batch_size, args.epochs), (50, 8, 200))
         self.assertEqual(args.random_state, 42)
         self.assertTrue(args.reuse_cache)
-        self.assertEqual(args.parallel, "no")
+        self.assertEqual(args.parallel, "yes")
         args = framework.parse_args(["--dataset-source", "mafese", "--pipeline-mode", "feature_selection",
                                      "--no-reuse-cache", "--parallel", "no", "--fs-epochs", "7",
                                      "--miafex-epochs", "3", "--n-workers", "2"])

@@ -14,7 +14,7 @@ class WorkerSizingTests(unittest.TestCase):
     def test_cpu_ram_affinity_and_unknown_limits(self):
         mib = 1024**2
         for cpus, affinity, ram, expected in (
-            (12, 12, 8 * 1024 * mib, 8), (12, 12, 512 * mib + 3 * 192 * mib, 3),
+            (12, 12, 8 * 1024 * mib, 7), (12, 12, 512 * mib + 3 * 1024 * mib, 3),
             (12, 3, 8 * 1024 * mib, 2), (1, 1, 0, 1), (None, 12, None, 1),
             (12, 12, None, 8), (12, 12, 511 * mib, 1),
         ):
@@ -24,7 +24,7 @@ class WorkerSizingTests(unittest.TestCase):
                     patch.object(framework, 'available_memory_bytes', return_value=ram):
                 self.assertEqual(framework.automatic_worker_count(), expected)
         self.assertEqual(framework.AUTO_WORKER_CPU_FRACTION, 2 / 3)
-        self.assertEqual(framework.AUTO_WORKER_RAM_BYTES, 192 * mib)
+        self.assertEqual(framework.AUTO_WORKER_RAM_BYTES, 1024 * mib)
         self.assertEqual(framework.AUTO_RAM_RESERVE_BYTES, 512 * mib)
 
     def test_memory_uses_available_ram_and_portable_fallbacks(self):
@@ -92,8 +92,8 @@ class CacheInfrastructureTests(unittest.TestCase):
 
     def test_defaults_and_none_cli(self):
         args = framework.parse_args([])
-        self.assertEqual((framework.EXP_ID, framework.REUSE_CACHE_FROM_EXP_ID), (602, 602))
-        self.assertEqual((args.exp_id, args.reuse_cache_from_exp_id), (602, 602))
+        self.assertEqual((framework.EXP_ID, framework.REUSE_CACHE_FROM_EXP_ID), (604, None))
+        self.assertEqual((args.exp_id, args.reuse_cache_from_exp_id), (604, None))
         self.assertEqual(args.n_workers, framework.N_WORKERS)
         self.assertEqual(args.figures_only, framework.FIGURES_ONLY)
         self.assertIsNone(framework.parse_args(['--reuse-cache-from-exp-id', 'none']).reuse_cache_from_exp_id)

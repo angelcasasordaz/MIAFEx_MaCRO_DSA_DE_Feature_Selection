@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 from joblib import parallel_config
 from threadpoolctl import threadpool_limits
+from scipy.stats import friedmanchisquare, rankdata, wilcoxon
 from mafese import Data, MhaSelector, get_dataset
 from mafese.utils.mealpy_util import FeatureSelectionProblem
 from mafese.utils.estimator import get_general_estimator
@@ -143,7 +144,7 @@ DSADE_PCR = 0.2
 DSADE_MAHAL_Q = 0.68
 
 # Experiment and cache reuse
-EXP_ID = 603
+EXP_ID = 604
 REUSE_CACHE = True
 REUSE_CACHE_FROM_EXP_ID = None  # None: current EXP only; another ID: read-only fallback.
 FIGURES_ONLY = False
@@ -1062,8 +1063,26 @@ def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: a
     }
 
 
+_RUN_WORKER_DATA_SPLIT = None
+_RUN_WORKER_THREAD_LIMIT = None
+
+
+def initialize_run_worker(data_split):
+    """Install immutable dataset arrays once per spawned CPU worker."""
+    global _RUN_WORKER_DATA_SPLIT, _RUN_WORKER_THREAD_LIMIT
+    _RUN_WORKER_DATA_SPLIT = {}
+    for name, values in data_split.items():
+        array = np.asarray(values).view()
+        array.flags.writeable = False
+        _RUN_WORKER_DATA_SPLIT[name] = array
+    _RUN_WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
+
+
 def run_single_parallel_task(task: dict):
-    data_split = task["data_split"]
+    # Direct legacy callers may still supply their split; pool tasks never do.
+    data_split = task.get("data_split", _RUN_WORKER_DATA_SPLIT)
+    if data_split is None:
+        raise RuntimeError("Run worker has not been initialized with a dataset.")
     data = Data()
     data.set_train_test(
         X_train=data_split["X_train"],
@@ -1113,7 +1132,6 @@ def execute_pending_runs(
     tasks = [
         {
             "run": run,
-            "data_split": data_split,
             "estimator": estimator,
             "method": method,
             "tf": tf,
@@ -1129,7 +1147,8 @@ def execute_pending_runs(
         optimizer_display_label(method), tf, estimator, len(args.transfer_functions) > 1, True,
     )
     # Forking after PyTorch/OpenMP initialization can inherit locked native pools.
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=get_context("spawn")) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=get_context("spawn"),
+                             initializer=initialize_run_worker, initargs=(data_split,)) as executor:
         futures = {executor.submit(run_single_parallel_task, task) for task in tasks}
         while futures:
             ready, _ = wait(
@@ -1341,12 +1360,17 @@ def resolve_cached_payload(paths: Paths, args: argparse.Namespace, dataset_name:
     return None
 
 
-def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]) -> Dict[str, Dict]:
+def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str],
+                            *, statistical_results: Dict[str, Dict] | None = None) -> Dict[str, Dict]:
     results_struct = {}
     missing = []
-    dataset_args = resolve_miafex_dataset_args(args) if args.dataset_source == "miafex" else {}
+    metadata_args = argparse.Namespace(**vars(args))
+    metadata_args.figures_only = True
+    dataset_args = resolve_miafex_dataset_args(metadata_args) if args.dataset_source == "miafex" else {}
     for dataset_name in dataset_names:
         results_struct[dataset_name] = {}
+        if statistical_results is not None:
+            statistical_results[dataset_name] = {}
         dataset_cache_sig = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
         for estimator in args.estimators:
             payload = resolve_cached_payload(
@@ -1357,6 +1381,8 @@ def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_name
                 missing.append(f"{dataset_name}/{estimator}")
                 continue
             results_struct[dataset_name].update(payload)
+            if statistical_results is not None:
+                statistical_results[dataset_name].update(statistical_classifier_rows(payload, estimator, args))
 
     if missing:
         raise FileNotFoundError(
@@ -1374,6 +1400,42 @@ def payload_completed_runs(payload: dict) -> int:
         total += (len(row["CompletedRunIDs"]) if "CompletedRunIDs" in row
                   else int(row.get("CompletedRuns", len(row.get("AccRuns", [])))))
     return total
+
+
+def experiment_cache_is_complete(paths, args, dataset_names, cache_sig, dataset_args=None):
+    """Check requested run IDs in compatible current-EXP caches, never source EXPs."""
+    if not dataset_names or not args.optimizers or not args.estimators or not args.transfer_functions or args.runs < 1:
+        return False
+    required_ids = set(range(args.runs))
+    run_keys = ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns")
+    for dataset in dataset_names:
+        scoped = argparse.Namespace(**vars((dataset_args or {}).get(dataset, args)))
+        scoped.reuse_cache_from_exp_id = None
+        signature = cache_sig[dataset] if isinstance(cache_sig, dict) else cache_sig
+        for classifier in args.estimators:
+            payload = resolve_cached_payload(paths, scoped, dataset, classifier, signature)
+            if not payload:
+                return False
+            groups = statistical_run_groups(
+                {dataset: statistical_classifier_rows(payload, classifier, args)}, [dataset], args,
+            )
+            for method in args.optimizers:
+                for transfer in args.transfer_functions:
+                    rows = groups.get((dataset, (optimizer_acronym(method), classifier.lower(), transfer.lower())), [])
+                    complete = False
+                    for row in rows:
+                        try:
+                            ids = completed_run_ids(row)
+                            complete = required_ids.issubset(ids) and all(
+                                len(row.get(key, [])) == len(ids) for key in run_keys
+                            )
+                        except (TypeError, ValueError):
+                            complete = False
+                        if complete:
+                            break
+                    if not complete:
+                        return False
+    return True
 
 
 def parse_result_label(label: str, args: argparse.Namespace) -> dict:
@@ -1541,6 +1603,286 @@ def export_global_excel(results_struct: Dict[str, Dict], dataset_names: List[str
         feat.to_csv(paths[5])
         tim.to_csv(paths[6])
         return paths
+
+def statistical_classifier_rows(payload: dict, estimator: str, args: argparse.Namespace) -> dict:
+    """Qualify legacy labels in a reporting-only view; never rewrite cache records."""
+    return {
+        label if parse_result_label(label, args)["estimator"] else f"{label}_{estimator.upper()}":
+            dict(row, Estimator=row.get("Estimator") or estimator)
+        for label, row in payload.items()
+    }
+
+
+def _run_stats(values, best_mode: str) -> Dict[str, float]:
+    """Summarize available finite runs without changing cached aggregates."""
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {stat: np.nan for stat in ("Best", "Worst", "Mean", "Std")}
+    best, worst = (arr.min(), arr.max()) if best_mode == "min" else (arr.max(), arr.min())
+    return {
+        "Best": float(best),
+        "Worst": float(worst),
+        "Mean": float(arr.mean()),
+        "Std": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+    }
+
+
+def statistical_run_groups(results_struct, dataset_names, args):
+    """Group cached records without mixing classifiers or transfer functions."""
+    grouped = {}
+    for dataset in dataset_names:
+        for label, row in results_struct.get(dataset, {}).items():
+            parsed = parse_result_label(label, args)
+            classifier = str(row.get("Estimator") or parsed["estimator"] or (
+                args.estimators[0] if len(args.estimators) == 1 else "unknown"
+            )).lower()
+            transfer = parsed["transfer_function"] or (
+                args.transfer_functions[0] if len(args.transfer_functions) == 1 else "unknown_tf"
+            )
+            combination = (optimizer_acronym(parsed["method"]), classifier, transfer.lower())
+            grouped.setdefault((dataset, combination), []).append(row)
+    return grouped
+
+
+def export_statistical_excel(
+    results_struct: Dict[str, Dict],
+    dataset_names: List[str],
+    optimizer_order: List[str],
+    args: argparse.Namespace,
+    out_path: str,
+):
+    """Export run statistics separately for every optimizer/classifier/TF combination."""
+    metrics = {
+        "Accuracy": ("AccRuns", "max"),
+        "Precision": ("PSRuns", "max"),
+        "Recall": ("RSRuns", "max"),
+        "F1Score": ("F1Runs", "max"),
+        "Fitness": ("FitRuns", "min"),
+        "Features": ("FeatRuns", "min"),
+        "Time": ("TimeRuns", "min"),
+    }
+    stats = ["Best", "Worst", "Mean", "Std"]
+    grouped = statistical_run_groups(results_struct, dataset_names, args)
+    present = list(dict.fromkeys(combination for _, combination in grouped))
+    orders = [
+        list(dict.fromkeys(optimizer_acronym(opt) for opt in optimizer_order)),
+        list(dict.fromkeys(str(est).lower() for est in args.estimators)),
+        list(dict.fromkeys(str(tf).lower() for tf in args.transfer_functions)),
+    ]
+    for axis, order in enumerate(orders):
+        order.extend(value for value in dict.fromkeys(group[axis] for group in present) if value not in order)
+    configured = [(optimizer_acronym(method), str(classifier).lower(), str(tf).lower())
+                  for method in optimizer_order for classifier in args.estimators for tf in args.transfer_functions]
+    combinations = sorted(dict.fromkeys(configured + present),
+                          key=lambda group: tuple(order.index(value) for order, value in zip(orders, group)))
+    headers = [f"{method} | {classifier.upper()} | {transfer.upper()}"
+               for method, classifier, transfer in combinations]
+    index = pd.MultiIndex.from_product([dataset_names, stats], names=["Dataset", "Statistic"])
+    with pd.ExcelWriter(out_path) as writer:
+        for sheet_name, (run_key, best_mode) in metrics.items():
+            frame = pd.DataFrame(np.nan, index=index, columns=headers)
+            for dataset in dataset_names:
+                for combination, header in zip(combinations, headers):
+                    chunks = [np.asarray(row.get(run_key, []), dtype=float).ravel()
+                              for row in grouped.get((dataset, combination), [])]
+                    values = np.concatenate(chunks) if chunks else []
+                    for stat, value in _run_stats(values, best_mode).items():
+                        frame.loc[(dataset, stat), header] = value
+            if headers:
+                frame.to_excel(writer, sheet_name=sheet_name, merge_cells=True)
+            else:
+                frame.reset_index().to_excel(writer, sheet_name=sheet_name, index=False)
+    return out_path
+
+
+def _holm_adjusted_pvalues(p_values: List[float]) -> np.ndarray:
+    """Return Holm step-down adjusted p-values in their original order."""
+    raw = np.asarray(p_values, dtype=float)
+    if raw.size == 0:
+        return raw
+    order = np.argsort(raw)
+    sorted_raw = raw[order]
+    multipliers = np.arange(raw.size, 0, -1, dtype=float)
+    sorted_adjusted = np.minimum(1.0, np.maximum.accumulate(sorted_raw * multipliers))
+    adjusted = np.empty_like(sorted_adjusted)
+    adjusted[order] = sorted_adjusted
+    return adjusted
+
+def calculate_friedman_analysis(
+    fitness_matrix: pd.DataFrame,
+    mode: str,
+    alpha: float = 0.05,
+) -> Dict[str, pd.DataFrame]:
+    """Calculate one Friedman test and conditional Wilcoxon-Holm post-hoc."""
+    mode_label = str(mode).upper()
+    complete = fitness_matrix.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any")
+    optimizers = list(fitness_matrix.columns)
+    enough_data = len(optimizers) >= 3 and complete.shape[0] >= 2
+
+    rank_matrix = pd.DataFrame(
+        index=complete.index,
+        columns=optimizers,
+        dtype=float,
+    )
+    for block_name, row in complete.iterrows():
+        rank_matrix.loc[block_name] = rankdata(row.to_numpy(dtype=float), method="average")
+    average_ranks = rank_matrix.mean(axis=0)
+
+    statistic = np.nan
+    p_value = np.nan
+    significant = False
+    status = "Insufficient complete blocks or optimizers"
+    all_tied = not complete.empty and bool((complete.nunique(axis=1) == 1).all())
+    if enough_data and all_tied:
+        status = "Friedman undefined: all optimizers tied in every complete block"
+    if enough_data and not all_tied:
+        samples = [complete[optimizer].to_numpy(dtype=float) for optimizer in optimizers]
+        statistic, p_value = friedmanchisquare(*samples)
+        statistic = float(statistic)
+        p_value = float(p_value)
+        significant = bool(np.isfinite(p_value) and p_value < alpha)
+        status = ("Significant differences detected" if significant else "No significant differences detected")
+        if not np.isfinite(statistic) or not np.isfinite(p_value):
+            status = "Friedman undefined for these blocks"
+
+    finite_ranks = average_ranks.dropna()
+    if finite_ranks.empty:
+        best_rank = np.nan
+        best_optimizers = []
+    else:
+        best_rank = float(finite_ranks.min())
+        best_optimizers = finite_ranks.index[np.isclose(finite_ranks, best_rank)].tolist()
+
+    summary = pd.DataFrame([{
+        "Mode": mode_label,
+        "Metric": "Final fitness (lower is better)",
+        "Aggregation": "Mean final fitness across independent runs per dataset/function and optimizer",
+        "Configured optimizers": len(optimizers),
+        "Available blocks": int(fitness_matrix.shape[0]),
+        "Complete blocks used": int(complete.shape[0]),
+        "Friedman statistic": statistic,
+        "p-value": p_value,
+        "Alpha": float(alpha),
+        "Significant": "YES" if significant else "NO",
+        "Conclusion": status,
+        "Best average rank optimizer(s)": ", ".join(map(str, best_optimizers)),
+        "Best average rank": best_rank,
+        "Post-hoc method": "Pairwise Wilcoxon signed-rank with Holm correction" if significant else "Not performed",
+    }])
+
+    ranks = pd.DataFrame({
+        "Optimizer": optimizers,
+        "Average rank": [float(average_ranks.get(opt, np.nan)) for opt in optimizers],
+        "Best average rank": ["YES" if opt in best_optimizers else "NO" for opt in optimizers],
+        "Complete blocks used": int(complete.shape[0]),
+    }).sort_values(["Average rank", "Optimizer"], na_position="last", ignore_index=True)
+
+    posthoc_columns = [
+        "Optimizer A",
+        "Optimizer B",
+        "Wilcoxon statistic",
+        "Raw p-value",
+        "Holm adjusted p-value",
+        f"Significant at alpha={alpha:g}",
+        "Better average rank",
+        "Note",
+    ]
+    posthoc_rows = []
+    if significant:
+        raw_p_values = []
+        pair_results = []
+        for left_idx, left in enumerate(optimizers[:-1]):
+            for right in optimizers[left_idx + 1:]:
+                left_values = complete[left].to_numpy(dtype=float)
+                right_values = complete[right].to_numpy(dtype=float)
+                if np.allclose(left_values, right_values, rtol=0.0, atol=0.0):
+                    pair_statistic, pair_p = 0.0, 1.0
+                else:
+                    pair_statistic, pair_p = wilcoxon(
+                        left_values,
+                        right_values,
+                        alternative="two-sided",
+                        method="auto",
+                    )
+                pair_results.append((left, right, float(pair_statistic), float(pair_p)))
+                raw_p_values.append(float(pair_p))
+
+        adjusted_p_values = _holm_adjusted_pvalues(raw_p_values)
+        for (left, right, pair_statistic, pair_p), adjusted_p in zip(pair_results, adjusted_p_values):
+            left_rank = float(average_ranks[left])
+            right_rank = float(average_ranks[right])
+            if np.isclose(left_rank, right_rank):
+                better_rank = "TIE"
+            else:
+                better_rank = left if left_rank < right_rank else right
+            posthoc_rows.append({
+                "Optimizer A": left,
+                "Optimizer B": right,
+                "Wilcoxon statistic": pair_statistic,
+                "Raw p-value": pair_p,
+                "Holm adjusted p-value": float(adjusted_p),
+                f"Significant at alpha={alpha:g}": "YES" if adjusted_p < alpha else "NO",
+                "Better average rank": better_rank,
+                "Note": "",
+            })
+    else:
+        posthoc_rows.append({
+            f"Significant at alpha={alpha:g}": "NO",
+            "Note": "Post-hoc not performed because the Friedman test was not significant or lacked sufficient data.",
+        })
+    posthoc = pd.DataFrame(posthoc_rows, columns=posthoc_columns)
+
+    return {
+        "summary": summary,
+        "ranks": ranks,
+        "posthoc": posthoc,
+        "blocks": fitness_matrix,
+        "block_ranks": rank_matrix,
+    }
+
+def build_friedman_fitness_matrix(results_struct, dataset_names, optimizer_order, args,
+                                 *, classifier, transfer_function):
+    """Mean finite FitRuns per dataset/method within one classifier/TF stratum."""
+    methods = list(dict.fromkeys(optimizer_acronym(method) for method in optimizer_order))
+    matrix = pd.DataFrame(np.nan, index=pd.Index(dataset_names, name="Dataset/Function"),
+                          columns=pd.Index(methods, name="Optimizer"))
+    grouped = statistical_run_groups(results_struct, dataset_names, args)
+    for dataset in dataset_names:
+        for method in methods:
+            rows = grouped.get((dataset, (method, classifier.lower(), transfer_function.lower())), [])
+            chunks = [np.asarray(row.get("FitRuns", []), dtype=float).ravel() for row in rows]
+            values = np.concatenate(chunks) if chunks else []
+            matrix.loc[dataset, method] = _run_stats(values, "min")["Mean"]
+    return matrix
+
+
+def export_friedman_analysis(results_struct, dataset_names, optimizer_order, args, out_path, alpha=0.05):
+    """Independent FULL comparisons per classifier/TF; Holm correction within each."""
+    tables = {key: [] for key in ("summary", "ranks", "posthoc", "blocks", "block_ranks")}
+    for classifier in dict.fromkeys(args.estimators):
+        for transfer in dict.fromkeys(args.transfer_functions):
+            matrix = build_friedman_fitness_matrix(
+                results_struct, dataset_names, optimizer_order, args,
+                classifier=classifier, transfer_function=transfer,
+            )
+            analysis = calculate_friedman_analysis(matrix, "FULL", alpha=alpha)
+            for key, frame in analysis.items():
+                frame = frame.reset_index() if key in {"blocks", "block_ranks"} else frame.copy()
+                frame.insert(0, "TransferFunction", transfer)
+                frame.insert(0, "Classifier", classifier)
+                tables[key].append(frame)
+    sheet_names = {
+        "summary": "FULL_Friedman", "ranks": "FULL_Average_Ranks",
+        "posthoc": "FULL_PostHoc_Holm", "blocks": "FULL_Block_Fitness",
+        "block_ranks": "FULL_Block_Ranks",
+    }
+    with pd.ExcelWriter(out_path) as writer:
+        for key, frames in tables.items():
+            frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            frame.to_excel(writer, sheet_name=sheet_names[key], index=False)
+    return out_path
+
 
 def generate_summary_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace) -> pd.DataFrame:
     rows = []
@@ -2171,8 +2513,17 @@ def generate_global_features_runtime(df, out_dir, opt_order):
         "09_global_features_runtime_tradeoff.png"
     )
 
-def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]):
-    results_struct = load_results_from_cache(paths, args, dataset_names, cache_sig)
+def export_reporting_outputs(paths, args, dataset_names, results_struct, statistical_results):
+    """The same complete set of derived outputs for fresh and cached results."""
+    excel_path = os.path.join(paths.res_dir, f"Global_Results_{paths.exp_tag}.xlsx")
+    exported = export_global_excel(results_struct, dataset_names, excel_path)
+    statistical_path = os.path.join(paths.res_dir, f"Statistical_Results_{paths.exp_tag}.xlsx")
+    export_statistical_excel(statistical_results, dataset_names, list(args.optimizers), args, statistical_path)
+    analysis_path = os.path.join(paths.res_dir, f"Full_Friedman_Analysis_{paths.exp_tag}.xlsx")
+    export_friedman_analysis(statistical_results, dataset_names, list(args.optimizers), args, analysis_path)
+    print(f"Global results: {', '.join(exported)}")
+    print(f"Statistical results: {statistical_path}")
+    print(f"Friedman analysis: {analysis_path}")
     summary_df = generate_summary_dataframe(results_struct, args)
     summary_csv = os.path.join(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv")
     summary_df.to_csv(summary_csv, index=False)
@@ -2182,6 +2533,15 @@ def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, datase
         paths.fig_dir,
         list(args.optimizers),
         args,
+    )
+    return exported, summary_csv, generated_charts
+
+
+def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]):
+    statistical_results = {}
+    results_struct = load_results_from_cache(paths, args, dataset_names, cache_sig, statistical_results=statistical_results)
+    _, summary_csv, generated_charts = export_reporting_outputs(
+        paths, args, dataset_names, results_struct, statistical_results,
     )
     return summary_csv, generated_charts
 
@@ -2260,14 +2620,21 @@ def main():
         miafex_csv_path = None
         cache_sig = build_cache_signature(args)
     else:
-        dataset_args = resolve_miafex_dataset_args(args)
+        metadata_args = argparse.Namespace(**vars(args))
+        if args.pipeline_mode != "extract":
+            # Resolve paths without requiring images to remain online for reporting.
+            metadata_args.figures_only = True
+            if (args.pipeline_mode == "full" and not args.figures_only
+                    and args.dataset_name is None and args.miafex_datasets is None and not args.dataset_root):
+                discovered = discover_miafex_datasets(args.miafex_dataset_root)
+                if discovered:
+                    metadata_args.miafex_datasets = sorted(discovered, key=str.lower)
+        dataset_args = resolve_miafex_dataset_args(metadata_args)
         dataset_names = list(dataset_args)
         miafex_csv_path = {name: miafex_feature_paths(scoped) for name, scoped in dataset_args.items()}
-        # Plot regeneration is cache-only and never prepares neural artifacts.
-        if not args.figures_only:
+        if args.pipeline_mode == "extract":
             for name, scoped in dataset_args.items():
                 miafex_csv_path[name] = resolve_miafex_csv(scoped)
-        if args.pipeline_mode == "extract":
             print("Completed MIAFEx feature preparation; feature selection was not run.")
             for name, csv_path in miafex_csv_path.items():
                 print(f"  {name}: {csv_path}")
@@ -2280,9 +2647,16 @@ def main():
 
     print_experiment_summary(args, paths, dataset_names, cache_sig, miafex_csv_path)
 
-    if args.figures_only:
+    complete = not args.figures_only and experiment_cache_is_complete(
+        paths, args, dataset_names, cache_sig,
+        dataset_args if args.dataset_source == "miafex" else None,
+    )
+    if args.figures_only or complete:
+        if complete:
+            print("[experiment-complete] All requested run IDs are cached in the current EXP; "
+                  "skipping training, extraction and feature selection.")
         summary_csv, generated_charts = regenerate_figures_from_cache(paths, args, dataset_names, cache_sig)
-        print("Completed figures-only.")
+        print("Completed cache-only reporting." if complete else "Completed figures-only.")
         print(f"Cache dir: {paths.cache_dir}")
         print(f"Figures dir: {paths.fig_dir}")
         print(f"Charts summary CSV: {summary_csv}")
@@ -2292,9 +2666,17 @@ def main():
                 print(f"  - {os.path.join(paths.fig_dir, name)}")
         return
 
+    if args.dataset_source == "miafex":
+        # Retain normal discovery/validation and neural preparation when incomplete.
+        dataset_args = resolve_miafex_dataset_args(args)
+        for name, scoped in dataset_args.items():
+            miafex_csv_path[name] = resolve_miafex_csv(scoped)
+
     results_struct = {}
+    statistical_results = {}
     for dataset_name in dataset_names:
         results_struct[dataset_name] = {}
+        statistical_results[dataset_name] = {}
         dataset_cache_sig = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
         if args.dataset_source == "mafese":
             mafese_data = get_dataset(dataset_name)
@@ -2418,14 +2800,12 @@ def main():
             save_cache(cache_file, cls_payload)
 
             results_struct[dataset_name].update(cls_payload)
+            statistical_results[dataset_name].update(statistical_classifier_rows(cls_payload, estimator, args))
 
-    excel_path = os.path.join(paths.res_dir, f"Global_Results_{paths.exp_tag}.xlsx")
-    exported = export_global_excel(results_struct, dataset_names, excel_path)
-    summary_df = generate_summary_dataframe(results_struct, args)
-    summary_csv = os.path.join(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv")
-    summary_df.to_csv(summary_csv, index=False)
+    exported, summary_csv, generated_charts = export_reporting_outputs(
+        paths, args, dataset_names, results_struct, statistical_results,
+    )
     chart_dir = paths.fig_dir
-    generated_charts = generate_seven_global_charts(summary_df, results_struct, chart_dir, list(args.optimizers), args)
 
     print("Completed.")
     print(f"Cache dir: {paths.cache_dir}")

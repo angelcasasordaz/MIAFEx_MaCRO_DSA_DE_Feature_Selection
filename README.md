@@ -12,10 +12,10 @@ KNN/SVM, `vstf_01`, 20 runs, 200 FS epochs, 30 agents, and parallel execution.
 `PIPELINE_MODE = "full"`, `MIAFEX_TRAIN = "yes"`, and `MIAFEX_EXTRACT = "yes"`
 force MIAFEx retraining and regeneration of both train/test feature partitions,
 then proceed to feature selection.
-`EXP_ID = 603`, `REUSE_CACHE = True`, and `REUSE_CACHE_FROM_EXP_ID = None`
-disable reuse from other experiments while preserving cache/resume within EXP 603.
-Existing compatible EXP 603 results/progress can still be reused; a fresh FS run
-assumes EXP 603 has no existing compatible results/progress.
+`EXP_ID = 604`, `REUSE_CACHE = True`, and `REUSE_CACHE_FROM_EXP_ID = None`
+disable reuse from other experiments while preserving cache/resume within EXP 604.
+Existing compatible EXP 604 results/progress can still be reused; a fresh FS run
+assumes EXP 604 has no existing compatible results/progress.
 
 Set `MIAFEX_DATASETS = None` to discover all datasets, set a list, or pass
 `--miafex-datasets Brain_MRI Chest_CT` to select a subset. `--dataset-name`
@@ -69,7 +69,11 @@ limit is also capped by pending runs. Each wrapper run limits BLAS/OpenMP and
 joblib to one thread during selection and final evaluation, including serial
 runs. The limits are restored afterwards, so MIAFEx extraction keeps its own
 thread settings. Workers use `spawn` to avoid inheriting initialized native
-thread pools. The automatic process limit is a resource cap, not a measured
+thread pools. A pool initializer installs read-only train/test arrays once per
+worker; individual run tasks carry metadata and seeds, not the dataset arrays.
+Native thread pools stay limited to one thread per worker, and the existing
+per-run joblib/thread limits, heartbeat, and immediate checkpoints are retained.
+The automatic process limit is a resource cap, not a measured
 optimal count; `--n-workers` can lower it on memory-constrained machines.
 
 Cache lookup prefers the current EXP. `REUSE_CACHE_FROM_EXP_ID` (or
@@ -99,6 +103,58 @@ Safe inspection commands (no training or feature selection):
 python main_best.py --help
 python main_best.py --list-miafex-datasets
 ```
+
+## Multi-run statistical reporting
+
+Normal result reporting and `--figures-only` also write
+`Results/EXPxxx/Statistical_Results_EXPxxx.xlsx` under `--output-root`.
+This additional workbook leaves Global Results, the summary CSV, and figures
+unchanged. It reads the cached per-run arrays without training or optimization
+in figures-only mode, including available runs in partial/resumable caches.
+Cache formats and scientific signatures are unchanged.
+
+The seven sheets are `Accuracy`, `Precision`, `Recall`, `F1Score`, `Fitness`,
+`Features`, and `Time`. Each has `Dataset` and `Statistic` columns followed by
+one column per `Optimizer | CLASSIFIER | TRANSFER_FUNCTION` combination in
+configured optimizer/classifier/transfer order. Configured combinations with no
+available runs retain blank cells; additional cached combinations are retained.
+Each dataset has four rows: `Best`, `Worst`, `Mean`, and `Std`.
+Best is the maximum for Accuracy/Precision/Recall/F1Score and the minimum for
+Fitness/Features/Time; Worst uses the opposite direction. All statistics ignore
+NaN and infinite values independently per metric. Std uses `ddof=1`, or zero
+for one finite run; no finite runs produces blank cells. Values retain their
+stored units (Accuracy in percent, Precision/Recall/F1Score as fractions,
+Features as counts, and Time in seconds). Missing arrays are not inferred from
+cached means.
+
+`Full_Friedman_Analysis_EXPxxx.xlsx` adds the FULL-comparison analysis, separately
+for every classifier/transfer-function pair. Its sheets are `FULL_Friedman`,
+`FULL_Average_Ranks`, `FULL_PostHoc_Holm`, `FULL_Block_Fitness`, and
+`FULL_Block_Ranks`, each identifying `Classifier` and `TransferFunction`.
+Dataset blocks contain mean finite `FitRuns` values for each configured optimizer
+(lower is better). Only datasets with a finite mean for every configured optimizer
+enter a comparison. Average ranks use average ties; Friedman requires at least
+three methods and two complete datasets. Insufficient data or an all-tied,
+undefined test is reported explicitly with blank test results. A significant
+Friedman result (`p < 0.05`) enables two-sided paired Wilcoxon tests with Holm
+correction across all method pairs **within that classifier/transfer stratum**.
+No classifiers or transfer functions are pooled, and cached means are not used
+as substitutes for missing run arrays.
+
+`FIGURES_ONLY=True` / `--figures-only` regenerates **all** derived outputs from
+compatible cache: Global Results, the summary CSV, both statistical workbooks,
+and the existing figures. Image/feature data are not loaded and no neural or
+feature-selection execution occurs.
+
+Before normal full/feature-selection execution loads data or prepares neural
+artifacts, the framework checks compatible **current-EXP** caches for every
+requested dataset/optimizer/classifier/transfer combination and every requested
+run ID. A complete cache prints `[experiment-complete]` and regenerates those
+same outputs immediately. Partial or missing combinations retain the existing
+execution/resume flow. This check does not import source-EXP caches and respects
+`--no-reuse-cache` (current progress remains resumable). Atomic cache writes,
+non-contiguous run IDs, source priority, legacy handling, implementation-revision
+guards, and scientific signatures are unchanged.
 
 ## Python environment
 
