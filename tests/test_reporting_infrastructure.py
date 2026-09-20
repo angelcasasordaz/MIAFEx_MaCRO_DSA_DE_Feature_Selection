@@ -131,7 +131,8 @@ class CompleteCacheTests(unittest.TestCase):
                         label = framework.build_alg_label(method, tf, classifier, True, True)
                         payload[label] = framework.build_label_payload(
                             classifier, *[[run + 1.0 for run in ids] for _ in range(7)],
-                            [np.array([1])] * len(ids), 1, completed_run_ids=None if legacy else list(ids),
+                            [np.full(self.args.epochs, run + 1.0) for run in ids], self.args.epochs,
+                            completed_run_ids=None if legacy else list(ids),
                         )
                 filename = framework.cache_files(paths, dataset, classifier, self.signatures[dataset])[0]
                 framework.save_cache(filename, payload)

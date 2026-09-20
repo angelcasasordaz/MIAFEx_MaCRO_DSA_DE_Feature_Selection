@@ -13,6 +13,7 @@ import main_best as framework
 
 class PipelineConfigurationTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(framework, 'PLOT_ESTIMATORS', ['knn', 'svm']))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -24,6 +25,7 @@ class PipelineConfigurationTests(unittest.TestCase):
             "--feature-dataset-root", str(self.root / "features"),
         ])
         self.args.miafex_datasets = None  # Test discovery independently of the controlled-run defaults.
+        self.args.figures_only = False
         self.args.miafex_device = "cpu"
         for name in ("A", "B"):
             for split in ("train", "test"):
@@ -226,7 +228,8 @@ class PipelineConfigurationTests(unittest.TestCase):
             X_test=np.arange(1000, 1008).reshape(4, 2), y_test=np.array([0, 1, 0, 1]),
         )
         optimizer = Mock()
-        optimizer.history = SimpleNamespace(list_global_best_fit=[0.1])
+        optimizer.history = SimpleNamespace(list_global_best_fit=[0.1] * self.args.epochs)
+        optimizer.g_best = SimpleNamespace(target=SimpleNamespace(fitness=0.1))
         def solve(problem, **kwargs):
             # Exercise MAFESE's real fit/problem construction but no optimizer run.
             self.assertTrue(np.all(problem.data.X_train < 1000))
@@ -332,7 +335,10 @@ class PipelineConfigurationTests(unittest.TestCase):
         signatures = {name: framework.build_cache_signature(self.scoped(name)) for name in ("A", "B")}
         for name in signatures:
             framework.save_cache(str(Path(paths.cache_dir) / f"{paths.exp_tag}_{name}_knn_{signatures[name]}_results.pkl"),
-                                 {"sample": {"CompletedRuns": 1}})
+                                 {"sample": framework.build_label_payload(
+                                     "knn", *[[0.1] for _ in range(7)],
+                                     [framework.np.full(self.args.epochs, 0.1)], self.args.epochs,
+                                 )})
         results = framework.load_results_from_cache(paths, self.args, ["A", "B"], signatures)
         self.assertEqual(set(results), {"A", "B"})
         self.assertEqual(results["A"]["sample"]["CompletedRuns"], 1)
@@ -363,7 +369,8 @@ class PipelineConfigurationTests(unittest.TestCase):
         self.args.parallel = "no"
         result = {"as_test": 75.0, "ps_test": 0.75, "rs_test": 0.75,
                   "f1_test": 0.75, "fit_final": 0.2, "n_features": 1,
-                  "runtime": 0.01, "curve": [0.3, 0.2]}
+                  "runtime": 0.01, "curve": [0.3, 0.2],
+                  "convergence": framework.convergence_metadata(2, 0.2)}
         with patch.object(framework, "resolve_optimizers", return_value=["OriginalPSO"]), \
                 patch.object(framework, "optimizer_display_label", return_value="PSO"), \
                 patch.object(framework.Data, "split_train_test", side_effect=AssertionError("MIAFEx must never resplit its prepared partitions")), \
@@ -423,7 +430,8 @@ class PipelineConfigurationTests(unittest.TestCase):
             return real_split(data, **kwargs)
         result = {"as_test": 75.0, "ps_test": 0.75, "rs_test": 0.75,
                   "f1_test": 0.75, "fit_final": 0.2, "n_features": 1,
-                  "runtime": 0.01, "curve": [0.3, 0.2]}
+                  "runtime": 0.01, "curve": [0.3, 0.2],
+                  "convergence": framework.convergence_metadata(2, 0.2)}
         with patch.object(framework, "resolve_mafese_dataset_names", return_value=["Internal"]), \
                 patch.object(framework, "get_dataset", return_value=SimpleNamespace(X=X, y=y)), \
                 patch.object(framework, "resolve_optimizers", return_value=["OriginalPSO"]), \

@@ -27,6 +27,7 @@ def synthetic_result(seed):
         # Fixed synthetic runtime lets us compare every cache field exactly.
         "runtime": 0.01 + seed / 100000,
         "curve": framework.np.array([0.5, 0.4, 1 - values[0]]),
+        "convergence": framework.convergence_metadata(3, 1 - values[0]),
     }
 
 
@@ -46,6 +47,7 @@ def synthetic_parallel_task(task):
 
 class ParallelResumeTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(framework, 'PLOT_ESTIMATORS', ['knn', 'svm']))
         temporary = tempfile.TemporaryDirectory(prefix="parallel-resume-test-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -59,6 +61,7 @@ class ParallelResumeTests(unittest.TestCase):
             "--fs-epochs", "3", "--n-workers", "4", "--parallel", "yes",
             "--train-miafex", "auto", "--extract-miafex", "auto",
         ])
+        self.args.figures_only = False
         for split in ("train", "test"):
             for label in ("a", "b"):
                 directory = self.root / "images" / split / label
@@ -161,7 +164,8 @@ class ParallelResumeTests(unittest.TestCase):
                 "as_test", "ps_test", "rs_test", "f1_test", "fit_final", "n_features", "runtime", "curve",
             )], self.args.epochs,
         )
-        self.assert_payload_equal({k: v for k, v in resumed.items() if k != "CompletedRunIDs"}, original)
+        self.assert_payload_equal({k: v for k, v in resumed.items()
+                                   if k not in {"CompletedRunIDs", "ConvergenceRuns"}}, original)
         self.assertEqual(self.neural_artifacts, {
             path: (path.read_bytes(), path.stat().st_mtime_ns) for path in self.neural_artifacts
         })

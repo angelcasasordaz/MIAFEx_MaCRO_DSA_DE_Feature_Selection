@@ -26,6 +26,7 @@ METRICS = {
 
 class StatisticalReportingTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(framework, 'PLOT_ESTIMATORS', ['knn', 'svm']))
         temporary = tempfile.TemporaryDirectory(prefix="statistical-reporting-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -142,7 +143,7 @@ class StatisticalReportingTests(unittest.TestCase):
             values = [1.0, 3.0, 5.0] if classifier == "knn" else [11.0, 13.0, 15.0]
             row = framework.build_label_payload(
                 classifier, *[values for _ in METRICS],
-                [np.array([0.5])] * 3, 1, completed_run_ids=run_ids,
+                [np.full(args.epochs, value) for value in values], args.epochs, completed_run_ids=run_ids,
             )
             # Both classifier caches deliberately use the same legacy label.
             label = framework.build_alg_label(args.optimizers[0], "vstf_01", classifier, False, False)
@@ -196,7 +197,8 @@ class StatisticalReportingTests(unittest.TestCase):
         paths = framework.make_paths(args)
         signature = framework.build_cache_signature(scoped)
         row = framework.build_label_payload("knn", *[[1, 3, 5] for _ in METRICS],
-                                            [np.array([0.5])] * 3, 1, completed_run_ids=[0, 1, 2])
+                                            [np.full(args.epochs, value) for value in (1, 3, 5)],
+                                            args.epochs, completed_run_ids=[0, 1, 2])
         label = framework.build_alg_label(args.optimizers[0], "vstf_01", "knn", False, False)
         framework.save_cache(framework.cache_files(paths, "Synthetic", "knn", signature)[0], {label: row})
         with ExitStack() as stack:

@@ -78,7 +78,6 @@ def available_memory_bytes() -> int | None:
         pass
     return None
 
-
 def automatic_worker_count() -> int:
     """Cap workers by usable CPUs and available RAM; always allow one worker."""
     cpus = os.cpu_count() or 1
@@ -92,7 +91,6 @@ def automatic_worker_count() -> int:
         return cpu_limit
     ram_limit = max(1, (available - AUTO_RAM_RESERVE_BYTES) // AUTO_WORKER_RAM_BYTES)
     return min(cpu_limit, ram_limit)
-
 
 # User-editable configuration: the full experiment used by PyCharm's Run action.
 # Dataset and pipeline
@@ -147,7 +145,8 @@ DSADE_MAHAL_Q = 0.68
 EXP_ID = 604
 REUSE_CACHE = True
 REUSE_CACHE_FROM_EXP_ID = None  # None: current EXP only; another ID: read-only fallback.
-FIGURES_ONLY = False
+FIGURES_ONLY = True
+PLOT_ESTIMATORS = ["svm"]  # Figures/reports only; never affects experiments or cache signatures. "knn",
 
 # Parallelize independent runs; each wrapper uses one native/joblib thread.
 PARALLEL = True
@@ -1021,8 +1020,12 @@ def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: a
     selector.fit(data.X_train, data.y_train, **fit_kwargs)
     runtime = time.time() - t0
 
-    fit_curve = np.array(selector.optimizer.history.list_global_best_fit, dtype=float)
-    fit_final = float(fit_curve[-1]) if fit_curve.size else np.nan
+    final_best = float(selector.optimizer.g_best.target.fitness)
+    fit_curve = validate_convergence_curve(
+        selector.optimizer.history.list_global_best_fit, args.epochs, final_best,
+    )
+    # Preserve the existing reported fitness; independently check it above.
+    fit_final = float(fit_curve[-1])
 
     selected = selector.transform(data.X_train)
     n_features = int(selected.shape[1])
@@ -1060,6 +1063,7 @@ def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: a
         "n_features": n_features,
         "runtime": runtime,
         "curve": fit_curve,
+        "convergence": convergence_metadata(args.epochs, final_best),
     }
 
 
@@ -1211,15 +1215,138 @@ def completed_run_ids(payload: dict) -> List[int]:
     return run_ids
 
 
+CONVERGENCE_VERSION = 1  # Per-run evidence only; deliberately outside scientific signatures.
+
+
+def convergence_metadata(epochs: int, final_best: float) -> dict:
+    return {
+        "version": CONVERGENCE_VERSION,
+        "epochs": epochs,
+        "history_source": "optimizer.history.list_global_best_fit",
+        "final_best_source": "optimizer.g_best.target.fitness",
+        "final_best": float(final_best),
+    }
+
+
+def validate_convergence_curve(curve, epochs: int, final_best=None) -> np.ndarray:
+    """Validate without padding, truncating, smoothing or correcting fitness."""
+    curve = np.asarray(curve, dtype=float)
+    if epochs < 1 or curve.shape != (epochs,):
+        raise ValueError(f"curve shape {curve.shape}; expected ({epochs},), non-empty")
+    if not np.isfinite(curve).all():
+        raise ValueError("curve contains non-finite values")
+    if np.any(np.diff(curve) > 0):
+        raise ValueError("minimization best-so-far curve increases")
+    if final_best is not None:
+        final_best = float(final_best)
+        if not np.isfinite(final_best) or not np.isclose(curve[-1], final_best, rtol=1e-12, atol=1e-15):
+            raise ValueError(f"curve endpoint {curve[-1]} does not match final fitness {final_best}")
+    return curve.copy()
+
+
+def validate_convergence_metadata(metadata, curve, epochs):
+    if not isinstance(metadata, dict):
+        raise ValueError("missing independent convergence evidence")
+    expected = convergence_metadata(epochs, 0.0)
+    if any(metadata.get(key) != value for key, value in expected.items() if key != "final_best"):
+        raise ValueError("unsupported or inconsistent convergence metadata")
+    if metadata.get("final_best") is None:
+        raise ValueError("missing independent final-best value")
+    validate_convergence_curve(curve, epochs, metadata["final_best"])
+
+
 def pad_mean_curves(curves: List[np.ndarray], target_len: int) -> np.ndarray:
-    if not curves:
-        return np.array([])
-    mat = np.full((len(curves), target_len), np.nan, dtype=float)
-    for i, curve in enumerate(curves):
-        c = np.asarray(curve, dtype=float).ravel()
-        ln = min(target_len, c.size)
-        mat[i, :ln] = c[:ln]
-    return np.nanmean(mat, axis=0)
+    """Compatibility name: strict mean of validated, equal-length histories."""
+    if len(curves) == 0:
+        raise ValueError("cannot average an empty collection of convergence curves")
+    validated = [validate_convergence_curve(curve, target_len) for curve in curves]
+    return np.mean(np.stack(validated), axis=0)
+
+
+def cached_convergence_errors(row: dict, epochs: int) -> tuple[dict, list]:
+    """Return per-run failures and aggregate failures; legacy evidence is optional."""
+    ids = completed_run_ids(row)
+    curves = row.get("CurvesAll", [])
+    fitness = row.get("FitRuns", [])
+    evidence = row.get("ConvergenceRuns", {})
+    if not isinstance(evidence, dict) or set(evidence) - set(ids):
+        raise ValueError("ConvergenceRuns must map recorded run IDs to evidence")
+    if len(curves) > len(ids):
+        raise ValueError("extra individual curves cannot be aligned with run IDs")
+    for key in ("PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns"):
+        if len(row.get(key, [])) > len(ids):
+            raise ValueError(f"extra {key} entries cannot be aligned with run IDs")
+    invalid = {}
+    for index, run in enumerate(ids):
+        try:
+            # Keep all cached metrics aligned when recovering a particular run.
+            for key in ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns"):
+                if index >= len(row.get(key, [])):
+                    raise ValueError(f"missing {key} entry")
+            if index >= len(curves):
+                raise ValueError("missing individual curve")
+            if fitness[index] is None:
+                raise ValueError("missing FitRuns value")
+            validate_convergence_curve(curves[index], epochs, fitness[index])
+            if run in evidence:
+                validate_convergence_metadata(evidence[run], curves[index], epochs)
+        except (TypeError, ValueError, OverflowError) as exc:
+            invalid[run] = str(exc)
+    aggregate = []
+    if not ids:
+        aggregate.append("no individual curves stored")
+    elif not invalid:
+        try:
+            mean = pad_mean_curves(curves, epochs)
+            stored = validate_convergence_curve(row.get("Curve", []), epochs)
+            if not np.allclose(stored, mean, rtol=1e-12, atol=1e-15):
+                raise ValueError("stored Curve differs from mean of individual curves")
+            mean_fitness = float(np.mean(fitness))
+            if not np.isclose(stored[-1], mean_fitness, rtol=1e-12, atol=1e-15):
+                raise ValueError("mean curve endpoint differs from mean FitRuns")
+            if not np.isclose(row.get("FitMean", np.nan), mean_fitness, rtol=1e-12, atol=1e-15):
+                raise ValueError("FitMean differs from mean FitRuns")
+        except (TypeError, ValueError, OverflowError) as exc:
+            aggregate.append(str(exc))
+    return invalid, aggregate
+
+
+def report_cached_convergence(payload, epochs, context, *, figures_only=False):
+    problems = []
+    for label, row in payload.items():
+        try:
+            invalid, aggregate = cached_convergence_errors(row, epochs)
+            problems.extend(f"{label} run {run + 1}: {reason}" for run, reason in invalid.items())
+            problems.extend(f"{label}: {reason}" for reason in aggregate)
+        except (TypeError, ValueError) as exc:
+            problems.append(f"{label}: {exc}")
+    if problems:
+        message = f"Invalid convergence cache ({context}): " + "; ".join(problems)
+        if figures_only:
+            raise ValueError(message + ". FIGURES_ONLY will not rerun or rewrite cached runs.")
+        print(f"[convergence-cache] {message}", flush=True)
+    return bool(problems)
+
+
+def prepare_cached_convergence(row, epochs):
+    """Keep valid rows, remove only invalid run IDs, rebuild derived aggregates."""
+    if not row:
+        return row
+    invalid, aggregate = cached_convergence_errors(row, epochs)
+    if not invalid and not aggregate:
+        return row
+    ids = completed_run_ids(row)
+    keep = [index for index, run in enumerate(ids) if run not in invalid]
+    if not keep:
+        return {}
+    kept_ids = [ids[index] for index in keep]
+    return build_label_payload(
+        row["Estimator"],
+        *[[row[key][index] for index in keep] for key in (
+            "AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns", "CurvesAll",
+        )], epochs, completed_run_ids=kept_ids,
+        convergence_runs={run: meta for run, meta in row.get("ConvergenceRuns", {}).items() if run in kept_ids},
+    )
 
 def build_label_payload(
     estimator: str,
@@ -1233,7 +1360,11 @@ def build_label_payload(
     curves: List[np.ndarray],
     epochs: int,
     completed_run_ids: List[int] | None = None,
+    convergence_runs: dict | None = None,
 ):
+    if any(len(values) != len(acc_runs) for values in
+           (ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves)):
+        raise ValueError("run metrics and individual curves must have equal counts")
     if completed_run_ids is not None:
         # Completion order must not change the scientific aggregation or exported run order.
         order = np.argsort(completed_run_ids)
@@ -1265,6 +1396,12 @@ def build_label_payload(
     }
     if completed_run_ids is not None:
         payload["CompletedRunIDs"] = sorted(completed_run_ids)
+    if convergence_runs:
+        # Only newly executed runs carry independent evidence, including mixed caches.
+        payload["ConvergenceRuns"] = dict(convergence_runs)
+    invalid, aggregate = cached_convergence_errors(payload, epochs)
+    if invalid or aggregate:
+        raise ValueError(f"Invalid convergence payload: runs={invalid}; aggregates={aggregate}")
     return payload
 
 def save_cache(path: str, payload: dict):
@@ -1333,7 +1470,9 @@ def resolve_cached_payload(paths: Paths, args: argparse.Namespace, dataset_name:
 
     payload, found_sig = read_best(paths)
     if payload is not None:
-        if found_sig != signature:
+        report_cached_convergence(payload, args.epochs, f"{paths.exp_tag}/{dataset_name}/{estimator}",
+                                  figures_only=figures_only)
+        if found_sig != signature and not figures_only:
             publish(payload)
         print(f"CACHE HIT CURRENT | {paths.exp_tag} | {dataset_name} / {estimator}"
               + (" | migrated legacy signature" if found_sig != signature else ""), flush=True)
@@ -1344,7 +1483,10 @@ def resolve_cached_payload(paths: Paths, args: argparse.Namespace, dataset_name:
         source = make_paths(args, exp_id=source_id, create=False)
         payload, found_sig = read_best(source)
         if payload is not None:
-            publish(payload)
+            report_cached_convergence(payload, args.epochs, f"{source.exp_tag}/{dataset_name}/{estimator}",
+                                      figures_only=figures_only)
+            if not figures_only:
+                publish(payload)
             print(f"CACHE IMPORTED | {source.exp_tag} -> {paths.exp_tag} | {dataset_name} / {estimator}"
                   + (" | migrated legacy signature" if found_sig != signature else ""), flush=True)
             return payload
@@ -1429,6 +1571,8 @@ def experiment_cache_is_complete(paths, args, dataset_names, cache_sig, dataset_
                             complete = required_ids.issubset(ids) and all(
                                 len(row.get(key, [])) == len(ids) for key in run_keys
                             )
+                            invalid, aggregate = cached_convergence_errors(row, args.epochs)
+                            complete = complete and not invalid and not aggregate
                         except (TypeError, ValueError):
                             complete = False
                         if complete:
@@ -1936,6 +2080,7 @@ def generate_classifier_metric_grid_chart(df: pd.DataFrame, out_dir: str, opt_or
 
     plot_df = df.copy()
     plot_df["Estimador"] = plot_df["Estimador"].astype(str).str.lower()
+    plot_df = plot_df[plot_df["Estimador"].isin(PLOT_ESTIMATORS)]
     plot_df, opts, color_map, label_map = prepare_plot_groups(plot_df, opt_order)
     if not opts:
         return None
@@ -1951,7 +2096,7 @@ def generate_classifier_metric_grid_chart(df: pd.DataFrame, out_dir: str, opt_or
     ]
 
     present_estimators = [str(e).lower() for e in plot_df["Estimador"].dropna().unique()]
-    required_estimators = [e for e in DEFAULT_ESTIMATORS if e in SUPPORTED_ESTIMATORS]
+    required_estimators = [e for e in DEFAULT_ESTIMATORS if e in SUPPORTED_ESTIMATORS and e in PLOT_ESTIMATORS]
     estimators = [e for e in SUPPORTED_ESTIMATORS if e in set(required_estimators + present_estimators)]
     estimators += sorted(e for e in present_estimators if e not in set(estimators))
     if not estimators:
@@ -2100,14 +2245,144 @@ def _grid_shape(n_items: int) -> tuple[int, int]:
     return n_rows, n_cols
 
 
+def _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group):
+    categories = ["Accuracy", "Precision", "Recall", "F1-Score", "Feat.\nEfficiency"]
+    angles = [n / 5.0 * 2 * np.pi for n in range(5)]
+    angles += angles[:1]
+    sub = plot_df[plot_df["Archivo"] == dataset]
+    medias = sub.groupby("GrupoGrafica")[["AS_test", "PS_test", "RS_test", "F1_test", "N_Features_Selected"]].mean()
+    max_feat = max(float(medias["N_Features_Selected"].max()), 1.0)
+    for opt in opts:
+        if opt not in medias.index:
+            continue
+        row = medias.loc[opt]
+        vals = [row["AS_test"], row["PS_test"], row["RS_test"], row["F1_test"], 1 - row["N_Features_Selected"] / max_feat]
+        vals += vals[:1]
+        is_dsade = is_dsade_method(method_by_group.get(opt))
+        is_macro = method_by_group.get(opt) == "MaCRO-DE"
+
+        ax.plot(
+            angles,
+            vals,
+            color=color_map.get(opt, "#888"),
+            linewidth=4.0 if is_macro else (2.4 if is_dsade else 1.1),
+            linestyle="-" if is_macro else ("-" if is_dsade else "--"),
+            zorder=10 if is_macro else 2
+        )
+
+        ax.fill(
+            angles,
+            vals,
+            color=color_map.get(opt, "#888"),
+            alpha=0.20 if is_macro else (0.12 if is_dsade else 0.04)
+        )
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(dataset, fontsize=11, fontweight="bold", pad=14)
+
+
+def _draw_dataset_features_runtime(ax1, dataset, plot_df, opts, color_map, label_map):
+    ax2 = ax1.twinx()
+    sub = plot_df[plot_df["Archivo"] == dataset].groupby("GrupoGrafica")[["N_Features_Selected", "Runtime"]].mean()
+    x = np.arange(len(opts))
+    feat_vals = [sub.loc[o, "N_Features_Selected"] if o in sub.index else np.nan for o in opts]
+    rt_vals = [sub.loc[o, "Runtime"] if o in sub.index else np.nan for o in opts]
+    colors = [color_map.get(o, "#888") for o in opts]
+    ax1.bar(x - 0.18, feat_vals, 0.36, color=colors, alpha=0.85)
+    ax2.bar(x + 0.18, rt_vals, 0.36, color=colors, alpha=0.40, hatch="///")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([label_map.get(o, o) for o in opts], rotation=45, ha="right", fontsize=7)
+    ax1.set_ylabel("Features", fontsize=9)
+    ax2.set_ylabel("Runtime (s)", fontsize=9)
+    ax1.set_title(dataset, fontsize=11, fontweight="bold")
+    ax1.grid(axis="y", alpha=0.25)
+
+
+def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map):
+    sub = curve_plot_df[curve_plot_df["Archivo"] == dataset] if not curve_plot_df.empty else pd.DataFrame()
+    plotted = False
+    for opt in curve_opts:
+        rows_opt = sub[sub["GrupoGrafica"] == opt] if not sub.empty else pd.DataFrame()
+        if rows_opt.empty:
+            continue
+        curve = np.asarray(rows_opt.iloc[0]["Curve"], dtype=float)
+        if curve.size == 0:
+            continue
+        is_dsade = is_dsade_method(rows_opt.iloc[0]["Optimizador"])
+        is_macro = str(rows_opt.iloc[0]["Optimizador"]).upper() == "MACRO-DE"
+        ax.plot(curve, color=curve_color_map.get(opt, "#888"), linewidth=2.4 if is_macro else (2.4 if is_dsade else 1.4), linestyle="-")
+        plotted = True
+    if not plotted:
+        ax.text(0.5, 0.5, "Sin curvas", transform=ax.transAxes, ha="center", va="center", color="#777")
+    ax.set_title(dataset, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Iteration", fontsize=9)
+    ax.set_ylabel("Fitness", fontsize=9)
+    ax.grid(alpha=0.25)
+
+
+def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args):
+    """Export standalone panels using the combined plots' data and drawing code."""
+    saved = []
+    if df.empty:
+        return saved
+    os.makedirs(out_dir, exist_ok=True)
+    for estimator in dict.fromkeys(PLOT_ESTIMATORS):
+        selected = df[df["Estimador"].astype(str).str.lower() == estimator]
+        plot_df, opts, color_map, label_map = prepare_plot_groups(selected, opt_order)
+        if not opts:
+            continue
+        method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
+        curve_df = build_curve_dataframe(results_struct, args, estimator)
+        if curve_df.empty:
+            curve_plot_df = pd.DataFrame()
+            curve_opts, curve_color_map, curve_label_map = opts, color_map, label_map
+        else:
+            curve_plot_df, curve_opts, curve_color_map, curve_label_map = prepare_plot_groups(curve_df, opt_order)
+
+        for dataset in sorted(plot_df["Archivo"].dropna().unique()):
+            fig, ax = plt.subplots(figsize=(6.4, 6.4), subplot_kw=dict(polar=True))
+            _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group)
+            _individual_dataset_legend(fig, opts, color_map, label_map)
+            filename = f"02_radar_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(filename)
+
+            fig, ax = plt.subplots(figsize=(max(7.0, 0.5 * len(opts)), 5.0))
+            _draw_dataset_features_runtime(ax, dataset, plot_df, opts, color_map, label_map)
+            fig.tight_layout()
+            filename = f"03_features_runtime_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(filename)
+
+            fig, ax = plt.subplots(figsize=(7.0, 5.4))
+            _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map)
+            _individual_dataset_legend(fig, curve_opts, curve_color_map, curve_label_map)
+            filename = f"05_convergence_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(filename)
+    return saved
+
+
+def _individual_dataset_legend(fig, opts, color_map, label_map):
+    columns = min(len(opts), 3)
+    rows = int(np.ceil(len(opts) / columns))
+    fig.legend(handles=_plot_legend_patches(opts, color_map, label_map),
+               loc="lower center", ncol=columns, fontsize=9)
+    fig.tight_layout(rect=[0.0, 0.04 + 0.035 * rows, 1.0, 1.0])
+
+
 def generate_seven_global_charts(
     df: pd.DataFrame,
     results_struct: Dict[str, Dict],
     out_dir: str,
     opt_order: List[str],
     args: argparse.Namespace,
-    estimator_filter: str = "svm", # Change here for knn
+    estimator_filter: str = "svm",  # Preserve the legacy combined-chart selection.
 ):
+    if df.empty:
+        return []
+    df = df[df["Estimador"].astype(str).str.lower().isin(PLOT_ESTIMATORS)]
     if df.empty:
         return []
     os.makedirs(out_dir, exist_ok=True)
@@ -2119,6 +2394,10 @@ def generate_seven_global_charts(
         os.replace(os.path.join(out_dir, chart1), os.path.join(out_dir, new_chart1))
         saved.append(new_chart1)
 
+    saved.extend(generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args))
+    # Keep legacy combined filenames/layouts, but honor a single-classifier selection.
+    if estimator_filter.lower() not in PLOT_ESTIMATORS:
+        estimator_filter = PLOT_ESTIMATORS[0]
     knn_df = df[df["Estimador"].astype(str).str.lower() == estimator_filter.lower()].copy()
     if knn_df.empty:
         return saved
@@ -2129,9 +2408,6 @@ def generate_seven_global_charts(
     datasets = sorted(plot_df["Archivo"].dropna().unique())
     n_rows, n_cols = _grid_shape(len(datasets))
 
-    categories = ["Accuracy", "Precision", "Recall", "F1-Score", "Feat.\nEfficiency"]
-    angles = [n / 5.0 * 2 * np.pi for n in range(5)]
-    angles += angles[:1]
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
@@ -2141,39 +2417,7 @@ def generate_seven_global_charts(
     )
     for idx, dataset in enumerate(datasets):
         ax = axes[idx // n_cols, idx % n_cols]
-        sub = plot_df[plot_df["Archivo"] == dataset]
-        medias = sub.groupby("GrupoGrafica")[["AS_test", "PS_test", "RS_test", "F1_test", "N_Features_Selected"]].mean()
-        max_feat = max(float(medias["N_Features_Selected"].max()), 1.0)
-        for opt in opts:
-            if opt not in medias.index:
-                continue
-            row = medias.loc[opt]
-            vals = [row["AS_test"], row["PS_test"], row["RS_test"], row["F1_test"], 1 - row["N_Features_Selected"] / max_feat]
-            vals += vals[:1]
-            is_dsade = is_dsade_method(method_by_group.get(opt))
-            is_macro = method_by_group.get(opt) == "MaCRO-DE"
-
-            ax.plot(
-                angles,
-                vals,
-                color=color_map.get(opt, "#888"),
-                linewidth=4.0 if is_macro else (2.4 if is_dsade else 1.1),
-                linestyle="-" if is_macro else ("-" if is_dsade else "--"),
-                zorder=10 if is_macro else 2
-            )
-
-            ax.fill(
-                angles,
-                vals,
-                color=color_map.get(opt, "#888"),
-                alpha=0.20 if is_macro else (0.12 if is_dsade else 0.04)
-            )
-            # ax.plot(angles, vals, color=color_map.get(opt, "#888"), linewidth=2.4 if is_dsade else 1.1, linestyle="-" if is_dsade else "--")
-            # ax.fill(angles, vals, color=color_map.get(opt, "#888"), alpha=0.12 if is_dsade else 0.04)
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(categories, fontsize=8)
-        ax.set_ylim(0.0, 1.0)
-        ax.set_title(dataset, fontsize=11, fontweight="bold", pad=14)
+        _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group)
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.legend(handles=_plot_legend_patches(opts, color_map, label_map), loc="lower center", ncol=min(len(opts), 6), fontsize=9)
@@ -2184,20 +2428,7 @@ def generate_seven_global_charts(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.6 * n_rows), squeeze=False)
     for idx, dataset in enumerate(datasets):
         ax1 = axes[idx // n_cols, idx % n_cols]
-        ax2 = ax1.twinx()
-        sub = plot_df[plot_df["Archivo"] == dataset].groupby("GrupoGrafica")[["N_Features_Selected", "Runtime"]].mean()
-        x = np.arange(len(opts))
-        feat_vals = [sub.loc[o, "N_Features_Selected"] if o in sub.index else np.nan for o in opts]
-        rt_vals = [sub.loc[o, "Runtime"] if o in sub.index else np.nan for o in opts]
-        colors = [color_map.get(o, "#888") for o in opts]
-        ax1.bar(x - 0.18, feat_vals, 0.36, color=colors, alpha=0.85)
-        ax2.bar(x + 0.18, rt_vals, 0.36, color=colors, alpha=0.40, hatch="///")
-        ax1.set_xticks(x)
-        ax1.set_xticklabels([label_map.get(o, o) for o in opts], rotation=45, ha="right", fontsize=7)
-        ax1.set_ylabel("Features", fontsize=9)
-        ax2.set_ylabel("Runtime (s)", fontsize=9)
-        ax1.set_title(dataset, fontsize=11, fontweight="bold")
-        ax1.grid(axis="y", alpha=0.25)
+        _draw_dataset_features_runtime(ax1, dataset, plot_df, opts, color_map, label_map)
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.tight_layout(rect=[0.0, 0.02, 1.0, 1.0])
@@ -2238,26 +2469,7 @@ def generate_seven_global_charts(
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.4 * n_rows), squeeze=False)
     for idx, dataset in enumerate(datasets):
         ax = axes[idx // n_cols, idx % n_cols]
-        sub = curve_plot_df[curve_plot_df["Archivo"] == dataset] if not curve_plot_df.empty else pd.DataFrame()
-        plotted = False
-        for opt in curve_opts:
-            rows_opt = sub[sub["GrupoGrafica"] == opt] if not sub.empty else pd.DataFrame()
-            if rows_opt.empty:
-                continue
-            curve = np.asarray(rows_opt.iloc[0]["Curve"], dtype=float)
-            if curve.size == 0:
-                continue
-            is_dsade = is_dsade_method(rows_opt.iloc[0]["Optimizador"])
-            is_macro = str(rows_opt.iloc[0]["Optimizador"]).upper() == "MACRO-DE"
-            ax.plot(curve, color=curve_color_map.get(opt, "#888"), linewidth=2.4 if is_macro else (2.4 if is_dsade else 1.4), linestyle="-")
-            #ax.plot(curve, color=curve_color_map.get(opt, "#888"), linewidth=2.4 if is_dsade else 1.4, linestyle="-" if is_dsade else "--")
-            plotted = True
-        if not plotted:
-            ax.text(0.5, 0.5, "Sin curvas", transform=ax.transAxes, ha="center", va="center", color="#777")
-        ax.set_title(dataset, fontsize=11, fontweight="bold")
-        ax.set_xlabel("Iteration", fontsize=9)
-        ax.set_ylabel("Fitness", fontsize=9)
-        ax.grid(alpha=0.25)
+        _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map)
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.legend(handles=_plot_legend_patches(curve_opts, curve_color_map, curve_label_map), loc="lower center", ncol=min(len(curve_opts), 6), fontsize=9)
@@ -2515,6 +2727,24 @@ def generate_global_features_runtime(df, out_dir, opt_order):
 
 def export_reporting_outputs(paths, args, dataset_names, results_struct, statistical_results):
     """The same complete set of derived outputs for fresh and cached results."""
+    selected_estimators = [e for e in args.estimators if e in PLOT_ESTIMATORS]
+    if not selected_estimators:
+        raise ValueError("PLOT_ESTIMATORS must include at least one experiment classifier for reporting.")
+
+    def selected_results(source):
+        return {
+            dataset: {
+                label: row for label, row in rows.items()
+                if (parse_result_label(label, args)["estimator"] or row.get("Estimator", "")
+                    or (args.estimators[0] if len(args.estimators) == 1 else "")).lower() in selected_estimators
+            }
+            for dataset, rows in source.items()
+        }
+
+    results_struct = selected_results(results_struct)
+    statistical_results = selected_results(statistical_results)
+    # A reporting-only copy leaves experiment arguments and cache identity untouched.
+    args = argparse.Namespace(**{**vars(args), "estimators": selected_estimators})
     excel_path = os.path.join(paths.res_dir, f"Global_Results_{paths.exp_tag}.xlsx")
     exported = export_global_excel(results_struct, dataset_names, excel_path)
     statistical_path = os.path.join(paths.res_dir, f"Statistical_Results_{paths.exp_tag}.xlsx")
@@ -2666,10 +2896,29 @@ def main():
                 print(f"  - {os.path.join(paths.fig_dir, name)}")
         return
 
+    # Load before neural preparation so convergence repairs reuse the original features.
+    cached_payloads = {}
+    convergence_repair_datasets = set()
+    for dataset_name in dataset_names:
+        signature = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
+        for estimator in args.estimators:
+            payload = resolve_cached_payload(
+                paths, dataset_args[dataset_name] if args.dataset_source == "miafex" else args,
+                dataset_name, estimator, signature,
+            ) or {}
+            cached_payloads[dataset_name, estimator] = payload
+            if any(any(cached_convergence_errors(row, args.epochs)) for row in payload.values()):
+                convergence_repair_datasets.add(dataset_name)
+
     if args.dataset_source == "miafex":
         # Retain normal discovery/validation and neural preparation when incomplete.
-        dataset_args = resolve_miafex_dataset_args(args)
+        if not convergence_repair_datasets:
+            dataset_args = resolve_miafex_dataset_args(args)
         for name, scoped in dataset_args.items():
+            if convergence_repair_datasets and any(cached_payloads[name, est] for est in args.estimators):
+                # A repair must not retrain even the unaffected cached datasets.
+                scoped = argparse.Namespace(**{**vars(scoped), "pipeline_mode": "feature_selection"})
+                print(f"[convergence-cache] {name}: reusing existing train/test features for repair.")
             miafex_csv_path[name] = resolve_miafex_csv(scoped)
 
     results_struct = {}
@@ -2697,14 +2946,19 @@ def main():
 
         for estimator in args.estimators:
             cache_file, progress_file = cache_files(paths, dataset_name, estimator, dataset_cache_sig)
-            cls_payload = resolve_cached_payload(
-                paths, dataset_args[dataset_name] if args.dataset_source == "miafex" else args,
-                dataset_name, estimator, dataset_cache_sig,
-            ) or {}
+            cls_payload = dict(cached_payloads[dataset_name, estimator])
+            cache_changed = False
             for method in args.optimizers:
                 for tf in args.transfer_functions:
                     label = build_alg_label(method, tf, estimator, show_tf, show_cls)
-                    prev = cls_payload.get(label, {})
+                    original = cls_payload.get(label, {})
+                    prev = prepare_cached_convergence(original, args.epochs)
+                    if prev is not original:
+                        cache_changed = True
+                        if prev:
+                            cls_payload[label] = prev
+                        else:
+                            cls_payload.pop(label, None)
                     acc_runs = list(np.asarray(prev.get("AccRuns", []), dtype=float))
                     ps_runs = list(np.asarray(prev.get("PSRuns", []), dtype=float))
                     rs_runs = list(np.asarray(prev.get("RSRuns", []), dtype=float))
@@ -2715,6 +2969,7 @@ def main():
                     curves = list(prev.get("CurvesAll", []))
 
                     run_ids = completed_run_ids(prev)
+                    convergence_runs = dict(prev.get("ConvergenceRuns", {}))
                     pending_runs = [run for run in range(args.runs) if run not in run_ids]
                     progress_label = build_alg_label(optimizer_display_label(method), tf, estimator, show_tf, True)
                     print(
@@ -2728,6 +2983,8 @@ def main():
                     print(f"Running {dataset_name} | {label} | runs={args.runs} (recovered {len(run_ids)})", flush=True)
 
                     def checkpoint_run(run, out):
+                        validate_convergence_curve(out["curve"], args.epochs, out["fit_final"])
+                        validate_convergence_metadata(out.get("convergence"), out["curve"], args.epochs)
                         acc_runs.append(out["as_test"])
                         ps_runs.append(out["ps_test"])
                         rs_runs.append(out["rs_test"])
@@ -2737,6 +2994,7 @@ def main():
                         time_runs.append(out["runtime"])
                         curves.append(out["curve"])
                         run_ids.append(run)
+                        convergence_runs[run] = out["convergence"]
 
                         cls_payload[label] = build_label_payload(
                             estimator,
@@ -2750,6 +3008,7 @@ def main():
                             curves,
                             args.epochs,
                             completed_run_ids=run_ids,
+                            convergence_runs=convergence_runs,
                         )
                         save_cache(progress_file, cls_payload)
                         save_cache(cache_file, cls_payload)
@@ -2794,10 +3053,13 @@ def main():
                         curves,
                         args.epochs,
                         completed_run_ids=run_ids,
+                        convergence_runs=convergence_runs,
                     )
                     save_cache(progress_file, cls_payload)
                     save_cache(cache_file, cls_payload)
-            save_cache(cache_file, cls_payload)
+            if cache_changed:
+                save_cache(progress_file, cls_payload)
+                save_cache(cache_file, cls_payload)
 
             results_struct[dataset_name].update(cls_payload)
             statistical_results[dataset_name].update(statistical_classifier_rows(cls_payload, estimator, args))

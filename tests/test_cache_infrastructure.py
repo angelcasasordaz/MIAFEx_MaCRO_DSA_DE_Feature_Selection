@@ -47,6 +47,7 @@ class WorkerSizingTests(unittest.TestCase):
 
 class CacheInfrastructureTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(framework, 'PLOT_ESTIMATORS', ['knn', 'svm']))
         temporary = tempfile.TemporaryDirectory(prefix='cache-infrastructure-')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -73,7 +74,7 @@ class CacheInfrastructureTests(unittest.TestCase):
     def payload(self, ids, *, legacy=False):
         return {self.label: framework.build_label_payload(
             'knn', *[[0.5 + run / 100 for run in ids] for _ in range(7)],
-            [[0.3, 0.2, 0.1] for _ in ids], 3,
+            [[0.9, 0.8, 0.5 + run / 100] for run in ids], 3,
             completed_run_ids=None if legacy else ids,
         )}
 
@@ -196,7 +197,8 @@ class CacheInfrastructureTests(unittest.TestCase):
         backend = framework.ExecutionConfig('cpu', 'auto', 'sklearn', 'cpu',
                     framework.BackendAvailability(False, False, None, False, False))
         result = dict(as_test=80, ps_test=0.8, rs_test=0.8, f1_test=0.8, fit_final=0.2,
-                      n_features=1, runtime=0.001, curve=[0.4, 0.3, 0.2])
+                      n_features=1, runtime=0.001, curve=[0.4, 0.3, 0.2],
+                      convergence=framework.convergence_metadata(3, 0.2))
         with patch.object(framework, 'parse_args', return_value=args), \
                 patch.object(framework, 'resolve_execution_config', return_value=backend), \
                 patch.object(framework, 'print_backend_report'), \
