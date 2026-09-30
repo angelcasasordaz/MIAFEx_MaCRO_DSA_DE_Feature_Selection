@@ -3,6 +3,106 @@
 Framework for medical image feature extraction using MIAFEx and wrapper-based
 feature selection with MaCRO-DE and other metaheuristic algorithms.
 
+## Fresh clone / Python 3.11
+
+**CPython 3.11.x and 3.13.x are supported. Python 3.13 is not required.**
+Start with a complete Python 3.11 installation on Ubuntu/Linux, including
+`venv`, `pip`, `ssl`, `lzma`, `bz2`, `sqlite3`, and `ctypes` support. On Ubuntu
+releases whose configured repositories provide Python 3.11, install the
+prerequisites with `sudo apt update` and
+`sudo apt install git python3.11 python3.11-venv`. Package availability depends
+on the Ubuntu release; if unavailable, install complete CPython 3.11 from a
+trusted distribution first. Do not substitute Python 3.13 just to open the project.
+Use a supported PyCharm release with Python 3.11 support.
+
+```bash
+git clone https://github.com/angelcasasordaz/MIAFEx_MaCRO_DSA_DE_Feature_Selection.git
+cd MIAFEx_MaCRO_DSA_DE_Feature_Selection
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip check
+python verify_environment.py
+```
+
+Run the commands from the repository root. Alternatively, after cloning and installing Python
+3.11, run `bash scripts/setup_linux_python311.sh`. The helper creates or reuses
+this checkout's `.venv`, checks that it uses Python 3.11, installs requirements,
+runs `pip check`, and verifies imports. It stops on errors, never deletes an
+existing environment, and does not alter PyCharm settings. It can be rerun;
+it does not activate the calling shell. Afterwards use
+`source .venv/bin/activate` in each new terminal, or call `.venv/bin/python`
+explicitly. No training, feature extraction, or feature selection occurs during setup.
+
+`.venv/` is local and ignored by Git: a clone contains no interpreter or installed
+packages. `.idea/` and `*.iml` are also local and ignored in full. No shared IDE
+configuration is required by this repository; PyCharm generates its own project
+files on open. Those files must not encode another computer's interpreter or
+SDK name. The repository no longer supplies `.python-version`: that file used
+to select 3.13.15 implicitly. Interpreter-manager users may create an ignored
+local `.python-version` for either supported version. The commands above select
+3.11 explicitly and do not depend on pyenv, uv, or a prior environment.
+
+### Select the interpreter visually in PyCharm
+
+Open the cloned **repository folder** using **File → Open**. Open **Settings →
+Python → Interpreter** (or **Settings → Project → Python Interpreter** in older
+versions). Choose the appropriate path:
+
+- **A — `.venv` does not exist:** **Add Interpreter → Add Local Interpreter →
+  Generate new → Virtualenv**. Set **Base Python** to the complete Python **3.11**
+  executable (for example `/usr/bin/python3.11`) and **Location** to
+  `<project>/.venv`. Leave **Inherit global site-packages** unchecked. Click **OK**.
+  Then install dependencies and validate with the last four commands above in
+  an activated terminal, or use `.venv/bin/python` explicitly.
+- **B — `.venv` already exists** (including after terminal/helper setup):
+  **Add Interpreter → Add Local Interpreter → Select existing → Python**.
+  Browse to **`<project>/.venv/bin/python`**, then click **OK**.
+  Do not use **Generate new** for an existing environment.
+
+In both cases, select the newly added interpreter in the **project interpreter
+dropdown**, click **Apply → OK**, and verify the displayed executable belongs to
+this checkout. Adding an SDK entry alone is not enough if the project still
+selects a previous entry. Run `verify_environment.py` from PyCharm to confirm
+the executable and **Inside project .venv: True**. Set run configurations to use
+the project interpreter and the repository root as their working directory.
+See the [JetBrains virtualenv instructions](https://www.jetbrains.com/help/pycharm/creating-virtual-environment.html).
+
+For a previously opened project with an `[invalid]` entry, select the valid local
+interpreter and apply the change; remove the obsolete SDK registration via
+**Show All / Manage Interpreters** if needed. Check that individual run
+configurations also use the project interpreter. Existing local IDE state is
+not rewritten by a Git pull. A fresh clone has no such state to inherit.
+
+### Validate before running research
+
+`verify_environment.py` prints the executable, Python version, venv status,
+platform, versions of NumPy, SciPy, pandas, scikit-learn, matplotlib, MAFESE,
+MEALPY, Permetrics, PyTorch, torchvision, transformers, and timm, plus CUDA
+availability and GPU names when available. It checks imports and small CPU
+binary compatibility operations and exits nonzero on failure. Run `python -m
+pip check` as well to check declared dependency compatibility. These checks
+do not access datasets or experiment artifacts. They validate the software
+environment, not dataset preparation or experimental outcomes.
+
+For a safe project startup check use `python main_best.py --help`. Before running
+an experiment, follow the dataset workflow below and review the experiment
+configuration. A clone supplies no medical datasets, trained models, or features.
+MIAFEx model construction also loads pretrained
+`google/vit-base-patch16-224-in21k` weights from Hugging Face: research execution
+needs internet access on first use or an already populated local model cache.
+Environment verification never constructs that model or downloads its weights.
+
+The base installation supports CPU operation without an NVIDIA driver. On Linux
+x86_64, the pinned PyPI PyTorch wheel also downloads CUDA runtime packages, so
+allow several GB of disk space even for CPU use. Actual GPU use additionally
+requires suitable hardware and a compatible host driver; those prerequisites
+are separate from basic setup. See **Optional GPU dependencies** below.
+The direct dependencies are pinned; transitive dependencies are resolved by pip,
+so this is not a hash-locked, bit-for-bit environment snapshot. Keep the printed
+versions (or `python -m pip freeze`) with research environment records.
+
 ## Experiment configuration
 
 Edit the grouped configuration block near the top of `main_best.py`.
@@ -156,39 +256,20 @@ execution/resume flow. This check does not import source-EXP caches and respects
 non-contiguous run IDs, source priority, legacy handling, implementation-revision
 guards, and scientific signatures are unchanged.
 
-## Python environment
-
-Python 3.11 and 3.13 are supported; the IDE uses 3.13.15. The compiled scientific and deep-learning
-packages in `requirements.txt` are pinned to releases that provide CPython 3.13
-Linux wheels, avoiding unsupported source builds of older releases such as
-`numpy==1.26.4`.
-
-Create a clean virtual environment on Ubuntu with:
-
-```bash
-sudo apt update
-sudo apt install python3.13 python3.13-venv
-cd /path/to/MIAFEx_MaCRO_DSA_DE_Feature_Selection
-python3.13 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip check
-```
-
-The `.python-version` file records the exact tested patch release, 3.13.15.
-
 ## Pinned compatibility stack
 
-The core migration pins are:
+The unchanged compatibility pins support both Python 3.11 and 3.13:
 
 - NumPy 2.1.3, SciPy 1.14.1, pandas 2.2.3, scikit-learn 1.6.0, and
-  matplotlib 3.9.2: the earliest practical compatible release line with CPython
-  3.13 Linux wheels.
+  matplotlib 3.9.2 provide Linux wheels for both supported Python versions.
 - MAFESE 1.0.0, MEALPY 3.0.2, and Permetrics 2.0.0 remain unchanged.
 - Plotly 5.24.1 and Kaleido 0.2.1 preserve the API used by MAFESE 1.0.0.
 - PyTorch 2.7.1 and torchvision 0.22.1 are a matched pair with Python 3.13
-  support. Transformers 4.48.3 and timm 1.0.14 complete the tested MIAFEx stack.
+  support as well as 3.11. Transformers 4.48.3 and timm 1.0.14 complete the stack.
+
+For Python 3.13, substitute `python3.13 -m venv .venv` in the manual workflow,
+using a separate checkout/environment rather than mixing Python versions in an
+existing venv. The one-command helper intentionally targets Python 3.11.
 
 ## Execution backends
 
@@ -238,12 +319,24 @@ python -m pip check
 python -c "import torch, torchvision, transformers, timm, mafese, mealpy; import miafex_model, train_miafex, extract_miafex_features; print(torch.__version__, torchvision.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-Validation: Python 3.11.16 (isolated wheel installation) and 3.13.15 (existing
-IDE environment) passed project/stack imports, `pip check`, and resolution of
-`requirements-gpu.txt`. Both imported PyTorch/torchvision CUDA 12.6 builds;
-no CUDA device was available, so no GPU execution was tested. The system's
-separate Python 3.11.13 lacks `_lzma`; use a complete Python installation with
-the standard `lzma` module for torchvision.
+Clean-clone audit, 2026-09-30: a temporary snapshot of Git-tracked source plus
+the environment/documentation changes started with no `.venv` or `.idea`.
+Complete CPython **3.11.16** created a fresh venv and installed the unchanged
+`requirements.txt`. `pip check`, `verify_environment.py`, imports of
+`miafex_model`, `train_miafex`, `extract_miafex_features`, and `main_best`,
+`main_best.py --help`, and all three `tests.test_dispatch` tests passed.
+The final bootstrap helper also passed when reusing that environment.
+CUDA inspection detected runtime 12.6 and an NVIDIA GeForce RTX 3060;
+no GPU computation, training, feature extraction, or feature selection was run.
+No EXP604/EXP605 artifacts were accessed by these checks. The PyCharm API
+reported a valid local Python 3.11.16 module interpreter; a separate fresh
+PyCharm GUI session was not automated in this audit.
+
+Earlier recorded validation covered Python **3.13.15** and GPU-requirements
+resolution on both supported Python versions. Python 3.13 was not retested in
+this audit; its dependency pins remain unchanged. A Python installation that
+lacks standard-library modules such as `_lzma` is incomplete even if it can
+create a venv; the verifier now reports such failures explicitly.
 
 ## Local dataset workflow
 
