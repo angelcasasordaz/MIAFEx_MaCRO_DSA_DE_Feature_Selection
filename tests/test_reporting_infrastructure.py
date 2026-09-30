@@ -117,6 +117,10 @@ class CompleteCacheTests(unittest.TestCase):
         metadata_args = copy.deepcopy(self.args)
         metadata_args.figures_only = True
         self.scoped = framework.resolve_miafex_dataset_args(metadata_args)
+        for selected in self.scoped.values():
+            for filename in framework.miafex_feature_paths(selected).values():
+                Path(filename).parent.mkdir(parents=True, exist_ok=True)
+                Path(filename).write_text('f0,label\n1,0\n2,1\n')
         self.names = list(self.scoped)
         self.signatures = {name: framework.build_cache_signature(scoped) for name, scoped in self.scoped.items()}
         self.paths = framework.make_paths(self.args)
@@ -134,8 +138,10 @@ class CompleteCacheTests(unittest.TestCase):
                             [np.full(self.args.epochs, run + 1.0) for run in ids], self.args.epochs,
                             completed_run_ids=None if legacy else list(ids),
                         )
-                filename = framework.cache_files(paths, dataset, classifier, self.signatures[dataset])[0]
-                framework.save_cache(filename, payload)
+                        identity = framework.build_combination_identity(self.scoped[dataset], dataset, classifier, method, tf)
+                        filename = framework.scientific_cache.combination_files(paths, identity)[0]
+                        filename.parent.mkdir(parents=True, exist_ok=True)
+                        framework.save_cache(filename, {'identity': identity, 'row': payload[label]})
 
     def is_complete(self):
         with redirect_stdout(io.StringIO()):
@@ -146,14 +152,13 @@ class CompleteCacheTests(unittest.TestCase):
         self.assertFalse(self.is_complete())
         self.write_caches()
         self.assertTrue(self.is_complete())
-        path = framework.cache_files(self.paths, "Two", "svm", self.signatures["Two"])[0]
-        payload = framework.load_cache(path)
-        missing = payload.pop(next(iter(payload)))
-        framework.save_cache(path, payload)
+        identity = framework.build_combination_identity(self.scoped['Two'], 'Two', 'svm', self.args.optimizers[0], self.args.transfer_functions[0])
+        path = framework.scientific_cache.combination_files(self.paths, identity)[0]
+        path.unlink()
         self.assertFalse(self.is_complete())
         self.write_caches()
         payload = framework.load_cache(path)
-        next(iter(payload.values()))["TimeRuns"] = []
+        payload["row"]["TimeRuns"] = []
         framework.save_cache(path, payload)
         self.assertFalse(self.is_complete())
         self.write_caches(legacy=True)
@@ -171,7 +176,7 @@ class CompleteCacheTests(unittest.TestCase):
         for scoped in self.scoped.values():
             scoped.reuse_cache = False
         self.assertFalse(self.is_complete())
-        for path in Path(self.paths.cache_dir).glob('*_results.pkl'):
+        for path in Path(self.paths.cache_dir).rglob('*_results.pkl'):
             path.rename(str(path).replace('_results.pkl', '_progress.pkl'))
         self.assertTrue(self.is_complete())
 
@@ -181,16 +186,15 @@ class CompleteCacheTests(unittest.TestCase):
             scoped.optimizers = ["MaCRO-DE-t"]
             self.signatures[dataset] = framework.build_cache_signature(scoped)
         self.write_caches()
-        for dataset in self.names:
-            legacy_sig = framework._hash_cache_settings(framework._legacy_cache_settings(self.scoped[dataset]))
-            for classifier in self.args.estimators:
-                path = Path(framework.cache_files(self.paths, dataset, classifier, self.signatures[dataset])[0])
-                path.rename(framework.cache_files(self.paths, dataset, classifier, legacy_sig)[0])
+        for path in Path(self.paths.cache_dir).rglob('*_results.pkl'):
+            entry = framework.load_cache(path)
+            entry['identity']['optimizer_implementation']['revision'] = 'obsolete'
+            framework.save_cache(path, entry)
         self.assertFalse(self.is_complete())
 
     def test_complete_and_figures_only_regenerate_all_outputs_offline(self):
         self.write_caches()
-        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in Path(self.paths.cache_dir).glob('*.pkl')}
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in Path(self.paths.cache_dir).rglob('*.pkl')}
         for figures_only in (False, True):
             with self.subTest(figures_only=figures_only), ExitStack() as stack:
                 args = copy.deepcopy(self.args)
@@ -200,7 +204,7 @@ class CompleteCacheTests(unittest.TestCase):
                 stack.enter_context(patch.object(framework, "print_backend_report"))
                 stack.enter_context(patch.object(framework, "validate_execution_config"))
                 charts = stack.enter_context(patch.object(framework, "generate_seven_global_charts", return_value=[]))
-                for name in ("resolve_miafex_csv", "load_miafex_feature_data", "get_dataset", "train_miafex",
+                for name in ("resolve_miafex_csv", "get_dataset", "train_miafex",
                              "extract_miafex_features", "run_single", "execute_pending_runs", "save_cache"):
                     stack.enter_context(patch.object(framework, name, side_effect=AssertionError(name)))
                 output = io.StringIO()

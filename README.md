@@ -330,3 +330,38 @@ Do not use `git add -f` for data or experiment artifacts.
    Choose a fresh output directory/experiment ID for a fresh execution; existing
    progress can still resume with `--no-reuse-cache`. Feature selection preserves
    the outer train/test partitions and never trains or extracts in this mode.
+
+## Cache-only publication reports
+
+Reporting is an explicit opt-in. From the project root, report the validated
+EXP604 caches without training, extraction, feature selection or cache migration:
+
+```sh
+.venv/bin/python main_best.py --report-only --exp-id 604
+```
+
+In PyCharm, add `--report-only --exp-id 604` to the Run configuration's script
+parameters. `REPORT_ONLY = False` preserves the ordinary Run behavior. The alias
+`--full-replica-report-only` enables the same reporting path.
+
+`--output-root` selects the source containing `Results/EXPxxx/cache`.
+`--report-output-root /path/to/reports` optionally selects a separate destination.
+Each successful invocation appends matching `Figures/EXPxxx/full_repN` and
+`Results/EXPxxx/full_repN` directories. The report number is a presentation version,
+not another scientific repetition. Existing versions are preserved.
+
+The `reporting/` package validates final `combinations_v2` envelopes or migrated
+references bound to the SHA-256 of an original final cache. It reports the stored
+scientific identities, including historical revisions; it never treats EXP604 as
+compatible with corrected EXP605. Progress files, cross-EXP fallback, run merging
+and cache repair are excluded. No image or feature CSV contents are loaded.
+Dataset/classifier/optimizer/transfer selections and run/epoch/population/seed
+settings must match a complete, unambiguous cache grid. Missing data raises an
+error before report allocation; it never schedules an experiment.
+
+Outputs include 600 dpi PNGs, Global/Statistical/Friedman Excel workbooks, editable
+manuscript tables, matched-block Friedman and pairwise Wilcoxon-Holm CSV/text
+reports, and validation manifests in both trees. Manifests record exact source
+identities/hashes, output hashes, skipped unavailable metrics/curves, and zero
+scientific calls. Runtime guards reject scientific execution and writes outside
+the new staging directories; publication occurs only after validation.

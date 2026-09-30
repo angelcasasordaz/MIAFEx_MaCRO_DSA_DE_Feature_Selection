@@ -37,7 +37,7 @@ class IndividualPlotTests(unittest.TestCase):
         self.addCleanup(framework.plt.close, "all")
         self.args = framework.parse_args([
             "--optimizers", "MaCRO-DE", "DE", "PSO", "--estimators", "knn", "svm",
-            "--output-root", self.temp.name,
+            "--output-root", self.temp.name, "--epochs", "3",
         ])
         self.results = {}
         for di, dataset in enumerate(("Brain_MRI", "Other_Dataset")):
@@ -52,7 +52,9 @@ class IndividualPlotTests(unittest.TestCase):
                         "AccRuns": [value * 100, (value + .01) * 100],
                         "PSRuns": [value, value + .01], "RSRuns": [value, value + .01],
                         "F1Runs": [value, value + .01], "FeatRuns": [10 + mi, 12 + mi],
-                        "TimeRuns": [2 + mi, 3 + mi], "FitRuns": [value, value + .01],
+                        "TimeRuns": [2 + mi, 3 + mi], "FitRuns": [value / 3, (value + .01) / 3],
+                        "CurvesAll": [[value, value / 2, value / 3],
+                                      [value + .01, (value + .01) / 2, (value + .01) / 3]],
                     }
         self.df = framework.generate_summary_dataframe(self.results, self.args)
 
@@ -71,7 +73,7 @@ class IndividualPlotTests(unittest.TestCase):
                 saved = framework.generate_seven_global_charts(
                     self.df, self.results, self.temp.name, self.args.optimizers, self.args,
                 )
-            self.assertEqual(len(saved), 15)
+            self.assertEqual(len(saved), 17)
             self.assertEqual(len(self.figures["09_resultados_clasificador_metrica_todos_datasets.png"]), 4)
             for family in ("02_radar", "03_features_runtime", "05_convergence"):
                 combined = self.figures[f"{family}_por_dataset_knn.png"]
@@ -84,16 +86,16 @@ class IndividualPlotTests(unittest.TestCase):
         self.assertEqual(self.results, before)
 
     def test_both_classifiers_and_missing_curves(self):
-        self.results["Brain_MRI"]["DE_KNN"]["Curve"] = []
         self.figures = {}
         with patch.object(framework, "PLOT_ESTIMATORS", ["knn", "svm"]), \
                 patch.object(framework, "_save_chart", side_effect=self.capture):
             saved = framework.generate_individual_dataset_charts(
-                self.df, self.results, self.temp.name, self.args.optimizers, self.args,
-            )
-        self.assertEqual(len(saved), 12)
-        self.assertEqual(len(self.figures["05_convergence_Brain_MRI_knn.png"][0]["lines"]), 2)
-        self.assertEqual(len(self.figures["05_convergence_Brain_MRI_svm.png"][0]["lines"]), 3)
+                self.df, self.results, self.temp.name, self.args.optimizers, self.args)
+            self.assertEqual(len(saved), 16)
+            self.results["Brain_MRI"]["DE_KNN"]["CurvesAll"] = []
+            with self.assertRaisesRegex(ValueError, 'convergence requires'):
+                framework.generate_individual_dataset_charts(
+                    self.df, self.results, self.temp.name, self.args.optimizers, self.args)
 
     def test_selection_filters_all_reports_without_changing_science(self):
         paths = framework.make_paths(self.args)
@@ -111,12 +113,12 @@ class IndividualPlotTests(unittest.TestCase):
                 )
                 self.assertEqual(framework.build_cache_signature(self.args), signature)
             self.assertEqual(set(charts.call_args.args[0].Estimador), set(selected))
-            summary = framework.pd.read_csv(Path(paths.res_dir, "RESUMEN_GRAFICAS_EXP604.csv"))
+            summary = framework.pd.read_csv(Path(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv"))
             self.assertEqual(set(summary.Estimador), set(selected))
-            analysis = framework.pd.read_excel(Path(paths.res_dir, "Full_Friedman_Analysis_EXP604.xlsx"))
+            analysis = framework.pd.read_excel(Path(paths.res_dir, f"Full_Friedman_Analysis_{paths.exp_tag}.xlsx"))
             self.assertEqual(set(analysis.Classifier), set(selected))
-            for filename, start_column in (("Global_Results_EXP604.xlsx", 1),
-                                            ("Statistical_Results_EXP604.xlsx", 2)):
+            for filename, start_column in ((f"Global_Results_{paths.exp_tag}.xlsx", 1),
+                                            (f"Statistical_Results_{paths.exp_tag}.xlsx", 2)):
                 tables = framework.pd.read_excel(Path(paths.res_dir, filename), sheet_name=None)
                 for table in tables.values():
                     for column in table.columns[start_column:]:

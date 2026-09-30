@@ -106,7 +106,7 @@ class ParallelResumeTests(unittest.TestCase):
         args.test_interrupt = interrupt
 
     def result_cache(self, args):
-        return next(Path(args.output_root).glob("Results/*/cache/*_results.pkl"))
+        return next(Path(args.output_root).glob("Results/*/cache/combinations_v2/*_results.pkl"))
 
     def executed_runs(self, args):
         return {int(path.stem.split("-")[1]): int(path.read_text())
@@ -125,7 +125,7 @@ class ParallelResumeTests(unittest.TestCase):
         def interrupt_after_two(path, payload):
             real_save(path, payload)
             if str(path).endswith("_results.pkl"):
-                row = next(iter(framework.load_cache(path).values()))
+                row = framework.load_cache(path)["row"]
                 snapshots.append(row["CompletedRunIDs"])
                 if row["CompletedRunIDs"] == [1, 3]:
                     # Release the pool only after durable non-contiguous results exist.
@@ -137,7 +137,7 @@ class ParallelResumeTests(unittest.TestCase):
         self.assertEqual(len(snapshots[0]), 1)
         self.assertEqual(snapshots[-1], [1, 3])
         cache = self.result_cache(self.args)
-        interrupted = next(iter(framework.load_cache(cache).values()))
+        interrupted = framework.load_cache(cache)["row"]
         self.assertEqual(interrupted["CompletedRunIDs"], [1, 3])
         self.assertEqual(interrupted["CompletedRuns"], 2)
 
@@ -147,7 +147,7 @@ class ParallelResumeTests(unittest.TestCase):
         self.assertEqual(self.executed_runs(self.args), {run: self.args.seed_base + run for run in missing})
         self.assertIn("completed=2/6 | recovered=2,4 | missing=1,3,5..6", self.output.getvalue())
         self.assertRegex(self.output.getvalue(), r"Run 0[1-6]/6 \| Accuracy=.* \| F1=.* \| Fitness=.* \| Features=.* \| run time=.* \| total elapsed=")
-        resumed = next(iter(framework.load_cache(cache).values()))
+        resumed = framework.load_cache(cache)["row"]
         self.assertEqual(resumed["CompletedRunIDs"], list(range(6)))
 
         baseline_args = copy.deepcopy(self.args)
@@ -155,7 +155,7 @@ class ParallelResumeTests(unittest.TestCase):
         self.configure_invocation(baseline_args, "uninterrupted")
         self.invoke_main(baseline_args)
         self.assertEqual(self.executed_runs(baseline_args), {run: self.args.seed_base + run for run in range(6)})
-        baseline = next(iter(framework.load_cache(self.result_cache(baseline_args)).values()))
+        baseline = framework.load_cache(self.result_cache(baseline_args))["row"]
         self.assert_payload_equal(resumed, baseline)
         # Verify the original aggregation, independent of completion order and new metadata.
         rows = [synthetic_result(self.args.seed_base + run) for run in range(6)]
@@ -189,12 +189,13 @@ class ParallelResumeTests(unittest.TestCase):
         )
         self.assertNotIn("CompletedRunIDs", legacy)
         # Exercise recovery from the old partial file with no final file present.
-        path = Path(paths.cache_dir) / f"{paths.exp_tag}_Synthetic_knn_{signature}_progress.pkl"
-        framework.save_cache(path, {label: legacy})
+        identity = framework.build_combination_identity(scoped, "Synthetic", "knn", scoped.optimizers[0], "vstf_01")
+        framework.save_combination(paths, identity, legacy)
+        framework.scientific_cache.combination_files(paths, identity)[0].unlink()
         self.configure_invocation(self.args, "legacy-resumed")
         self.invoke_main(self.args)
         self.assertEqual(self.executed_runs(self.args), {run: self.args.seed_base + run for run in range(2, 6)})
-        result = framework.load_cache(self.result_cache(self.args))[label]
+        result = framework.load_cache(self.result_cache(self.args))["row"]
         self.assertEqual(result["CompletedRunIDs"], list(range(6)))
         framework.np.testing.assert_array_equal(result["AccRuns"][:2], legacy["AccRuns"])
 

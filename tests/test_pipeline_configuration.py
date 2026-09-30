@@ -71,7 +71,9 @@ class PipelineConfigurationTests(unittest.TestCase):
 
     def test_configuration_defaults_and_cli_overrides(self):
         args = framework.parse_args([])
-        self.assertEqual((args.dataset_source, args.pipeline_mode), ("miafex", "full"))
+        self.assertEqual((args.dataset_source, args.pipeline_mode), ("miafex", "feature_selection"))
+        self.assertEqual((args.train_miafex, args.extract_miafex), ("no", "no"))
+        self.assertEqual((args.exp_id, args.reuse_cache_from_exp_id, args.figures_only), (605, 604, False))
         self.assertIsNone(args.miafex_datasets)
         self.assertEqual(args.optimizers, framework.OPTIMIZERS)
         self.assertEqual(args.estimators, ["knn", "svm"])
@@ -229,7 +231,7 @@ class PipelineConfigurationTests(unittest.TestCase):
         )
         optimizer = Mock()
         optimizer.history = SimpleNamespace(list_global_best_fit=[0.1] * self.args.epochs)
-        optimizer.g_best = SimpleNamespace(target=SimpleNamespace(fitness=0.1))
+        optimizer.g_best = SimpleNamespace(solution=np.ones(2), target=SimpleNamespace(fitness=0.1, objectives=[0.1, 0.5, 2]))
         def solve(problem, **kwargs):
             # Exercise MAFESE's real fit/problem construction but no optimizer run.
             self.assertTrue(np.all(problem.data.X_train < 1000))
@@ -237,7 +239,8 @@ class PipelineConfigurationTests(unittest.TestCase):
             combined = np.concatenate((problem.data.X_train, problem.data.X_test))
             self.assertEqual({tuple(row) for row in combined}, {tuple(row) for row in data.X_train})
             optimizer.problem = problem
-            return SimpleNamespace(solution=np.ones(2))
+            problem.seed = kwargs['seed']  # Match real Optimizer.solve's seed handoff.
+            return optimizer.g_best
         optimizer.solve.side_effect = solve
         estimator = Mock()
         estimator.predict.side_effect = lambda X: np.zeros(len(X), dtype=int)
@@ -331,17 +334,22 @@ class PipelineConfigurationTests(unittest.TestCase):
     def test_dataset_specific_cache_loading(self):
         self.args.output_root = str(self.root / "outputs")
         self.args.estimators = ["knn"]
+        self.args.optimizers = ["OriginalPSO"]
+        self.args.miafex_datasets = ['A', 'B']
         paths = framework.make_paths(self.args)
         signatures = {name: framework.build_cache_signature(self.scoped(name)) for name in ("A", "B")}
         for name in signatures:
-            framework.save_cache(str(Path(paths.cache_dir) / f"{paths.exp_tag}_{name}_knn_{signatures[name]}_results.pkl"),
-                                 {"sample": framework.build_label_payload(
-                                     "knn", *[[0.1] for _ in range(7)],
-                                     [framework.np.full(self.args.epochs, 0.1)], self.args.epochs,
-                                 )})
+            scoped = self.scoped(name)
+            for filename in framework.miafex_feature_paths(scoped).values():
+                Path(filename).parent.mkdir(parents=True, exist_ok=True)
+                Path(filename).write_text('f0,label\n1,0\n2,1\n')
+            identity = framework.build_combination_identity(scoped, name, 'knn', 'PSO', 'vstf_01')
+            framework.save_combination(paths, identity, framework.build_label_payload(
+                "knn", *[[0.1] for _ in range(7)],
+                [framework.np.full(self.args.epochs, 0.1)], self.args.epochs))
         results = framework.load_results_from_cache(paths, self.args, ["A", "B"], signatures)
         self.assertEqual(set(results), {"A", "B"})
-        self.assertEqual(results["A"]["sample"]["CompletedRuns"], 1)
+        self.assertEqual(results["A"]["ORIGINALPSO"]["CompletedRuns"], 1)
 
     def run_main(self):
         availability = framework.BackendAvailability(False, False, None, False, False)
@@ -371,13 +379,15 @@ class PipelineConfigurationTests(unittest.TestCase):
                   "f1_test": 0.75, "fit_final": 0.2, "n_features": 1,
                   "runtime": 0.01, "curve": [0.3, 0.2],
                   "convergence": framework.convergence_metadata(2, 0.2)}
+        real_split = framework.Data.split_train_test
         with patch.object(framework, "resolve_optimizers", return_value=["OriginalPSO"]), \
                 patch.object(framework, "optimizer_display_label", return_value="PSO"), \
-                patch.object(framework.Data, "split_train_test", side_effect=AssertionError("MIAFEx must never resplit its prepared partitions")), \
+                patch.object(framework.Data, "split_train_test", side_effect=AssertionError("MIAFEx must never resplit its prepared partitions")) as splitting, \
                 patch.object(framework, "run_single", return_value=result) as run, \
                 patch.object(framework, "export_global_excel", return_value=[]) as export, \
                 patch.object(framework, "generate_summary_dataframe", return_value=framework.pd.DataFrame()), \
                 patch.object(framework, "generate_seven_global_charts", return_value=[]):
+            splitting.__wrapped__ = real_split
             self.run_main()
             self.assertEqual(run.call_count, 2)
             self.assertEqual(set(export.call_args.args[0]), {"A", "B"})
@@ -441,6 +451,7 @@ class PipelineConfigurationTests(unittest.TestCase):
                 patch.object(framework, "export_global_excel", return_value=[]), \
                 patch.object(framework, "generate_summary_dataframe", return_value=framework.pd.DataFrame()), \
                 patch.object(framework, "generate_seven_global_charts", return_value=[]):
+            splitting.__wrapped__ = real_split
             self.run_main()
         splitting.assert_called_once()
         self.assertEqual(splitting.call_args.kwargs["test_size"], self.args.test_size)

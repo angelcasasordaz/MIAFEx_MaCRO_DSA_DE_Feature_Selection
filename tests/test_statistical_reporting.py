@@ -135,6 +135,9 @@ class StatisticalReportingTests(unittest.TestCase):
         ])
         args.optimizers = framework.resolve_optimizers(args)
         scoped = framework.resolve_miafex_dataset_args(args)["Synthetic"]
+        for filename in framework.miafex_feature_paths(scoped).values():
+            Path(filename).parent.mkdir(parents=True, exist_ok=True)
+            Path(filename).write_text('f0,label\n1,0\n2,1\n')
         signature = framework.build_cache_signature(scoped)
         paths = framework.make_paths(args)
         snapshots = {}
@@ -147,10 +150,12 @@ class StatisticalReportingTests(unittest.TestCase):
             )
             # Both classifier caches deliberately use the same legacy label.
             label = framework.build_alg_label(args.optimizers[0], "vstf_01", classifier, False, False)
-            expected_results["Synthetic"][label] = row
+            expected_results["Synthetic"][framework.build_alg_label(args.optimizers[0], 'vstf_01', classifier, False, True)] = row
             # One final legacy payload and one partial, non-contiguous progress payload.
-            filename = Path(framework.cache_files(paths, "Synthetic", classifier, signature)[int(run_ids is not None)])
-            framework.save_cache(str(filename), {label: row})
+            identity = framework.build_combination_identity(scoped, 'Synthetic', classifier, args.optimizers[0], 'vstf_01')
+            filename = framework.scientific_cache.combination_files(paths, identity)[int(run_ids is not None)]
+            filename.parent.mkdir(parents=True, exist_ok=True)
+            framework.save_cache(str(filename), {'identity': identity, 'row': row})
             snapshots[filename] = (filename.read_bytes(), filename.stat().st_mtime_ns)
         expected_summary = framework.generate_summary_dataframe(expected_results, args)
         with ExitStack() as stack:
@@ -160,7 +165,7 @@ class StatisticalReportingTests(unittest.TestCase):
             stack.enter_context(patch.object(framework, "validate_execution_config"))
             chart = stack.enter_context(patch.object(framework, "generate_seven_global_charts", return_value=[]))
             for name in ("train_miafex", "extract_miafex_features", "run_single", "execute_pending_runs",
-                         "resolve_miafex_csv", "load_miafex_feature_data", "get_dataset", "save_cache"):
+                         "resolve_miafex_csv", "get_dataset", "save_cache"):
                 stack.enter_context(patch.object(framework, name, side_effect=AssertionError(f"Forbidden: {name}")))
             with redirect_stdout(io.StringIO()):
                 framework.main()
@@ -195,12 +200,16 @@ class StatisticalReportingTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("f0,label\n1,0\n2,1\n")
         paths = framework.make_paths(args)
+        for filename in framework.miafex_feature_paths(scoped).values():
+            Path(filename).parent.mkdir(parents=True, exist_ok=True)
+            Path(filename).write_text('f0,label\n1,0\n2,1\n')
         signature = framework.build_cache_signature(scoped)
         row = framework.build_label_payload("knn", *[[1, 3, 5] for _ in METRICS],
                                             [np.full(args.epochs, value) for value in (1, 3, 5)],
                                             args.epochs, completed_run_ids=[0, 1, 2])
         label = framework.build_alg_label(args.optimizers[0], "vstf_01", "knn", False, False)
-        framework.save_cache(framework.cache_files(paths, "Synthetic", "knn", signature)[0], {label: row})
+        identity = framework.build_combination_identity(scoped, 'Synthetic', 'knn', args.optimizers[0], 'vstf_01')
+        framework.save_combination(paths, identity, row)
         with ExitStack() as stack:
             stack.enter_context(patch.object(framework, "parse_args", return_value=args))
             stack.enter_context(patch.object(framework, "resolve_execution_config"))

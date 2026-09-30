@@ -32,6 +32,14 @@ class ConvergenceValidationTests(unittest.TestCase):
                 f.validate_convergence_curve(curve, 3, best)
         f.np.testing.assert_array_equal(f.validate_convergence_curve([5., 5., 4.], 3, 4.), [5., 5., 4.])
 
+    def test_even_one_ulp_endpoint_damage_is_rejected(self):
+        endpoint = f.np.nextafter(.1, 1.)
+        with self.assertRaisesRegex(ValueError, 'does not match final fitness'):
+            f.validate_convergence_curve([.5, .3, endpoint], 3, .1)
+        row = cached_row(evidence=True)
+        row['CurvesAll'][1][-1] = f.np.nextafter(row['FitRuns'][1], 1.)
+        self.assertEqual(set(f.cached_convergence_errors(row, 3)[0]), {1})
+
     def test_strict_mean_never_pads_or_truncates(self):
         curves = [[.8, .5, .1], [.7, .4, .2]]
         f.np.testing.assert_array_equal(f.pad_mean_curves(curves, 3), f.np.mean(f.np.stack(curves), axis=0))
@@ -45,6 +53,14 @@ class ConvergenceValidationTests(unittest.TestCase):
         selector = Mock()
         selector.optimizer.history.list_global_best_fit = [.5, .3, .1]
         selector.optimizer.g_best.target.fitness = .2
+        selector.seed = selector.optimizer.problem.seed = 1234
+        mask = f.np.ones(2, dtype=int)
+        selector.optimizer.g_best.solution = mask
+        selector.optimizer.g_best.target.objectives = [.1, .8, 2]
+        selector.optimizer.problem.decode_solution.return_value = {'my_var': mask}
+        selector.selected_feature_solution = mask
+        selector.selected_feature_masks = mask.astype(bool)
+        selector.selected_feature_indexes = f.np.flatnonzero(mask)
         selector.transform.return_value = data.X_train
         selector.evaluate.return_value = {'AS_test': .8, 'PS_test': .8, 'RS_test': .8, 'F1S_test': .8}
         with patch.object(f, 'build_optimizer', return_value='OriginalPSO'), \
@@ -99,6 +115,17 @@ class ConvergenceValidationTests(unittest.TestCase):
         self.assertNotIn('ConvergenceRuns', repaired)
         self.assertEqual(f.cached_convergence_errors(repaired, 3), ({}, []))
 
+    def test_one_ulp_mean_damage_is_rebuilt_without_rerunning_valid_runs(self):
+        row = cached_row(evidence=True)
+        expected = row['Curve'].copy()
+        row['Curve'][0] = f.np.nextafter(row['Curve'][0], 1.)
+        invalid, aggregate = f.cached_convergence_errors(row, 3)
+        self.assertFalse(invalid)
+        self.assertTrue(aggregate)
+        repaired = f.prepare_cached_convergence(row, 3)
+        f.np.testing.assert_array_equal(repaired['Curve'], expected)
+        self.assertEqual(repaired['CompletedRunIDs'], row['CompletedRunIDs'])
+
 
 class ConvergenceResumeTests(unittest.TestCase):
     def setUp(self):
@@ -121,11 +148,11 @@ class ConvergenceResumeTests(unittest.TestCase):
         self.paths = f.make_paths(self.args)
         self.sig = f.build_cache_signature(self.scoped['Tiny'])
         self.label = f.build_alg_label(self.args.optimizers[0], 'vstf_01', 'knn', False, False)
-        self.cache = f.cache_files(self.paths, 'Tiny', 'knn', self.sig)
+        self.identity = f.build_combination_identity(self.scoped['Tiny'], 'Tiny', 'knn', 'PSO', 'vstf_01')
+        self.cache = f.scientific_cache.combination_files(self.paths, self.identity)
 
     def write(self, row):
-        for path in self.cache:
-            f.save_cache(path, {self.label: row})
+        f.save_combination(self.paths, self.identity, row)
 
     def invoke(self, figures_only=False, parallel=False):
         self.args.figures_only = figures_only
@@ -158,7 +185,7 @@ class ConvergenceResumeTests(unittest.TestCase):
         run.assert_called_once()
         pool.assert_not_called()
         self.assertEqual(run.call_args.args[-1], self.args.seed_base + 1)
-        stored = f.load_cache(self.cache[0])[self.label]
+        stored = f.load_cache(self.cache[0])['row']
         self.assertEqual(stored['CompletedRunIDs'], [0, 1, 2])
         self.assertEqual(set(stored['ConvergenceRuns']), {1})
         self.assertEqual(f.cached_convergence_errors(stored, 3), ({}, []))
@@ -175,7 +202,7 @@ class ConvergenceResumeTests(unittest.TestCase):
         run, pool = self.invoke(parallel=True)
         run.assert_not_called()
         self.assertEqual(pool.call_args.args[5], [0, 2])
-        stored = f.load_cache(self.cache[0])[self.label]
+        stored = f.load_cache(self.cache[0])['row']
         self.assertEqual(stored['CompletedRunIDs'], [0, 1, 2])
         self.assertEqual(set(stored['ConvergenceRuns']), {0, 2})
         self.assertEqual(f.cached_convergence_errors(stored, 3), ({}, []))
@@ -197,7 +224,7 @@ class ConvergenceResumeTests(unittest.TestCase):
                 run, pool = self.invoke(figures_only=figures_only)
                 run.assert_not_called()
                 pool.assert_not_called()
-        self.assertNotIn('ConvergenceRuns', f.load_cache(self.cache[0])[self.label])
+        self.assertNotIn('ConvergenceRuns', f.load_cache(self.cache[0])['row'])
 
     def test_normal_execution_repairs_only_the_mean_without_reruns(self):
         row = cached_row()
@@ -206,7 +233,7 @@ class ConvergenceResumeTests(unittest.TestCase):
         run, pool = self.invoke()
         run.assert_not_called()
         pool.assert_not_called()
-        stored = f.load_cache(self.cache[0])[self.label]
+        stored = f.load_cache(self.cache[0])['row']
         self.assertEqual(f.cached_convergence_errors(stored, 3), ({}, []))
         self.assertNotIn('ConvergenceRuns', stored)
 

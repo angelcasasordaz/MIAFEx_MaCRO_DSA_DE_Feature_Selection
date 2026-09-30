@@ -337,57 +337,65 @@ class OptimizerIntegrationTests(unittest.TestCase):
             self.assertNotIn(name, registry.CUSTOM_OPTIMIZERS)
             with self.assertRaises(ValueError):
                 framework.build_optimizer(name, self.args(name))
-        self.assertNotIn("MaCRO-DE-t", framework.OPTIMIZERS)
+        self.assertIn("MaCRO-DE-t", framework.OPTIMIZERS)
         self.assertIs(type(framework.build_optimizer("MaCRO-DE", self.args("MaCRO-DE"))), framework.MaCRO_DE)
 
+    def cache_args(self, name, source, directory):
+        args = self.args(name, source)
+        args.output_root, args.exp_id, args.reuse_cache_from_exp_id = directory, 900, 899
+        args.dataset_name = 'Tiny'
+        for field in ('train_features_csv', 'test_features_csv'):
+            path = Path(directory) / (field + '.csv')
+            path.write_text('f0,label\n1,0\n2,1\n')
+            setattr(args, field, str(path))
+        return args
+
     def test_revisions_change_scientific_cache_identity_for_both_sources(self):
-        for source in ("miafex", "mafese"):
-            signatures = []
-            for name, cls, revision in (("DSADE", DSADE, "awad-survivor-v2"),
-                                        ("DSA-DE", DSADE, "awad-survivor-v2"),
-                                        ("DSA_DE", DSADE, "awad-survivor-v2"),
-                                        ("MaCRO-DE-t", MaCRO_DE_t, "awad-close-far-v2")):
-                args = self.args(name, source)
-                canonical = registry.resolve_optimizer_name(name)
-                self.assertEqual(framework.optimizer_implementation_revisions(args), {canonical: revision})
-                signature = framework.build_cache_signature(args)
-                signatures.append(signature)
-                with patch.object(cls, "IMPLEMENTATION_REVISION", "different-science"):
-                    self.assertNotEqual(signature, framework.build_cache_signature(args))
-                with patch.object(framework, "optimizer_implementation_revisions", return_value={}):
-                    self.assertNotEqual(signature, framework.build_cache_signature(args))
-                self.assertEqual(framework.legacy_cache_signatures(args), [])
-            self.assertNotEqual(signatures[0], signatures[-1])
-        macro = self.args("MaCRO-DE")
-        self.assertEqual(framework.optimizer_implementation_revisions(macro), {})
-        self.assertTrue(framework.legacy_cache_signatures(macro))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(framework, 'get_dataset', return_value=framework.Data([[1], [2]], [0, 1])):
+            for source in ('miafex', 'mafese'):
+                identities = []
+                for name, cls in (('DSADE', DSADE), ('DSA-DE', DSADE),
+                                  ('DSA_DE', DSADE), ('MaCRO-DE-t', MaCRO_DE_t)):
+                    args = self.cache_args(name, source, directory)
+                    identity = framework.build_combination_identity(args, 'Tiny', 'knn', name, 'vstf_01')
+                    identities.append(identity)
+                    with patch.object(cls, 'IMPLEMENTATION_REVISION', 'different-science'):
+                        self.assertNotEqual(identity, framework.build_combination_identity(
+                            args, 'Tiny', 'knn', name, 'vstf_01'))
+                    self.assertEqual(framework.legacy_cache_signatures(args), [])
+                self.assertEqual(identities[0], identities[1])
+                self.assertEqual(identities[0], identities[2])
+                self.assertNotEqual(identities[0], identities[-1])
 
     def test_reject_old_greedy_and_unversioned_caches_in_all_lookup_paths(self):
-        for name in ("DSADE", "DSA-DE", "DSA_DE", "MaCRO-DE-t"):
-            for source in ("miafex", "mafese"):
-                with self.subTest(name=name, source=source), tempfile.TemporaryDirectory() as directory:
-                    args = self.args(name, source)
-                    args.output_root, args.exp_id, args.reuse_cache_from_exp_id = directory, 900, 899
+        for name in ('DSADE', 'DSA-DE', 'DSA_DE', 'MaCRO-DE-t'):
+            for source in ('miafex', 'mafese'):
+                with self.subTest(name=name, source=source), tempfile.TemporaryDirectory() as directory, \
+                        patch.object(framework, 'get_dataset', return_value=framework.Data([[1], [2]], [0, 1])):
+                    args = self.cache_args(name, source, directory)
+                    args.estimators = ['knn']
                     paths = framework.make_paths(args)
                     source_paths = framework.make_paths(args, exp_id=899)
-                    signature = framework.build_cache_signature(args)
-                    with patch.object(framework, "optimizer_implementation_revisions", return_value={}):
-                        obsolete = [framework.build_cache_signature(args), *framework.legacy_cache_signatures(args)]
+                    identity = framework.build_combination_identity(args, 'Tiny', 'knn', name, 'vstf_01')
+                    row = framework.build_label_payload('knn', *[[.1] for _ in range(7)], [[.1]], 1)
+                    with patch.object(framework, 'optimizer_implementation_revisions', return_value={}):
+                        obsolete = framework.build_legacy_group_signature(args)
+                    with patch.object(DSADE if name != 'MaCRO-DE-t' else MaCRO_DE_t,
+                                      'IMPLEMENTATION_REVISION', 'old-greedy'):
+                        old_identity = framework.build_combination_identity(args, 'Tiny', 'knn', name, 'vstf_01')
                     for location in (paths, source_paths):
-                        for old in obsolete:
-                            for filename in framework.cache_files(location, "Tiny", "knn", old):
-                                framework.save_cache(filename, {"obsolete": {"CompletedRuns": 1}})
+                        framework.save_combination(location, old_identity, row)
+                        for filename in framework.cache_files(location, 'Tiny', 'knn', obsolete):
+                            framework.save_cache(filename, {'obsolete': row})
                     for figures_only in (False, True):
                         with redirect_stdout(io.StringIO()):
-                            payload = framework.resolve_cached_payload(paths, args, "Tiny", "knn", signature,
-                                                                       figures_only=figures_only)
-                        self.assertIsNone(payload)
-                    current_file, progress_file = framework.cache_files(paths, "Tiny", "knn", signature)
-                    self.assertFalse(Path(current_file).exists())
-                    valid = {"current": {"CompletedRuns": 1}}
-                    framework.save_cache(progress_file, valid)
+                            self.assertIsNone(framework.resolve_cached_payload(paths, args, 'Tiny', 'knn',
+                                                                                figures_only=figures_only))
+                    framework.save_combination(paths, identity, row)
                     with redirect_stdout(io.StringIO()):
-                        self.assertEqual(framework.resolve_cached_payload(paths, args, "Tiny", "knn", signature), valid)
+                        payload = framework.resolve_cached_payload(paths, args, 'Tiny', 'knn')
+                    self.assertEqual(framework.completed_run_ids(next(iter(payload.values()))), [0])
 
     def test_old_greedy_module_removed(self):
         self.assertFalse((ROOT / "dsade_optimizer.py").exists())

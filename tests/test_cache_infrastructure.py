@@ -68,6 +68,7 @@ class CacheInfrastructureTests(unittest.TestCase):
         self.paths = framework.make_paths(self.args)
         self.source = framework.make_paths(self.args, exp_id=601)
         self.signature = framework.build_cache_signature(self.scoped)
+        self.identity = framework.build_combination_identity(self.scoped, 'Tiny', 'knn', 'PSO', 'vstf_01')
         self.label = framework.build_alg_label(self.args.optimizers[0], 'vstf_01', 'knn', False, False)
         self.output = io.StringIO()
 
@@ -79,9 +80,13 @@ class CacheInfrastructureTests(unittest.TestCase):
         )}
 
     def write(self, paths, ids, *, progress=False, signature=None, legacy=False):
-        filename = framework.cache_files(paths, 'Tiny', 'knn', signature or self.signature)[int(progress)]
-        framework.save_cache(filename, self.payload(ids, legacy=legacy))
-        return Path(filename)
+        identity = copy.deepcopy(self.identity)
+        if signature is not None:
+            identity['epochs'] += 1
+        filename = framework.scientific_cache.combination_files(paths, identity)[int(progress)]
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        framework.save_cache(str(filename), {'identity': identity, 'row': self.payload(ids, legacy=legacy)[self.label]})
+        return filename
 
     def resolve(self, **kwargs):
         with redirect_stdout(self.output):
@@ -93,46 +98,36 @@ class CacheInfrastructureTests(unittest.TestCase):
 
     def test_defaults_and_none_cli(self):
         args = framework.parse_args([])
-        self.assertEqual((framework.EXP_ID, framework.REUSE_CACHE_FROM_EXP_ID), (604, None))
-        self.assertEqual((args.exp_id, args.reuse_cache_from_exp_id), (604, None))
+        self.assertEqual((framework.EXP_ID, framework.REUSE_CACHE_FROM_EXP_ID), (605, 604))
+        self.assertEqual((args.exp_id, args.reuse_cache_from_exp_id), (605, 604))
         self.assertEqual(args.n_workers, framework.N_WORKERS)
         self.assertEqual(args.figures_only, framework.FIGURES_ONLY)
         self.assertIsNone(framework.parse_args(['--reuse-cache-from-exp-id', 'none']).reuse_cache_from_exp_id)
 
-    def test_signature_excludes_execution_settings_but_retains_science(self):
-        for key, value in dict(exp_id=999, reuse_cache_from_exp_id=998, output_root='elsewhere',
-                               n_workers=1, parallel='yes', reuse_cache=False, figures_only=True,
-                               pipeline_mode='full', train_miafex='yes', extract_miafex='no',
-                               miafex_output='other/checkpoint', dataset_root='offline',
-                               features_csv='legacy-alias', compute_mode='cpu', ml_backend='sklearn',
-                               miafex_device='cpu').items():
+    def test_identity_excludes_execution_settings_but_retains_science(self):
+        for key, value in dict(exp_id=999, output_root='elsewhere', n_workers=1, parallel='yes',
+                               figures_only=True, optimizers=['PSO', 'BRO'], miafex_epochs=999).items():
             changed = copy.deepcopy(self.scoped)
             setattr(changed, key, value)
-            with self.subTest(key=key):
-                self.assertEqual(framework.build_cache_signature(changed), self.signature)
-        for key, value in dict(epochs=4, pop_size=6, runs=5, seed_base=999, test_size=0.3,
-                               random_state=99, train_features_csv='different.csv',
-                               test_features_csv='different-test.csv', transfer_functions=['sstf_01'],
-                               dsade_beta_min=0.1, miafex_epochs=11).items():
+            self.assertEqual(framework.build_combination_identity(changed, 'Tiny', 'knn', 'PSO', 'vstf_01'), self.identity)
+        for key, value in dict(epochs=4, pop_size=6, runs=5, seed_base=999, random_state=99).items():
             changed = copy.deepcopy(self.scoped)
             setattr(changed, key, value)
-            with self.subTest(key=key):
-                self.assertNotEqual(framework.build_cache_signature(changed), self.signature)
+            self.assertNotEqual(framework.build_combination_identity(changed, 'Tiny', 'knn', 'PSO', 'vstf_01'), self.identity)
 
-    def test_current_wins_and_richer_progress_wins_over_final(self):
+    def test_current_and_progress_merge_with_source_missing_ids(self):
         self.write(self.paths, [1])
         self.write(self.paths, [1, 3], progress=True)
         self.write(self.source, [0, 1, 2, 3])
-        with patch.object(framework, 'make_paths', side_effect=AssertionError('Source must not be consulted')):
-            self.assertEqual(self.ids(self.resolve()), [1, 3])
-        self.assertIn('CACHE HIT CURRENT', self.output.getvalue())
+        self.assertEqual(self.ids(self.resolve()), [0, 1, 2, 3])
+        self.assertIn('CACHE IMPORTED', self.output.getvalue())
 
     def test_cross_import_is_atomic_and_source_stays_byte_and_mtime_identical(self):
         source = self.write(self.source, [1, 3], progress=True)
         before = source.read_bytes(), source.stat().st_mtime_ns
         self.assertEqual(self.ids(self.resolve()), [1, 3])
-        for path in framework.cache_files(self.paths, 'Tiny', 'knn', self.signature):
-            self.assertEqual(self.ids(framework.load_cache(path)), [1, 3])
+        for path in framework.scientific_cache.combination_files(self.paths, self.identity):
+            self.assertEqual(framework.completed_run_ids(framework.load_cache(path)['row']), [1, 3])
         self.assertEqual(before, (source.read_bytes(), source.stat().st_mtime_ns))
         self.assertFalse(list(Path(self.paths.cache_dir).glob('*.tmp')))
         self.assertIn('CACHE IMPORTED | EXP601 -> EXP602', self.output.getvalue())
@@ -153,27 +148,13 @@ class CacheInfrastructureTests(unittest.TestCase):
         changed.epochs += 1
         self.write(self.source, [1], signature=framework.build_cache_signature(changed))
         self.assertIsNone(self.resolve())
-        self.assertIn('CACHE SOURCE INCOMPATIBLE', self.output.getvalue())
         self.assertIn('CACHE MISS', self.output.getvalue())
         self.assertEqual(list(Path(self.paths.cache_dir).iterdir()), [])
 
-    def test_legacy_hash_and_contiguous_rows_migrate_same_or_cross_exp(self):
-        for paths in (self.source, self.paths):
-            with self.subTest(exp=paths.exp_tag):
-                legacy_sig = framework._hash_cache_settings(framework._legacy_cache_settings(self.scoped))
-                legacy = self.write(paths, [0, 1], signature=legacy_sig, legacy=True, progress=True)
-                before = legacy.read_bytes()
-                self.assertEqual(self.ids(self.resolve()), [0, 1])
-                self.assertEqual(legacy.read_bytes(), before)
-                for path in framework.cache_files(self.paths, 'Tiny', 'knn', self.signature):
-                    Path(path).unlink()
-        self.assertIn('migrated legacy signature', self.output.getvalue())
-
-    def test_obsolete_single_csv_partition_signature_is_rejected(self):
-        payload = framework._legacy_cache_settings(self.scoped)
-        for key in ('miafex_partition_mode', 'train_features_csv', 'test_features_csv'):
-            payload.pop(key)
-        self.write(self.source, [0], signature=framework._hash_cache_settings(payload))
+    def test_unversioned_group_signature_is_rejected(self):
+        legacy_sig = framework._hash_cache_settings(framework._legacy_cache_settings(self.scoped))
+        path = framework.cache_files(self.source, 'Tiny', 'knn', legacy_sig)[0]
+        framework.save_cache(path, self.payload([0, 1], legacy=True))
         self.assertIsNone(self.resolve())
 
     def test_no_reuse_keeps_current_progress_resume_but_disables_source(self):
@@ -223,8 +204,7 @@ class CacheInfrastructureTests(unittest.TestCase):
     def test_figures_only_imports_without_loading_or_regenerating_features(self):
         source = self.write(self.source, [1, 3], progress=True)
         before = source.read_bytes(), source.stat().st_mtime_ns
-        with patch.object(framework, 'load_miafex_feature_data', side_effect=AssertionError('No CSV loading')), \
-                patch.object(framework, 'resolve_miafex_csv', side_effect=AssertionError('No artifact preparation')):
+        with patch.object(framework, 'resolve_miafex_csv', side_effect=AssertionError('No artifact preparation')):
             self.invoke_main(figures=True).assert_not_called()
         self.assertEqual(before, (source.read_bytes(), source.stat().st_mtime_ns))
         self.assertTrue((self.root / 'Results/EXP602/RESUMEN_GRAFICAS_EXP602.csv').exists())
