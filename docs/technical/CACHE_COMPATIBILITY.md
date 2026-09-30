@@ -56,7 +56,7 @@ partial runs; compatible combinations are not scheduled again.
 Run the guarded, read-only cache audit from the repository root:
 
 ```sh
-.venv/bin/python dry_run_exp605_cache.py
+.venv/bin/python tools/cache/dry_run_exp605_cache.py
 ```
 
 That command guards optimizer execution, training, extraction and cache writes;
@@ -87,7 +87,7 @@ optimizer's execution relative to EXP604.
 To keep a separate audit from previous integration evidence:
 
 ```sh
-.venv/bin/python dry_run_exp605_cache.py --diagnostic-output diagnostics/exp605_scientific_correction
+.venv/bin/python tools/cache/dry_run_exp605_cache.py --diagnostic-output diagnostics/exp605_scientific_correction
 ```
 
 The audit uses its own before/after snapshot rather than a stale temporary

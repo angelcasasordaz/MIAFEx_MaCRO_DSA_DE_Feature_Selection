@@ -8,13 +8,16 @@ import csv
 import io
 import json
 from pathlib import Path
+import sys
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 import main_best as f
 import scientific_cache as cache
 
 
-ROOT = Path(__file__).resolve().parent
 OUT = ROOT / 'diagnostics/exp605_integration'
 
 

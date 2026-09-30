@@ -1,6 +1,7 @@
 """Rebuild only datasets/Brain_MRI with a reproducible, per-class 80/20 split.
 
-Run: python prepare_brain_mri.py
+Historical utility; prefer prepare_all_miafex_datasets.py for new preparation.
+Run from the repository root: python tools/legacy/prepare_brain_mri.py
 Requires Pillow (already used by the project). Images are copied byte-for-byte.
 Training gets floor(0.8 * class_size); testing gets the remaining images.
 Content-based names retain duplicate files and make subsequent runs stable.
@@ -16,7 +17,7 @@ import tempfile
 from PIL import Image, UnidentifiedImageError
 
 
-DATASET = Path(__file__).resolve().parent / "datasets" / "Brain_MRI"
+DATASET = Path(__file__).resolve().parents[2] / "datasets" / "Brain_MRI"
 CLASSES = ("glioma_tumor", "meningioma_tumor", "no_tumor", "pituitary_tumor")
 SPLITS = ("train", "test")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}

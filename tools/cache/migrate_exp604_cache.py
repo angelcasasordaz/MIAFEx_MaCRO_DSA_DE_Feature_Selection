@@ -10,7 +10,11 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import pickle
+import sys
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 
@@ -18,7 +22,6 @@ import main_best as framework
 import scientific_cache as cache
 
 
-ROOT = Path(__file__).resolve().parent
 AUDIT = ROOT / "diagnostics/exp604_cache_migration"
 MANIFEST = AUDIT / "manifest.json"
 
