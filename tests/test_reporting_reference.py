@@ -102,7 +102,10 @@ class HistoricalScientificValuesTests(unittest.TestCase):
             self.assertEqual(len(labels), 5)
             features = figures.metric_values(reference, 'N_Features_Selected', classifier,
                                               report.datasets, report.algorithms)
-            np.testing.assert_allclose(radar[:, :, -1], 1 - features / np.maximum(features.max(axis=0), 1), rtol=1e-12)
+            counts = m.plot_original_feature_counts(report.args, report.datasets)
+            self.assertEqual(labels[-1], 'Selected Feature Ratio')
+            np.testing.assert_allclose(radar[:, :, -1],
+                                       features / [counts[dataset] for dataset in report.datasets], rtol=1e-12)
 
     def test_statistics_match_independent_matched_blocks_and_signed_ranks(self):
         report = self.report

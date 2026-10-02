@@ -529,6 +529,48 @@ def generate_outputs(report, figures, results):
     return required, skipped
 
 
+def organize_full_figure_tree(figure_root, destination, datasets, classifiers):
+    """Relocate figure artifacts only; leave scientific files and values alone."""
+    figure_root, destination = safe_path(figure_root), safe_path(destination)
+    moved = []
+    sources = list(figure_root.glob('*')) + list(destination.glob('*'))
+    for legacy in (figure_root / 'particular', destination / 'particular'):
+        if legacy.is_dir():
+            sources.extend(legacy.rglob('*'))
+    for path in sources:
+        if not path.is_file() or path.suffix.lower() not in {'.png', '.pdf'}:
+            continue
+        subdirectory = ''
+        if path.stem.startswith(('generic_average_rank', 'generic_block_distribution',
+                                 'generic_holm_heatmap', 'generic_reference_comparisons')):
+            subdirectory = 'statistics'
+        elif (path.stem.startswith(('06_', '07_'))
+              and path.stem not in {'06_heatmap_accuracy_knn', '07_violin_accuracy_knn'}):
+            subdirectory = 'individual'
+        elif (any(path.stem == f'{family}_{dataset}_{classifier}'
+                  for family in ('01_resultados_clasificador', '02_radar', '03_features_runtime', '05_convergence')
+                  for dataset in datasets for classifier in classifiers)
+              or 'particular' in path.relative_to(figure_root).parts):
+            subdirectory = 'individual'
+        elif not path.stem.startswith(tuple(f'{n:02d}_' for n in range(1, 10))):
+            continue
+        target = safe_path(destination / subdirectory / path.name)
+        if path == target:
+            continue
+        if target.exists():
+            if sha256(path) != sha256(target):
+                raise ValueError(f'Figure relocation would replace a different existing file: {target}')
+            path.unlink()  # Remove an identical figure duplicate only.
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(target)
+        moved.append(str(target.relative_to(destination)))
+    for legacy in (figure_root / 'particular', destination / 'particular'):
+        if legacy.is_dir() and not any(legacy.iterdir()):
+            legacy.rmdir()
+    return moved
+
+
 def run_full_figures(args):
     """Regenerate the FULL figure tree from validated caches; never export tables."""
     from reporting import figures, statistics
@@ -540,34 +582,14 @@ def run_full_figures(args):
     destination_root = safe_path(getattr(args, 'report_output_root', None) or root)
     destination = safe_path(destination_root / 'Figures' / report.exp_tag / 'full')
     destination.mkdir(parents=True, exist_ok=True)
-    # Retain filenames while relocating the old flat figure tree exactly once.
-    moved = []
-    for path in figure_root.glob('*'):
-        if not path.is_file() or path.suffix.lower() not in {'.png', '.pdf'}:
-            continue
-        subdirectory = ''
-        if any(path.stem == f'{family}_{dataset}_{classifier}'
-               for family in ('01_resultados_clasificador', '02_radar', '03_features_runtime', '05_convergence')
-               for dataset in report.datasets for classifier in report.classifiers):
-            subdirectory = 'individual'
-        elif path.stem.startswith(('generic_average_rank', 'generic_block_distribution',
-                                   'generic_holm_heatmap', 'generic_reference_comparisons')):
-            subdirectory = 'statistics'
-        elif not path.stem.startswith(tuple(f'{n:02d}_' for n in range(1, 10))):
-            continue
-        # An alternate destination must not move historical source figures.
-        if destination_root != root:
-            continue
-        target = safe_path(destination / subdirectory / path.name)
-        if target.exists():
-            raise ValueError(f'Figure relocation would replace an existing file: {target}')
-        target.parent.mkdir(parents=True, exist_ok=True)
-        path.rename(target)
-        moved.append(str(target.relative_to(destination)))
+    # An alternate destination must not move historical source figures.
+    moved = (organize_full_figure_tree(figure_root, destination, report.datasets, report.classifiers)
+             if destination_root == root else [])
     with report_stage('Generate representative FULL figures'), report_guard((destination,)) as guard:
         generated = m.generate_seven_global_charts(
             m.generate_plot_dataframe(report.results, report.args), report.results,
             str(destination), report.args.optimizers, report.args,
+            estimator_filter=m.PLOT_GLOBAL_ESTIMATOR,
         )
         metric = next((metric for metric in report.metrics if metric.run_key == 'F1Runs'), report.metrics[0])
         _, matrix = statistics.matched_block_matrix(
@@ -581,7 +603,8 @@ def run_full_figures(args):
             generated.append(f'statistics/{stem}.png')
         if any(sha256(root / path) != digest for path, digest in report.sources.items()):
             raise ValueError('Source cache changed during figure generation')
-    print(f'[report] FULL figures: {destination}; aggregation={m.PLOT_RUN_AGGREGATION}; '
+    print(f'[report] FULL figures: {destination}; global_classifier={m.PLOT_GLOBAL_ESTIMATOR}; '
+          f'aggregation={m.PLOT_RUN_AGGREGATION}; '
           f'optimization_calls={guard["optimization_calls"] + preflight["optimization_calls"]}', flush=True)
     return {'figures': str(destination), 'generated': generated, 'moved': moved,
             'optimization_calls': guard['optimization_calls'] + preflight['optimization_calls']}

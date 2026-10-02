@@ -164,7 +164,8 @@ BINARY_REPRESENTATION_REVISIONS = {
 OPTIMIZER_REPAIR_REVISIONS = {"OriginalBRO": BinaryRespawnBRO.IMPLEMENTATION_REVISION}
 SEED_POLICY_REVISION = "explicit-selector-seed-v1"
 WRAPPER_SCIENCE_REVISION = "mafese-prepared-partitions-corrected-binary-seeded-v2"
-PLOT_ESTIMATORS = ["knn","svm"]  # Figures/reports only; never affects experiments or cache signatures. "knn",
+PLOT_ESTIMATORS = ["knn", "svm"]  # Figures/reports only; never affects experiments or cache signatures.
+PLOT_GLOBAL_ESTIMATOR = "knn"  # Options: "knn", "svm"; global single-classifier figures only.
 PLOT_RUN_AGGREGATION = "best"  # "best", "worst", "mean"; figures only, never cache signatures.
 INDIVIDUAL_POLAR_CURVE_SIZE = (7.0, 5.4)
 
@@ -2536,19 +2537,54 @@ def _grid_shape(n_items: int) -> tuple[int, int]:
     return n_rows, n_cols
 
 
-def _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group):
-    categories = ["Accuracy", "Precision", "Recall", "F1-Score", "Feature Reduction"]
+def plot_original_feature_counts(args, datasets):
+    """Read original input widths for figures only, without preparing any data."""
+    if args.dataset_source != "miafex":
+        return {dataset: int(get_dataset(dataset).X.shape[1]) for dataset in datasets}
+    scoped = argparse.Namespace(**vars(args))
+    scoped.figures_only = True
+    scoped.miafex_datasets = list(datasets)
+    dataset_args = resolve_miafex_dataset_args(scoped)
+    counts = {}
+    for dataset in datasets:
+        columns = []
+        for path in miafex_feature_paths(dataset_args[dataset]).values():
+            # The loader treats 'label' (or the last column) as the target.
+            # Headers suffice: never load, concatenate, split or rewrite features.
+            header = pd.read_csv(path, nrows=0)
+            if header.shape[1] < 2:
+                raise ValueError(f"{dataset}: prepared features need an input and a label.")
+            label = "label" if "label" in header.columns else header.columns[-1]
+            columns.append(list(header.drop(columns=[label]).columns))
+        if columns[0] != columns[1]:
+            raise ValueError(f"{dataset}: train/test feature columns must match.")
+        counts[dataset] = len(columns[0])
+    return counts
+
+
+def selected_feature_ratio(selected_features, original_features):
+    """Absolute figure coordinate; invalid counts fail instead of being clipped."""
+    original = float(original_features)
+    selected = np.asarray(selected_features, dtype=float)
+    if (not np.isfinite(original) or original <= 0 or not original.is_integer()
+            or not np.isfinite(selected).all() or np.any(selected < 0)
+            or np.any(selected > original)):
+        raise ValueError("Selected features must be within [0, original features], with a positive original width.")
+    return selected / original
+
+
+def _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group, *, original_features):
+    categories = ["Accuracy", "Precision", "Recall", "F1-Score", "Selected Feature Ratio"]
     angles = [n / 5.0 * 2 * np.pi for n in range(5)]
     angles += angles[:1]
     sub = plot_df[plot_df["Archivo"] == dataset]
     medias = sub.groupby("GrupoGrafica")[["AS_test", "PS_test", "RS_test", "F1_test", "N_Features_Selected"]].mean()
-    # MIAFEx's original embedding width, independent of the plotted optimizers.
-    total_original_features = 768
     for opt in opts:
         if opt not in medias.index:
             continue
         row = medias.loc[opt]
-        vals = [row["AS_test"], row["PS_test"], row["RS_test"], row["F1_test"], 1 - row["N_Features_Selected"] / total_original_features]
+        vals = [row["AS_test"], row["PS_test"], row["RS_test"], row["F1_test"],
+                float(selected_feature_ratio(row["N_Features_Selected"], original_features))]
         vals += vals[:1]
         is_dsade = is_dsade_method(method_by_group.get(opt))
         is_macro = method_by_group.get(opt) == "MaCRO-DE"
@@ -2707,6 +2743,7 @@ def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, a
     if df.empty:
         return saved
     df = _representative_figure_dataframe(df, results_struct, args)
+    original_counts = plot_original_feature_counts(args, df["Archivo"].unique())
     out_dir = os.path.join(out_dir, "individual")
     os.makedirs(out_dir, exist_ok=True)
     for estimator in dict.fromkeys(PLOT_ESTIMATORS):
@@ -2733,7 +2770,8 @@ def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, a
                 saved.append(os.path.join("individual", filename))
 
             fig, ax = plt.subplots(figsize=INDIVIDUAL_POLAR_CURVE_SIZE, subplot_kw=dict(polar=True))
-            _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group)
+            _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group,
+                                original_features=original_counts[dataset])
             _convergence_legend(fig, opts, color_map, label_map)
             filename = f"02_radar_{dataset}_{estimator}.png"
             _save_chart(fig, out_dir, filename)
@@ -2865,18 +2903,47 @@ def generate_accuracy_charts(results_struct, args, out_dir, opt_order):
         plot_df, opts, colors, labels = prepare_plot_groups(selected, opt_order)
         if not opts:
             continue
-        saved.append(_save_metric_heatmap(
-            plot_df, opts, labels, out_dir, f"06_heatmap_accuracy_{estimator}.png",
+        relative_dir = "" if estimator == "knn" else "individual"
+        metric_dir = os.path.join(out_dir, relative_dir)
+        os.makedirs(metric_dir, exist_ok=True)
+        filename = _save_metric_heatmap(
+            plot_df, opts, labels, metric_dir, f"06_heatmap_accuracy_{estimator}.png",
             "AS_test", "Accuracy (test)",
-        ))
+        )
+        saved.append(os.path.join(relative_dir, filename))
         runs = build_run_level_dataframe(results_struct, args, estimator)
         run_df, run_opts, run_colors, run_labels = prepare_plot_groups(runs, opt_order)
         if run_opts:
-            saved.append(_save_metric_violin(
-                run_df, run_opts, run_colors, run_labels, out_dir,
+            filename = _save_metric_violin(
+                run_df, run_opts, run_colors, run_labels, metric_dir,
                 f"07_violin_accuracy_{estimator}.png", "AS_test", "Accuracy (test)",
-            ))
+            )
+            saved.append(os.path.join(relative_dir, filename))
     return saved
+
+
+def generate_secondary_metric_charts(results_struct, args, out_dir, opt_order):
+    """Keep the existing KNN F1/recall panels independent of global selection."""
+    if "knn" not in PLOT_ESTIMATORS:
+        return []
+    representative = generate_plot_dataframe(results_struct, args)
+    selected = representative[representative["Estimador"].astype(str).str.lower() == "knn"]
+    plot_df, opts, _, labels = prepare_plot_groups(selected, opt_order)
+    if not opts:
+        return []
+    metric_dir = os.path.join(out_dir, "individual")
+    os.makedirs(metric_dir, exist_ok=True)
+    saved = [_save_metric_heatmap(
+        plot_df, opts, labels, metric_dir, "06_heatmap_f1_knn.png", "F1_test", "F1-Score (test)",
+    )]
+    runs = build_run_level_dataframe(results_struct, args, "knn")
+    run_df, run_opts, colors, run_labels = prepare_plot_groups(runs, opt_order)
+    if run_opts:
+        saved.append(_save_metric_violin(
+            run_df, run_opts, colors, run_labels, metric_dir,
+            "07_violin_recall_knn.png", "RS_test", "Recall (test)",
+        ))
+    return [os.path.join("individual", name) for name in saved]
 
 
 def generate_seven_global_charts(
@@ -2885,8 +2952,12 @@ def generate_seven_global_charts(
     out_dir: str,
     opt_order: List[str],
     args: argparse.Namespace,
-    estimator_filter: str = "knn",  # Combined filenames identify their KNN selection.
+    *,
+    estimator_filter: str,
 ):
+    estimator_filter = estimator_filter.lower()
+    if estimator_filter not in {"knn", "svm"}:
+        raise ValueError('PLOT_GLOBAL_ESTIMATOR must be "knn" or "svm".')
     if df.empty:
         return []
     df = df[df["Estimador"].astype(str).str.lower().isin(PLOT_ESTIMATORS)]
@@ -2904,17 +2975,16 @@ def generate_seven_global_charts(
 
     saved.extend(generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args))
     saved.extend(generate_accuracy_charts(results_struct, args, out_dir, opt_order))
-    # Keep legacy combined filenames/layouts, but honor a single-classifier selection.
-    if estimator_filter.lower() not in PLOT_ESTIMATORS:
-        estimator_filter = PLOT_ESTIMATORS[0]
-    knn_df = df[df["Estimador"].astype(str).str.lower() == estimator_filter.lower()].copy()
-    if knn_df.empty:
+    saved.extend(generate_secondary_metric_charts(results_struct, args, out_dir, opt_order))
+    global_df = df[df["Estimador"].astype(str).str.lower() == estimator_filter].copy()
+    if global_df.empty:
         return saved
-    plot_df, opts, color_map, label_map = prepare_plot_groups(knn_df, opt_order)
+    plot_df, opts, color_map, label_map = prepare_plot_groups(global_df, opt_order)
     if not opts:
         return saved
     method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
     datasets = sorted(plot_df["Archivo"].dropna().unique())
+    original_counts = plot_original_feature_counts(args, datasets)
     n_rows, n_cols = _grid_shape(len(datasets))
 
     fig, axes = plt.subplots(
@@ -2926,13 +2996,15 @@ def generate_seven_global_charts(
     )
     for idx, dataset in enumerate(datasets):
         ax = axes[idx // n_cols, idx % n_cols]
-        _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group)
+        _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group,
+                            original_features=original_counts[dataset])
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.legend(handles=_plot_legend_patches(opts, color_map, label_map), loc="lower center", ncol=min(len(opts), 6), fontsize=9)
     fig.tight_layout(rect=[0.0, 0.05, 1.0, 1.0])
-    _save_chart(fig, out_dir, "02_radar_por_dataset_knn.png")
-    saved.append("02_radar_por_dataset_knn.png")
+    filename = f"02_radar_por_dataset_{estimator_filter}.png"
+    _save_chart(fig, out_dir, filename)
+    saved.append(filename)
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.6 * n_rows), squeeze=False)
     for idx, dataset in enumerate(datasets):
@@ -2941,8 +3013,9 @@ def generate_seven_global_charts(
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.tight_layout(rect=[0.0, 0.02, 1.0, 1.0])
-    _save_chart(fig, out_dir, "03_features_runtime_por_dataset_knn.png")
-    saved.append("03_features_runtime_por_dataset_knn.png")
+    filename = f"03_features_runtime_por_dataset_{estimator_filter}.png"
+    _save_chart(fig, out_dir, filename)
+    saved.append(filename)
 
     run_df = build_run_level_dataframe(results_struct, args, estimator_filter)
     run_source = run_df if not run_df.empty else plot_df
@@ -2966,8 +3039,9 @@ def generate_seven_global_charts(
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     fig.tight_layout(rect=[0.0, 0.02, 1.0, 1.0])
-    _save_chart(fig, out_dir, "04_boxplot_accuracy_por_dataset_knn.png")
-    saved.append("04_boxplot_accuracy_por_dataset_knn.png")
+    filename = f"04_boxplot_accuracy_por_dataset_{estimator_filter}.png"
+    _save_chart(fig, out_dir, filename)
+    saved.append(filename)
 
     curve_df = build_curve_dataframe(results_struct, args, estimator_filter)
     if curve_df.empty:
@@ -2982,16 +3056,9 @@ def generate_seven_global_charts(
     for idx in range(len(datasets), n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
     _convergence_legend(fig, curve_opts, curve_color_map, curve_label_map)
-    _save_chart(fig, out_dir, "05_convergence_por_dataset_knn.png")
-    saved.append("05_convergence_por_dataset_knn.png")
-
-    saved.append(_save_metric_heatmap(
-        plot_df, opts, label_map, out_dir, "06_heatmap_f1_knn.png", "F1_test", "F1-Score (test)",
-    ))
-    saved.append(_save_metric_violin(
-        run_plot_df, run_opts, run_color_map, run_label_map, out_dir,
-        "07_violin_recall_knn.png", "RS_test", "Recall (test)",
-    ))
+    filename = f"05_convergence_por_dataset_{estimator_filter}.png"
+    _save_chart(fig, out_dir, filename)
+    saved.append(filename)
 
     generate_global_accuracy_boxplot(
         run_plot_df,
@@ -3210,6 +3277,7 @@ def export_reporting_outputs(paths, args, dataset_names, results_struct, statist
         os.path.join(paths.fig_dir, "full"),
         list(args.optimizers),
         args,
+        estimator_filter=PLOT_GLOBAL_ESTIMATOR,
     )
     return exported, summary_csv, generated_charts
 

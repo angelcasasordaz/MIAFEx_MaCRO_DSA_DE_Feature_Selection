@@ -119,15 +119,22 @@ def summary_figure(report, classifier):
 
 
 def radar_values(report, classifier):
-    """Classification metrics plus the established per-dataset feature efficiency."""
+    """Use absolute original-input feature ratios for MIAFEx figures."""
     available = {metric.run_key: metric for metric in report.metrics}
     metrics = [available[key] for key in ('AccRuns', 'PSRuns', 'RSRuns', 'F1Runs') if key in available]
     labels = [metric.name for metric in metrics]
     values = [metric_matrix(report, classifier, metric) for metric in metrics]
     if 'FeatRuns' in available:
         features = metric_matrix(report, classifier, available['FeatRuns'])
-        values.append(1 - features / np.maximum(features.max(axis=0), 1.0))
-        labels.append('Feature\nefficiency')
+        if getattr(report.args, 'dataset_source', None) == 'miafex':
+            m = framework()
+            counts = m.plot_original_feature_counts(report.args, report.datasets)
+            values.append(np.stack([m.selected_feature_ratio(features[:, di], counts[dataset])
+                                    for di, dataset in enumerate(report.datasets)], axis=1))
+            labels.append('Selected Feature Ratio')
+        else:
+            values.append(1 - features / np.maximum(features.max(axis=0), 1.0))
+            labels.append('Feature\nefficiency')
     if not values:
         return labels, np.empty((len(report.algorithms), len(report.datasets), 0))
     return labels, np.stack(values, axis=-1)

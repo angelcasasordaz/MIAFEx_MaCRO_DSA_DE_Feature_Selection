@@ -29,7 +29,13 @@ class FullPlottingTests(unittest.TestCase):
             [[.8, .5, .3], [.9, .4, .1], [.7, .3, .2]], 3, completed_run_ids=[0, 1, 2],
         )
         self.results, indexed = {}, {}
+        self.args.feature_dataset_root = str(Path(self.temp.name) / 'features')
         for dataset in ('First', 'Second'):
+            directory = Path(self.args.feature_dataset_root) / dataset
+            directory.mkdir(parents=True)
+            for split in ('train', 'test'):
+                (directory / f'{split}_features.csv').write_text(
+                    ','.join([f'f{i}' for i in range(20)] + ['label']) + '\n')
             self.results[dataset] = {}
             for classifier in self.args.estimators:
                 for algorithm in self.args.optimizers:
@@ -92,10 +98,14 @@ class FullPlottingTests(unittest.TestCase):
             Path(directory, filename).touch()
         with patch.object(m, 'PLOT_RUN_AGGREGATION', 'best'), patch.object(m, '_save_chart', side_effect=sink):
             files = m.generate_seven_global_charts(m.generate_summary_dataframe(self.results, self.args),
-                                                   self.results, self.temp.name, self.args.optimizers, self.args)
+                                                   self.results, self.temp.name, self.args.optimizers, self.args,
+                                                   estimator_filter=m.PLOT_GLOBAL_ESTIMATOR)
         for classifier in ('knn', 'svm'):
             for stem in ('06_heatmap_accuracy', '07_violin_accuracy'):
-                self.assertIn(f'{stem}_{classifier}.png', files)
+                relative_dir = '' if classifier == 'knn' else 'individual/'
+                self.assertIn(f'{relative_dir}{stem}_{classifier}.png', files)
+                self.assertEqual(captured[f'{stem}_{classifier}.png'][0],
+                                 Path(self.temp.name) / relative_dir)
             heat = captured[f'06_heatmap_accuracy_{classifier}.png'][1].axes[0]
             np.testing.assert_array_equal(heat.images[0].get_array(), np.full((3, 2), .8))
             self.assertEqual([tick.get_text() for tick in heat.get_xticklabels()], ['First', 'Second'])
@@ -107,8 +117,10 @@ class FullPlottingTests(unittest.TestCase):
                     filename = f'{family}_{dataset}_{classifier}.png'
                     self.assertIn('individual/' + filename, files)
                     self.assertEqual(captured[filename][0], Path(self.temp.name) / 'individual')
-        self.assertIn('06_heatmap_f1_knn.png', files)
-        self.assertIn('07_violin_recall_knn.png', files)
+        self.assertIn('individual/06_heatmap_f1_knn.png', files)
+        self.assertIn('individual/07_violin_recall_knn.png', files)
+        self.assertEqual(captured['06_heatmap_f1_knn.png'][0], Path(self.temp.name) / 'individual')
+        self.assertEqual(captured['07_violin_recall_knn.png'][0], Path(self.temp.name) / 'individual')
         self.assertEqual(len(files), len(set(files)))
 
     def test_export_boundary_passes_selected_data_and_preserves_summary_tables(self):
@@ -181,10 +193,11 @@ class FullPlottingTests(unittest.TestCase):
             result = core.run_full_figures(self.args)
         destination = source / 'full'
         self.assertTrue((destination / 'individual/02_radar_First_knn.png').is_file())
-        self.assertTrue((destination / '06_heatmap_f1_knn.png').is_file())
+        self.assertTrue((destination / 'individual/06_heatmap_f1_knn.png').is_file())
         self.assertTrue((destination / 'statistics/generic_average_rank.png').is_file())
         self.assertFalse(list(source.glob('*.png')))
         self.assertEqual(generate.call_args.args[2], str(destination))
+        self.assertEqual(generate.call_args.kwargs['estimator_filter'], m.PLOT_GLOBAL_ESTIMATOR)
         self.assertEqual(result['optimization_calls'], 0)
         self.assertTrue(all(name.startswith('statistics/') for name in result['generated']))
         self.assertEqual((scientific / 'protected.pkl').read_bytes(), b'protected cache')

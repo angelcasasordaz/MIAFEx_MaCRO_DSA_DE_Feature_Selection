@@ -54,13 +54,15 @@ class PlotAggregationTests(unittest.TestCase):
                         patch.object(f, "PLOT_ESTIMATORS", ["knn"]), \
                         patch.object(f, "generate_classifier_metric_grid_chart", return_value=None) as grid, \
                         patch.object(f, "generate_individual_dataset_charts", return_value=[]) as individual, \
+                        patch.object(f, "plot_original_feature_counts", return_value={"Tiny": 10}), \
                         patch.object(f, "_draw_dataset_radar") as radar, \
                         patch.object(f, "_draw_dataset_features_runtime") as features, \
                         patch.object(f, "generate_global_accuracy_boxplot") as distribution, \
                         patch.object(f, "generate_global_features_runtime") as global_features, \
                         patch.object(f, "_save_chart"):
                     f.generate_seven_global_charts(summary, self.results, directory,
-                                                  self.args.optimizers, self.args)
+                                                  self.args.optimizers, self.args,
+                                                  estimator_filter=f.PLOT_GLOBAL_ESTIMATOR)
                     for table in (grid.call_args.args[0], individual.call_args.args[0],
                                   radar.call_args.args[2], features.call_args.args[2],
                                   global_features.call_args.args[0]):

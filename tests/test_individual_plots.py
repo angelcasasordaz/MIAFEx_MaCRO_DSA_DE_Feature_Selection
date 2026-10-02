@@ -40,7 +40,13 @@ class IndividualPlotTests(unittest.TestCase):
             "--output-root", self.temp.name, "--epochs", "3",
         ])
         self.results = {}
+        self.args.feature_dataset_root = str(Path(self.temp.name) / 'features')
         for di, dataset in enumerate(("Brain_MRI", "Other_Dataset")):
+            directory = Path(self.args.feature_dataset_root) / dataset
+            directory.mkdir(parents=True)
+            for split in ('train', 'test'):
+                (directory / f'{split}_features.csv').write_text(
+                    ','.join([f'f{i}' for i in range(20 + di * 10)] + ['label']) + '\n')
             self.results[dataset] = {}
             for ci, classifier in enumerate(self.args.estimators):
                 for mi, method in enumerate(self.args.optimizers):
@@ -72,12 +78,13 @@ class IndividualPlotTests(unittest.TestCase):
                     patch.object(framework, "_save_chart", side_effect=self.capture):
                 saved = framework.generate_seven_global_charts(
                     self.df, self.results, self.temp.name, self.args.optimizers, self.args,
+                    estimator_filter=estimator,
                 )
-            self.assertEqual(len(saved), 19)
-            self.assertEqual(sum(name.startswith('individual/') for name in saved), 8)
+            self.assertEqual(len(saved), 19 if estimator == 'knn' else 17)
+            self.assertEqual(sum(name.startswith('individual/') for name in saved), 10)
             self.assertEqual(len(self.figures["09_resultados_clasificador_metrica_todos_datasets.png"]), 4)
             for family in ("02_radar", "03_features_runtime", "05_convergence"):
-                combined = self.figures[f"{family}_por_dataset_knn.png"]
+                combined = self.figures[f"{family}_por_dataset_{estimator}.png"]
                 for index, dataset in enumerate(sorted(self.results)):
                     single = self.figures[f"{family}_{dataset}_{estimator}.png"]
                     expected = [combined[index]]
