@@ -99,7 +99,7 @@ def automatic_worker_count() -> int:
 # User-editable configuration: the full experiment used by PyCharm's Run action.
 # Dataset and pipeline
 DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
-PIPELINE_MODE = "feature_selection"  # Options: "extract", "feature_selection", "full"
+PIPELINE_MODE = "full"  # Options: "extract", "feature_selection", "full"
 MIAFEX_DATASETS = None
 # ["Brain_MRI"]
 # None: all valid discovered datasets.
@@ -107,10 +107,10 @@ MAFESE_DATASET_SUITE = "test14"
 
 # MIAFEx artifacts and neural-network settings
 MIAFEX_DATASET_ROOT = "datasets"
-MIAFEX_CHECKPOINT_ROOT = "checkpoints/miafex"
-FEATURE_DATASET_ROOT = "datasets_features/miafex"
-MIAFEX_TRAIN = "no"  # Options: "auto", "yes", "no"
-MIAFEX_EXTRACT = "no"  # Options: "auto", "yes", "no"
+MIAFEX_CHECKPOINT_ROOT = "checkpoints/miafex_exp607"
+FEATURE_DATASET_ROOT = "datasets_features/miafex_exp607"
+MIAFEX_TRAIN = "yes"  # Options: "auto", "yes", "no"
+MIAFEX_EXTRACT = "yes"  # Options: "auto", "yes", "no"
 MIAFEX_EPOCHS = 50  # Neural-network training epochs.
 MIAFEX_BATCH_SIZE = 8
 MIAFEX_LEARNING_RATE = 1e-4
@@ -119,7 +119,7 @@ MIAFEX_LEARNING_RATE = 1e-4
 OPTIMIZERS = [
     # "MaCRO-DE",
     # "DSADE",
-    "MaCRO-DE-t",
+    # "MaCRO-DE-t",
     "MaCRO-DE-t-v2", # Independently selectable; retains supplied v2 defaults.
     "DE",
     "JADE",
@@ -128,11 +128,11 @@ OPTIMIZERS = [
     "GWO",
     "WOA",
     "HHO",
-    "BRO",
+    # "BRO",
     "DBO",
     "RUN",
     "FOX",
-    "FLA",
+    # "FLA",
 ]
 ESTIMATORS = ["knn", "svm"]
 TRANSFER_FUNCTIONS = ["vstf_01"]
@@ -151,11 +151,11 @@ MACRO_DE_T_V2_BETA_MAX = 0.60
 MACRO_DE_T_V2_MAHAL_Q = 0.50
 
 # Experiment and cache reuse
-EXP_ID = 606
-REUSE_CACHE = True
-REUSE_CACHE_FROM_EXP_ID = 605  # None: current EXP only; another ID: read-only fallback.
-FIGURES_ONLY = True
-REPORT_ONLY = True  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
+EXP_ID = 607
+REUSE_CACHE = False
+REUSE_CACHE_FROM_EXP_ID = None  # None: current EXP only; another ID: read-only fallback.
+FIGURES_ONLY = False
+REPORT_ONLY = False  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
 # Scientific versions describe the implementation that actually executes.
 # Bounds/decoding and explicit seeding affect every optimizer, including DE variants.
 BINARY_REPRESENTATION_REVISIONS = {
@@ -532,6 +532,38 @@ def discover_miafex_datasets(base_dir=MIAFEX_DATASET_ROOT) -> Dict[str, str]:
         if valid_miafex_dataset(dataset_root):
             discovered[item.name] = dataset_root
     return dict(sorted(discovered.items(), key=lambda row: row[0].lower()))
+
+
+def audit_miafex_datasets(args: argparse.Namespace) -> None:
+    """Report prepared image partitions without altering their membership."""
+    selected = [args.dataset_name] if args.dataset_name else args.miafex_datasets
+    if args.dataset_root:
+        roots = {os.path.basename(os.path.normpath(args.dataset_root)): args.dataset_root}
+    elif selected is not None:
+        roots = {name: os.path.join(args.miafex_dataset_root, name) for name in selected}
+    else:
+        roots = ({item.name: item.path for item in os.scandir(args.miafex_dataset_root)
+                  if item.is_dir()} if os.path.isdir(args.miafex_dataset_root) else {})
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+    for name, root in sorted(roots.items(), key=lambda row: row[0].lower()):
+        counts, classes = {}, {}
+        for split in ("train", "test"):
+            folder = os.path.join(root, split)
+            classes[split] = (sorted(item.name for item in os.scandir(folder)
+                                     if item.is_dir() and not item.name.startswith("."))
+                              if os.path.isdir(folder) else [])
+            counts[split] = sum(
+                filename.lower().endswith(image_extensions)
+                for label in classes[split]
+                for _, _, files in os.walk(os.path.join(folder, label))
+                for filename in files
+            )
+        valid = valid_miafex_dataset(root)
+        print(f"[dataset-audit] {name}: train={counts['train']}, test={counts['test']}, "
+              f"classes(train)={classes['train']}, classes(test)={classes['test']}, "
+              f"train/test valid={'yes' if valid else 'no'}, path={os.path.abspath(root)}")
+    if not roots:
+        print(f"[dataset-audit] No dataset folders under {os.path.abspath(args.miafex_dataset_root)}.")
 
 
 def print_miafex_datasets(datasets: Dict[str, str], base_dir=MIAFEX_DATASET_ROOT) -> None:
@@ -3356,6 +3388,10 @@ def main():
         print(list_available_optimizers())
         return
 
+    paths = make_paths(args)
+    if args.dataset_source == "miafex" and args.pipeline_mode in {"full", "extract"} and not args.figures_only:
+        audit_miafex_datasets(args)
+
     if args.pipeline_mode == "extract":
         if args.dataset_source != "miafex":
             raise ValueError("--pipeline-mode extract requires --dataset-source miafex; MAFESE already supplies feature datasets.")
@@ -3395,7 +3431,6 @@ def main():
             return
         cache_sig = {name: build_cache_signature(scoped) for name, scoped in dataset_args.items()}
 
-    paths = make_paths(args)
     show_tf = len(args.transfer_functions) > 1
     show_cls = len(args.estimators) > 1
 
