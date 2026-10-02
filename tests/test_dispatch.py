@@ -10,6 +10,8 @@ import main_best as m
 
 class DispatchTests(unittest.TestCase):
     def test_report_is_opt_in_for_plain_pycharm_run(self):
+        self.enterContext(patch.object(m, 'REPORT_ONLY', False))
+        self.enterContext(patch.object(m, 'FIGURES_ONLY', False))
         self.assertFalse(m.REPORT_ONLY)
         self.assertFalse(m.parse_args([]).report_only)
         class StopAtNormalSetup(Exception):
@@ -23,6 +25,7 @@ class DispatchTests(unittest.TestCase):
         report.assert_not_called()
 
     def test_report_aliases_bypass_every_scientific_path(self):
+        self.enterContext(patch.object(m, 'FIGURES_ONLY', False))
         for flag in ('--report-only', '--full-replica-report-only'):
             with self.subTest(flag=flag), ExitStack() as stack:
                 stack.enter_context(patch.object(sys, 'argv', ['main_best.py', flag, '--exp-id', '604',

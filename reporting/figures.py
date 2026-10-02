@@ -10,7 +10,7 @@ from matplotlib.patches import Patch
 import numpy as np
 from scipy.stats import t
 
-from reporting.core import report_stage
+from reporting.core import report_stage, framework
 
 
 STYLE = {'font.family': 'DejaVu Sans', 'font.size': 10, 'axes.labelsize': 11,
@@ -57,13 +57,26 @@ def save_png(fig, path):
 
 
 def metric_matrix(report, classifier, metric):
-    """Algorithm × dataset run means, in stored units adjusted by Metric.scale."""
-    return np.asarray([[np.mean(report.indexed[ds, classifier, opt][metric.run_key]) / metric.scale
+    """Figure-only representative observations; selection is shared across metrics."""
+    def value(row):
+        index = framework()._plot_run_index(row)
+        values = np.asarray(row[metric.run_key], dtype=float)
+        if values.ndim != 1 or (index is not None and len(values) != len(row['FitRuns'])):
+            raise ValueError(f'{metric.run_key} must align with FitRuns')
+        return (np.mean(values) if index is None else values[index]) / metric.scale
+    return np.asarray([[value(report.indexed[ds, classifier, opt])
                         for ds in report.datasets] for opt in report.algorithms])
 
 
+def run_observations(report, classifier, metric):
+    """Every real run across datasets, regardless of representative aggregation."""
+    return np.asarray([np.concatenate([
+        np.asarray(report.indexed[ds, classifier, opt][metric.run_key], dtype=float) / metric.scale
+        for ds in report.datasets]) for opt in report.algorithms])
+
+
 def dataset_mean_ci(values):
-    """Student-t 95% intervals across dataset means; never over flattened runs."""
+    """Student-t 95% intervals across dataset representatives, never flattened runs."""
     values = np.asarray(values, dtype=float)
     if values.ndim != 2 or not values.shape[1] or not np.isfinite(values).all():
         raise ValueError('Expected finite algorithm-by-dataset observations')
@@ -145,7 +158,7 @@ def heatmap_figure(report, classifier, metric):
     ax.set_xticks(range(len(report.datasets)), report.datasets, rotation=35, ha='right')
     algorithm_ticks(ax, report.algorithms, horizontal=True)
     ax.set_title(f'{classifier.upper()} — {metric.name} ({metric.unit})')
-    fig.colorbar(im, ax=ax, label='Cached run mean')
+    fig.colorbar(im, ax=ax, label=f'Cached {framework().PLOT_RUN_AGGREGATION} run')
     for i, j in np.ndindex(values.shape):
         ax.text(j, i, f'{values[i,j]:.4g}', ha='center', va='center', fontsize=8,
                 color='white' if im.norm(values[i,j]) > .6 else 'black')
@@ -186,12 +199,12 @@ def boxplot_figure(values, algorithms, classifier):
     for box, color in zip(boxes['boxes'], palette(algorithms).values()):
         box.set_facecolor(color); box.set_alpha(.35)
     observations(ax, values, algorithms)
-    ax.set_ylabel('Accuracy (test): one cached run mean per dataset')
+    ax.set_ylabel('Accuracy (test): all cached runs')
     ax.set_title(classifier.upper())
     return fig
 
 
-def violin_figure(values, algorithms, classifier):
+def violin_figure(values, algorithms, classifier, metric_name='Recall'):
     """Draw densities only for nonconstant samples, retaining every observation."""
     fig, ax = plt.subplots(figsize=(max(6, len(algorithms)*.8), 5), layout='constrained')
     for i, color in enumerate(palette(algorithms).values()):
@@ -201,11 +214,11 @@ def violin_figure(values, algorithms, classifier):
             parts['bodies'][0].set_alpha(.28)
         ax.hlines(np.median(values[i]), i-.3, i+.3, colors='black', linestyles='--', linewidth=1.3)
     observations(ax, values, algorithms, means=True)
-    ax.set_ylabel('Recall (test): one cached run mean per dataset')
+    ax.set_ylabel(f'{metric_name} (test): all cached runs')
     ax.set_title(classifier.upper())
     ax.legend(handles=[Line2D([], [], marker='D', color='none', markerfacecolor='#777777', label='Mean'),
                        Line2D([], [], color='black', linestyle='--', label='Median'),
-                       Line2D([], [], marker='o', color='none', markerfacecolor='#777777', label='Dataset mean')], frameon=False)
+                       Line2D([], [], marker='o', color='none', markerfacecolor='#777777', label='Dataset/run')], frameon=False)
     return fig
 
 
@@ -214,7 +227,17 @@ def convergence_figure(report, classifier, datasets):
     colors = palette(report.algorithms)
     for ax, ds in zip(axes, datasets):
         for i, algorithm in enumerate(report.algorithms):
-            curve = np.asarray(report.indexed[ds, classifier, algorithm]['Curve'])
+            row = report.indexed[ds, classifier, algorithm]
+            index = framework()._plot_run_index(row)
+            curves = row.get('CurvesAll', [])
+            validated = [framework().validate_convergence_curve(c, getattr(report.args, 'epochs', len(c)), fit)
+                         for c, fit in zip(curves, row['FitRuns'])]
+            if index is None and not validated:
+                curve = np.asarray(row['Curve'], dtype=float)
+            elif len(validated) != len(row['FitRuns']):
+                raise ValueError('Convergence requires individual curves aligned with FitRuns')
+            else:
+                curve = np.mean(np.stack(validated), axis=0) if index is None else validated[index]
             ax.plot(np.arange(len(curve)), curve, label=algorithm, color=colors[algorithm],
                     linestyle=('-', '--', ':', '-.')[i % 4])
         ax.set_title(f'{ds} / {classifier.upper()}')
@@ -261,20 +284,29 @@ def publication_figures(report, skipped):
             if key not in available:
                 skipped.append({'output': f'{stem}/{classifier}', 'reason': f'{key} unavailable'})
                 continue
-            values = metric_matrix(report, classifier, available[key])
+            values = (metric_matrix(report, classifier, available[key]) if key == 'PSRuns'
+                      else run_observations(report, classifier, available[key]))
             if key == 'PSRuns' and values.shape[1] < 2:
-                skipped.append({'output': f'Precision CI/{classifier}', 'reason': 'At least two dataset means required; only observed means are plotted'})
+                skipped.append({'output': f'Precision CI/{classifier}', 'reason': 'At least two datasets required; only observed representatives are plotted'})
             if key == 'RSRuns':
                 for i, algorithm in enumerate(report.algorithms):
                     if values.shape[1] < 2 or np.ptp(values[i]) == 0:
                         skipped.append({'output': f'Violin density/{classifier}/{algorithm}',
-                                        'reason': 'Insufficient or constant dataset means; observations, mean and median retained'})
+                                        'reason': 'Insufficient or constant run observations; observations, mean and median retained'})
             yield f'generic_{stem}_{suffix}', generate_figure(values, report.algorithms, classifier)
+        if 'AccRuns' in available:
+            yield f'07_violin_accuracy_{classifier}', violin_figure(
+                run_observations(report, classifier, available['AccRuns']),
+                report.algorithms, classifier, 'Accuracy')
         complete = []
         for ds in report.datasets:
-            missing = [a for a in report.algorithms if not np.asarray(report.indexed[ds, classifier, a].get('Curve', [])).size]
+            missing = [a for a in report.algorithms
+                       if not np.asarray(report.indexed[ds, classifier, a].get('Curve', [])).size
+                       or (framework().PLOT_RUN_AGGREGATION != 'mean'
+                           and len(report.indexed[ds, classifier, a].get('CurvesAll', []))
+                           != len(report.indexed[ds, classifier, a].get('FitRuns', [])))]
             if missing:
-                skipped.append({'output': f'Convergence {ds}/{classifier}', 'reason': f'No stored mean curve for {missing}'})
+                skipped.append({'output': f'Convergence {ds}/{classifier}', 'reason': f'No aligned convergence history for {missing}'})
             else:
                 complete.append(ds)
         if complete:

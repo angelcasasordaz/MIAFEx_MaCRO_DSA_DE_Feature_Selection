@@ -198,6 +198,13 @@ def _matches_request(identity, args):
                       ('dsade_beta_min', 'dsade_beta_max', 'dsade_pcr', 'dsade_mahal_q')}
     elif method == 'MaCRO-DE-t':
         parameters = {'wf': .5, 'cr': .9, 'dsade_mahal_q': args.dsade_mahal_q}
+    elif method == 'MaCRO-DE-t-v2':
+        parameters = {
+            'beta_min': args.macro_de_t_v2_beta_min,
+            'beta_max': args.macro_de_t_v2_beta_max,
+            'mahalanobis_q': args.macro_de_t_v2_mahal_q,
+            'pcr_policy': '0.1 + 0.25 * (1.0 - dM)',
+        }
     return (method in args.optimizers and identity['classifier'] in args.estimators
             and identity['transfer_function'] in args.transfer_functions
             and identity['optimizer_parameters'] == parameters)
@@ -520,6 +527,64 @@ def generate_outputs(report, figures, results):
     with report_stage(f'{tag}: statistical analysis and figures'):
         skipped.extend(statistics.export(report, figures / 'statistics', results / 'statistics'))
     return required, skipped
+
+
+def run_full_figures(args):
+    """Regenerate the FULL figure tree from validated caches; never export tables."""
+    from reporting import figures, statistics
+    m = framework()
+    with report_stage('Validate completed caches for FULL figures'), report_guard(()) as preflight:
+        report = load_completed_cache(args)
+    root = safe_path(args.output_root)
+    figure_root = safe_path(root / 'Figures' / report.exp_tag)
+    destination_root = safe_path(getattr(args, 'report_output_root', None) or root)
+    destination = safe_path(destination_root / 'Figures' / report.exp_tag / 'full')
+    destination.mkdir(parents=True, exist_ok=True)
+    # Retain filenames while relocating the old flat figure tree exactly once.
+    moved = []
+    for path in figure_root.glob('*'):
+        if not path.is_file() or path.suffix.lower() not in {'.png', '.pdf'}:
+            continue
+        subdirectory = ''
+        if any(path.stem == f'{family}_{dataset}_{classifier}'
+               for family in ('01_resultados_clasificador', '02_radar', '03_features_runtime', '05_convergence')
+               for dataset in report.datasets for classifier in report.classifiers):
+            subdirectory = 'individual'
+        elif path.stem.startswith(('generic_average_rank', 'generic_block_distribution',
+                                   'generic_holm_heatmap', 'generic_reference_comparisons')):
+            subdirectory = 'statistics'
+        elif not path.stem.startswith(tuple(f'{n:02d}_' for n in range(1, 10))):
+            continue
+        # An alternate destination must not move historical source figures.
+        if destination_root != root:
+            continue
+        target = safe_path(destination / subdirectory / path.name)
+        if target.exists():
+            raise ValueError(f'Figure relocation would replace an existing file: {target}')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path.rename(target)
+        moved.append(str(target.relative_to(destination)))
+    with report_stage('Generate representative FULL figures'), report_guard((destination,)) as guard:
+        generated = m.generate_seven_global_charts(
+            m.generate_plot_dataframe(report.results, report.args), report.results,
+            str(destination), report.args.optimizers, report.args,
+        )
+        metric = next((metric for metric in report.metrics if metric.run_key == 'F1Runs'), report.metrics[0])
+        _, matrix = statistics.matched_block_matrix(
+            report.indexed, report.datasets, report.classifiers, report.algorithms, metric,
+        )
+        analysis = statistics.analyze(matrix, report.algorithms, higher_is_better=metric.best_mode == 'max')
+        stats_dir = destination / 'statistics'
+        stats_dir.mkdir(exist_ok=True)
+        for stem, fig in figures.statistical_figures(analysis, report.algorithms, metric.name):
+            figures.save_png(fig, stats_dir / f'{stem}.png')
+            generated.append(f'statistics/{stem}.png')
+        if any(sha256(root / path) != digest for path, digest in report.sources.items()):
+            raise ValueError('Source cache changed during figure generation')
+    print(f'[report] FULL figures: {destination}; aggregation={m.PLOT_RUN_AGGREGATION}; '
+          f'optimization_calls={guard["optimization_calls"] + preflight["optimization_calls"]}', flush=True)
+    return {'figures': str(destination), 'generated': generated, 'moved': moved,
+            'optimization_calls': guard['optimization_calls'] + preflight['optimization_calls']}
 
 
 def run_report(args):

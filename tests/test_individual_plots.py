@@ -73,7 +73,8 @@ class IndividualPlotTests(unittest.TestCase):
                 saved = framework.generate_seven_global_charts(
                     self.df, self.results, self.temp.name, self.args.optimizers, self.args,
                 )
-            self.assertEqual(len(saved), 17)
+            self.assertEqual(len(saved), 19)
+            self.assertEqual(sum(name.startswith('individual/') for name in saved), 8)
             self.assertEqual(len(self.figures["09_resultados_clasificador_metrica_todos_datasets.png"]), 4)
             for family in ("02_radar", "03_features_runtime", "05_convergence"):
                 combined = self.figures[f"{family}_por_dataset_knn.png"]

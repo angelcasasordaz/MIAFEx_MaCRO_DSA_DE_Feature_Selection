@@ -78,7 +78,7 @@ class AdaptiveConvergenceTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             f._draw_dataset_convergence(ax, "Example", table, opts, colors)
-        self.assertIn(f"dataset=Example classifier=knn aggregation={f.CONVERGENCE_AGGREGATION} start_iteration=76 end_iteration=100",
+        self.assertIn(f"dataset=Example classifier=knn aggregation={f.PLOT_RUN_AGGREGATION} start_iteration=76 end_iteration=100",
                       output.getvalue())
         self.assertEqual(len(ax.child_axes), 1)
         inset = ax.child_axes[0]
@@ -124,8 +124,9 @@ class AdaptiveConvergenceTests(unittest.TestCase):
         row = {"Estimator": "knn", "Curve": [.7, .4, .15], "FitRuns": [.2, .1],
                "CurvesAll": [[.5, .3, .2], [.9, .5, .1]]}
         signature = f.build_cache_signature(args)
-        for mode, expected in (("mean", np.mean(row["CurvesAll"], axis=0)), ("best", row["CurvesAll"][1])):
-            with patch.object(f, "CONVERGENCE_AGGREGATION", mode):
+        for mode, expected in (("mean", np.mean(row["CurvesAll"], axis=0)), ("best", row["CurvesAll"][1]),
+                               ("worst", row["CurvesAll"][0])):
+            with patch.object(f, "PLOT_RUN_AGGREGATION", mode):
                 table = f.build_curve_dataframe({"Example": {"DE_KNN": row}}, args, "knn")
                 np.testing.assert_array_equal(table.iloc[0]["Curve"], expected)
                 self.assertEqual(f.build_cache_signature(args), signature)

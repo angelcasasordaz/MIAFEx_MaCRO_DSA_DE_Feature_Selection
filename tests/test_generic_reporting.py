@@ -164,7 +164,7 @@ class GenericReportTests(unittest.TestCase):
             skipped = []
             generated = list(figures.publication_figures(report, skipped))
             try:
-                self.assertEqual(len(generated), 3 * len(classifiers))
+                self.assertEqual(len(generated), 4 * len(classifiers))
                 self.assertEqual(sum(item['output'].startswith('Convergence') for item in skipped),
                                  len(datasets) * len(classifiers))
                 for _, fig in generated:

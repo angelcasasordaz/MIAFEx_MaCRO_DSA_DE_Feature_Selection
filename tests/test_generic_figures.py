@@ -15,7 +15,8 @@ def report_fixture(datasets, algorithms, classifiers):
     indexed = {}
     for ds, rows in results.items():
         for label, row in rows.items():
-            row['Curve'] = [.9, .7, .5]
+            row['CurvesAll'] = [[.9, .7, fit] for fit in row['FitRuns']]
+            row['Curve'] = np.mean(row['CurvesAll'], axis=0)
             indexed[ds, row['Estimator'], label.rsplit('_', 1)[0]] = row
     return core.CompletedReport(args, results, indexed, list(datasets), list(classifiers),
                                 list(algorithms), list(paper_tables.METRICS), 'fixture', {})
@@ -43,10 +44,9 @@ class GenericPublicationTypesTests(unittest.TestCase):
             for ci in range(1, len(classifiers) + 1):
                 for kind in types:
                     self.assertTrue(any(name.startswith(f'generic_{kind}_c{ci}') for name in names), kind)
-            self.assertEqual(len(names), (7 + len(report.metrics)) * len(classifiers))
+            self.assertEqual(len(names), (8 + len(report.metrics)) * len(classifiers))
             if len(datasets) == 1:
                 self.assertTrue(any(item['output'].startswith('Precision CI') for item in skipped))
-                self.assertTrue(any(item['output'].startswith('Violin density') for item in skipped))
             else:
                 self.assertEqual(skipped, [])
 

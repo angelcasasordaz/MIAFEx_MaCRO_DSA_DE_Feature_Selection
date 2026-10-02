@@ -79,6 +79,7 @@ class HistoricalScientificValuesTests(unittest.TestCase):
         self.assertNotEqual(next(iter(self.report.identities.values()))['wrapper_revision'], m.WRAPPER_SCIENCE_REVISION)
 
     def test_generic_means_ci_and_radar_preserve_historical_values(self):
+        self.enterContext(patch.object(m, 'PLOT_RUN_AGGREGATION', 'mean'))
         reference = pd.read_csv(self.source / 'RESUMEN_GRAFICAS_EXP604.csv').rename(
             columns={'Archivo': 'Dataset', 'Estimador': 'Estimator', 'Optimizador': 'Optimizer'})
         reference['Optimizer'] = reference.Optimizer.map(m.optimizer_acronym)

@@ -43,6 +43,7 @@ from dbo_optimizer import DBOOptimizer
 from dsade_awad_optimizer import DSADE
 from macro_de_optimizer import MaCRO_DE
 from macro_de_t_optimizer import MaCRO_DE_t
+from macro_de_t_v2_optimizer import MaCRO_DE_t_v2
 from corrected_binary import CorrectedTransferBinaryVar, BinaryRespawnBRO, corrected_transfer_binary
 from algorithm_acronym_list import (
     list_available_optimizers,
@@ -117,7 +118,9 @@ MIAFEX_LEARNING_RATE = 1e-4
 # Feature selection: supported optimizers/classifiers remain available via config/CLI.
 OPTIMIZERS = [
     # "MaCRO-DE",
+    # "DSADE",
     "MaCRO-DE-t",
+    "MaCRO-DE-t-v2", # Independently selectable; retains supplied v2 defaults.
     "DE",
     "JADE",
     "SHADE",
@@ -143,13 +146,16 @@ DSADE_BETA_MIN = 0.2
 DSADE_BETA_MAX = 0.8
 DSADE_PCR = 0.2
 DSADE_MAHAL_Q = 0.68
+MACRO_DE_T_V2_BETA_MIN = 0.10
+MACRO_DE_T_V2_BETA_MAX = 0.60
+MACRO_DE_T_V2_MAHAL_Q = 0.50
 
 # Experiment and cache reuse
-EXP_ID = 605
+EXP_ID = 606
 REUSE_CACHE = True
-REUSE_CACHE_FROM_EXP_ID = 604  # None: current EXP only; another ID: read-only fallback.
-FIGURES_ONLY = False
-REPORT_ONLY = False  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
+REUSE_CACHE_FROM_EXP_ID = 605  # None: current EXP only; another ID: read-only fallback.
+FIGURES_ONLY = True
+REPORT_ONLY = True  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
 # Scientific versions describe the implementation that actually executes.
 # Bounds/decoding and explicit seeding affect every optimizer, including DE variants.
 BINARY_REPRESENTATION_REVISIONS = {
@@ -159,7 +165,7 @@ OPTIMIZER_REPAIR_REVISIONS = {"OriginalBRO": BinaryRespawnBRO.IMPLEMENTATION_REV
 SEED_POLICY_REVISION = "explicit-selector-seed-v1"
 WRAPPER_SCIENCE_REVISION = "mafese-prepared-partitions-corrected-binary-seeded-v2"
 PLOT_ESTIMATORS = ["knn","svm"]  # Figures/reports only; never affects experiments or cache signatures. "knn",
-CONVERGENCE_AGGREGATION = "best"  # "mean" or "best"; plotting only, never part of cache signatures.
+PLOT_RUN_AGGREGATION = "best"  # "best", "worst", "mean"; figures only, never cache signatures.
 INDIVIDUAL_POLAR_CURVE_SIZE = (7.0, 5.4)
 
 # Parallelize independent runs; each wrapper uses one native/joblib thread.
@@ -454,6 +460,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     macro_dsade.add_argument("--dsade-beta-max", type=float, default=DSADE_BETA_MAX)
     macro_dsade.add_argument("--dsade-pcr", type=float, default=DSADE_PCR)
     macro_dsade.add_argument("--dsade-mahal-q", type=float, default=DSADE_MAHAL_Q)
+    macro_v2 = parser.add_argument_group("MaCRO-DE-t-v2 (adaptive pcr)")
+    macro_v2.add_argument("--macro-de-t-v2-beta-min", type=float, default=MACRO_DE_T_V2_BETA_MIN)
+    macro_v2.add_argument("--macro-de-t-v2-beta-max", type=float, default=MACRO_DE_T_V2_BETA_MAX)
+    macro_v2.add_argument("--macro-de-t-v2-mahal-q", type=float, default=MACRO_DE_T_V2_MAHAL_Q)
     return parser.parse_args(argv)
 
 def resolve_optimizers(args: argparse.Namespace) -> List[str]:
@@ -830,6 +840,14 @@ def build_optimizer(name: str, args: argparse.Namespace):
             pcr=args.dsade_pcr,
             mahalanobis_q=args.dsade_mahal_q,
         )
+    if resolved_upper == "MACRO-DE-T-V2":
+        return MaCRO_DE_t_v2(
+            epoch=args.epochs,
+            pop_size=args.pop_size,
+            beta_min=args.macro_de_t_v2_beta_min,
+            beta_max=args.macro_de_t_v2_beta_max,
+            mahalanobis_q=args.macro_de_t_v2_mahal_q,
+        )
     if resolved_upper == "MACRO-DE-T":
         return MaCRO_DE_t(
             epoch=args.epochs,
@@ -899,6 +917,7 @@ def optimizer_implementation_revisions(args: argparse.Namespace) -> dict:
     revisions = {
         "DSADE": DSADE.IMPLEMENTATION_REVISION,
         "MaCRO-DE-t": MaCRO_DE_t.IMPLEMENTATION_REVISION,
+        "MaCRO-DE-t-v2": MaCRO_DE_t_v2.IMPLEMENTATION_REVISION,
     }
     resolved = {resolve_optimizer_name(name) for name in args.optimizers}
     return {name: revision for name, revision in revisions.items() if name in resolved}
@@ -930,6 +949,7 @@ def build_combination_identity(args, dataset, estimator, method, transfer):
     from mealpy.utils.space import TransferBinaryVar, BinaryVar
     method = resolve_optimizer_name(method)
     custom = {"DSADE": DSADE, "MaCRO-DE": MaCRO_DE, "MaCRO-DE-t": MaCRO_DE_t,
+              "MaCRO-DE-t-v2": MaCRO_DE_t_v2,
               "DBO": DBOOptimizer, "OriginalDMOA": SafeOriginalDMOA, "OriginalBRO": BinaryRespawnBRO}
     cls = custom.get(method) or mealpy.get_optimizer_by_class(method)
     source_hash = lambda obj: hashlib.sha256(inspect.getsource(inspect.unwrap(obj)).encode()).hexdigest()
@@ -940,6 +960,13 @@ def build_combination_identity(args, dataset, estimator, method, transfer):
         "modules": {base.__module__: scientific_cache.file_digest(inspect.getsourcefile(base))
                     for base in cls.__mro__ if base is not object},
     }
+    if method == "MaCRO-DE-t-v2":
+        from macro_de_t_v2_source import macro_de_t_backend, transport
+        from cec_de_mc_cf import compute_backend
+        # Covariance and transport are dependencies outside the optimizer MRO.
+        for module in (macro_de_t_backend, transport, compute_backend):
+            implementation["modules"][module.__name__] = scientific_cache.file_digest(module.__file__)
+        implementation["canonical_name"] = cls.CANONICAL_NAME
     if args.dataset_source == "miafex":
         prepared = {split: scientific_cache.file_digest(path)
                     for split, path in miafex_feature_paths(args).items()}
@@ -956,6 +983,13 @@ def build_combination_identity(args, dataset, estimator, method, transfer):
                       ("dsade_beta_min", "dsade_beta_max", "dsade_pcr", "dsade_mahal_q")}
     elif method == "MaCRO-DE-t":
         parameters = {"wf": 0.5, "cr": 0.9, "dsade_mahal_q": args.dsade_mahal_q}
+    elif method == "MaCRO-DE-t-v2":
+        parameters = {
+            "beta_min": args.macro_de_t_v2_beta_min,
+            "beta_max": args.macro_de_t_v2_beta_max,
+            "mahalanobis_q": args.macro_de_t_v2_mahal_q,
+            "pcr_policy": "0.1 + 0.25 * (1.0 - dM)",
+        }
     return {
         "schema": 2, "dataset": dataset, "dataset_source": args.dataset_source,
         "classifier": estimator.lower(), "optimizer": method, "transfer_function": transfer.lower(),
@@ -1774,6 +1808,7 @@ def optimizer_plot_color(name: str) -> str:
     # Fixed EXP604 colors; never rebuild this palette from the selected methods.
     colors = {
         "MACRO-DE-T": "#5a4262", "BRO": "#6972c8", "DBO": "#6b9dfb",
+        "MACRO-DE-T-V2": "#167d8d",
         "DE": "#53c9ef", "FLA": "#48eac5", "FOX": "#77fb92",
         "GWO": "#b6fd63", "HHO": "#e0e95e", "JADE": "#fbc860",
         "PSO": "#fc984d", "RUN": "#e96a3b", "SHADE": "#c74b34",
@@ -1791,6 +1826,7 @@ def optimizer_plot_style(name: str) -> dict:
     identity = optimizer_display_label(name).upper()
     styles = {
         "MACRO-DE-T": ("-", "o"), "BRO": ("--", "s"), "DBO": (":", "^"),
+        "MACRO-DE-T-V2": ("-.", "D"),
         "DE": ("-.", "v"), "FLA": ("--", "D"), "FOX": (":", "P"),
         "GWO": ("-.", "X"), "HHO": ("--", "<"), "JADE": ("-", ">"),
         "PSO": ("--", "h"), "RUN": (":", "p"), "SHADE": ("-.", "*"),
@@ -1821,10 +1857,12 @@ def optimizer_order_key(name: str) -> tuple:
         return (1, "")
     if label == "MACRO-DE-T":
         return (2, "")
+    if label == "MACRO-DE-T-V2":
+        return (2, "v2")
     return (3, label)
 
 def is_dsade_method(name: str) -> bool:
-    return str(name).upper() in {"MACRO-DE", "MACRO-DE-T", "DSA-DE", "DSADE", "DSA_DE"}
+    return str(name).upper() in {"MACRO-DE", "MACRO-DE-T", "MACRO-DE-T-V2", "DSA-DE", "DSADE", "DSA_DE"}
 
 def is_exact_dsade_method(name: str) -> bool:
     return str(name).upper() in {"DSA-DE", "DSADE", "DSA_DE"}
@@ -2239,6 +2277,52 @@ def generate_summary_dataframe(results_struct: Dict[str, Dict], args: argparse.N
     return pd.DataFrame(rows)
 
 
+def _plot_run_index(row, context="plot"):
+    """Choose one positional run by final fitness; ties keep stored run order."""
+    if PLOT_RUN_AGGREGATION not in {"best", "worst", "mean"}:
+        raise ValueError('PLOT_RUN_AGGREGATION must be "best", "worst" or "mean".')
+    if PLOT_RUN_AGGREGATION == "mean":
+        return None
+    fitness = np.asarray(row.get("FitRuns", []), dtype=float)
+    ids = row.get("CompletedRunIDs", list(range(fitness.size)))
+    if (fitness.ndim != 1 or not fitness.size or not np.isfinite(fitness).all()
+            or len(ids) != fitness.size
+            or any(not isinstance(run, (int, np.integer)) or run < 0 for run in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError(f"{context}: representative figures require aligned run IDs and finite FitRuns.")
+    return int(np.argmin(fitness) if PLOT_RUN_AGGREGATION == "best" else np.argmax(fitness))
+
+
+def generate_plot_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace) -> pd.DataFrame:
+    """Figure-only view; summary tables and stored scientific rows keep their means."""
+    plot_rows = {}
+    for dataset, rows in results_struct.items():
+        plot_rows[dataset] = {}
+        for label, row in rows.items():
+            context = f"{dataset}/{label}"
+            index = _plot_run_index(row, context)
+            selected = dict(row)
+            if index is not None:
+                count = len(row["FitRuns"])
+                for metric in ("Acc", "PS", "RS", "F1", "Fit", "Feat", "Time"):
+                    values = np.asarray(row.get(f"{metric}Runs", []), dtype=float)
+                    if values.ndim != 1 or len(values) != count:
+                        raise ValueError(f"{context}: {metric}Runs must align with FitRuns.")
+                    selected[f"{metric}Mean"] = float(values[index])
+            plot_rows[dataset][label] = selected
+    return generate_summary_dataframe(plot_rows, args)
+
+
+def _representative_figure_dataframe(df, results_struct, args):
+    """Retain the caller's dataset/classifier/configuration selection."""
+    keys = ["Archivo", "Estimador", "Configuracion"]
+    selected = set(zip(df["Archivo"], df["Configuracion"]))
+    rows = {dataset: {label: row for label, row in algorithms.items() if (dataset, label) in selected}
+            for dataset, algorithms in results_struct.items()}
+    representative = generate_plot_dataframe(rows, args)
+    return representative.merge(df[keys].drop_duplicates(), on=keys, how="inner")
+
+
 def _plot_legend_patches(opts: List[str], color_map: Dict[str, str], label_map: Dict[str, str]) -> List[mpatches.Patch]:
     return [mpatches.Patch(color=color_map.get(o, "#888"), label=label_map.get(o, o)) for o in opts]
 
@@ -2414,8 +2498,6 @@ def build_run_level_dataframe(results_struct: Dict[str, Dict], args: argparse.Na
 
 
 def build_curve_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace, estimator_filter: str = "svm") -> pd.DataFrame:
-    if CONVERGENCE_AGGREGATION not in {"mean", "best"}:
-        raise ValueError('CONVERGENCE_AGGREGATION must be "mean" or "best".')
     rows = []
     for dataset_name, alg_data in results_struct.items():
         for label, row in alg_data.items():
@@ -2432,10 +2514,9 @@ def build_curve_dataframe(results_struct: Dict[str, Dict], args: argparse.Namesp
                     or len(set(ids)) != len(ids)):
                 raise ValueError(f"{dataset_name}/{label}: convergence requires aligned run IDs, finite FitRuns and CurvesAll.")
             validated = [validate_convergence_curve(c, args.epochs, fit) for c, fit in zip(curves, fitness)]
-            # A strict mean, or the complete real run with the lowest final fitness.
-            # Never trust an unvalidated aggregate or manufacture a pointwise best.
-            curve = (np.mean(np.stack(validated), axis=0) if CONVERGENCE_AGGREGATION == "mean"
-                     else validated[int(np.argmin(fitness))])
+            # Share the same fitness-selected run as every representative metric.
+            index = _plot_run_index(row, f"{dataset_name}/{label}")
+            curve = np.mean(np.stack(validated), axis=0) if index is None else validated[index]
             rows.append(
                 {
                     "Archivo": dataset_name,
@@ -2610,7 +2691,7 @@ def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_colo
     else:
         start = end = None
     print(f"[convergence-zoom] dataset={dataset} classifier={classifier} "
-          f"aggregation={CONVERGENCE_AGGREGATION} start_iteration={start} end_iteration={end}"
+          f"aggregation={PLOT_RUN_AGGREGATION} start_iteration={start} end_iteration={end}"
           + (" (no additional final-stage detail)" if window is None else ""), flush=True)
     if not plotted:
         ax.text(0.5, 0.5, "Sin curvas", transform=ax.transAxes, ha="center", va="center", color="#777")
@@ -2625,6 +2706,8 @@ def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, a
     saved = []
     if df.empty:
         return saved
+    df = _representative_figure_dataframe(df, results_struct, args)
+    out_dir = os.path.join(out_dir, "individual")
     os.makedirs(out_dir, exist_ok=True)
     for estimator in dict.fromkeys(PLOT_ESTIMATORS):
         selected = df[df["Estimador"].astype(str).str.lower() == estimator]
@@ -2647,28 +2730,28 @@ def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, a
                 title=f"{dataset} — {estimator.upper()}",
             )
             if filename:
-                saved.append(filename)
+                saved.append(os.path.join("individual", filename))
 
             fig, ax = plt.subplots(figsize=INDIVIDUAL_POLAR_CURVE_SIZE, subplot_kw=dict(polar=True))
             _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group)
             _convergence_legend(fig, opts, color_map, label_map)
             filename = f"02_radar_{dataset}_{estimator}.png"
             _save_chart(fig, out_dir, filename)
-            saved.append(filename)
+            saved.append(os.path.join("individual", filename))
 
             fig, ax = plt.subplots(figsize=(max(7.0, 0.5 * len(opts)), 5.0))
             _draw_dataset_features_runtime(ax, dataset, plot_df, opts, color_map, label_map)
             fig.tight_layout()
             filename = f"03_features_runtime_{dataset}_{estimator}.png"
             _save_chart(fig, out_dir, filename)
-            saved.append(filename)
+            saved.append(os.path.join("individual", filename))
 
             fig, ax = plt.subplots(figsize=INDIVIDUAL_POLAR_CURVE_SIZE)
             _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map, classifier=estimator)
             _convergence_legend(fig, curve_opts, curve_color_map, curve_label_map)
             filename = f"05_convergence_{dataset}_{estimator}.png"
             _save_chart(fig, out_dir, filename)
-            saved.append(filename)
+            saved.append(os.path.join("individual", filename))
     return saved
 
 
@@ -2695,19 +2778,121 @@ def _individual_dataset_legend(fig, opts, color_map, label_map, *, handles=None)
     fig.tight_layout(rect=[0.0, (bounds.height + 0.25) / fig.get_figheight(), 1.0, 1.0])
 
 
+def _save_metric_heatmap(plot_df, opts, label_map, out_dir, filename, metric, title):
+    """Shared F1/Accuracy style, order, annotation and optimizer highlighting."""
+    datasets = sorted(plot_df["Archivo"].dropna().unique())
+    method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
+    pivot = plot_df.groupby(["GrupoGrafica", "Archivo"])[metric].mean().unstack()
+    mat = pivot.reindex(index=opts, columns=datasets).values
+    fig, ax = plt.subplots(figsize=(max(10, 0.9 * len(datasets) + 4), max(5, 0.45 * len(opts) + 2)))
+    im = ax.imshow(mat, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
+    plt.colorbar(im, ax=ax, label=title, shrink=0.8)
+    ax.set_xticks(range(len(datasets)))
+    ax.set_xticklabels(datasets, rotation=35, ha="right")
+    ax.set_yticks(range(len(opts)))
+    ax.set_yticklabels([label_map.get(o, o) for o in opts])
+    # for tick, opt in zip(ax.get_yticklabels(), opts):
+    #     if str(method_by_group.get(opt)).upper() == "MACRO-DE":
+    #         tick.set_color("red")
+    #         tick.set_fontweight("bold")
+    macro_idx = next(
+        (i for i, opt in enumerate(opts)
+         if str(method_by_group.get(opt)).upper() == "MACRO-DE"),
+        None,
+    )
+
+    if macro_idx is not None:
+        rect = plt.Rectangle((-0.5, macro_idx - 0.5), len(datasets),1, fill=False, edgecolor="black", linewidth=2.5, zorder=100)
+        ax.add_patch(rect)
+
+    ax.set_xlabel("Dataset")
+    ax.set_ylabel("Metaheuristics")
+    for i in range(len(opts)):
+        for j in range(len(datasets)):
+            value = mat[i, j]
+            if np.isfinite(value):
+                ax.text(j, i, f"{value:.4f}", ha="center", va="center", color="white" if value > 0.80 else "#222", fontsize=8)
+    fig.tight_layout()
+    _save_chart(fig, out_dir, filename)
+    return filename
+
+
+def _save_metric_violin(run_plot_df, run_opts, run_color_map, run_label_map, out_dir, filename, metric, title):
+    """Distribution of every dataset/run observation, independent of aggregation."""
+    data_violin = [run_plot_df[run_plot_df["GrupoGrafica"] == opt][metric].dropna().values for opt in run_opts]
+    fig, ax = plt.subplots(figsize=(max(12, 0.85 * len(run_opts) + 5), 6.5))
+    for position, (values, opt) in enumerate(zip(data_violin, run_opts), start=1):
+        if values.size > 1 and np.ptp(values) > 0:
+            parts = ax.violinplot([values], positions=[position], showmeans=False, showmedians=False, widths=0.78)
+            body = parts["bodies"][0]
+            body.set_facecolor(run_color_map.get(opt, "#888"))
+            body.set_edgecolor(run_color_map.get(opt, "#888"))
+            body.set_alpha(0.22)
+    for i, (opt, values) in enumerate(zip(run_opts, data_violin), start=1):
+        if values.size == 0:
+            continue
+        jitter = np.linspace(-0.08, 0.08, values.size) if values.size > 1 else np.array([0.0])
+        ax.scatter(np.full(values.size, i) + jitter, values, color=run_color_map.get(opt, "#888"), edgecolor="white", linewidth=0.5, s=35, zorder=3)
+        mean_val = float(np.nanmean(values))
+        median_val = float(np.nanmedian(values))
+        ax.scatter(i, mean_val, marker="D", color="black", edgecolor="white", linewidth=1.2, s=140, zorder=4)
+        ax.hlines(median_val, i - 0.25, i + 0.25, colors="black", linestyles="--", linewidth=1.2)
+        ax.text(i, mean_val + 0.018, f"{mean_val:.3f}", ha="center", va="bottom", fontsize=8, color="#333")
+    ax.set_xticks(range(1, len(run_opts) + 1))
+    ax.set_xticklabels([run_label_map.get(o, o) for o in run_opts], rotation=35, ha="right")
+    ax.set_ylabel(title)
+    ax.set_ylim(0.0, 1.08)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(
+        handles=[
+            plt.Line2D([0], [0], marker="D", color="w", markerfacecolor="#555", label="Mean"),
+            plt.Line2D([0], [0], color="#555", linestyle="--", label="Median"),
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#555", label="Value per dataset/run"),
+        ],
+        loc="lower right",
+        framealpha=0.9,
+    )
+    fig.tight_layout()
+    _save_chart(fig, out_dir, filename)
+    return filename
+
+
+def generate_accuracy_charts(results_struct, args, out_dir, opt_order):
+    saved = []
+    representative = generate_plot_dataframe(results_struct, args)
+    for estimator in dict.fromkeys(PLOT_ESTIMATORS):
+        selected = representative[representative["Estimador"].astype(str).str.lower() == estimator]
+        plot_df, opts, colors, labels = prepare_plot_groups(selected, opt_order)
+        if not opts:
+            continue
+        saved.append(_save_metric_heatmap(
+            plot_df, opts, labels, out_dir, f"06_heatmap_accuracy_{estimator}.png",
+            "AS_test", "Accuracy (test)",
+        ))
+        runs = build_run_level_dataframe(results_struct, args, estimator)
+        run_df, run_opts, run_colors, run_labels = prepare_plot_groups(runs, opt_order)
+        if run_opts:
+            saved.append(_save_metric_violin(
+                run_df, run_opts, run_colors, run_labels, out_dir,
+                f"07_violin_accuracy_{estimator}.png", "AS_test", "Accuracy (test)",
+            ))
+    return saved
+
+
 def generate_seven_global_charts(
     df: pd.DataFrame,
     results_struct: Dict[str, Dict],
     out_dir: str,
     opt_order: List[str],
     args: argparse.Namespace,
-    estimator_filter: str = "svm",  # Preserve the legacy combined-chart selection.
+    estimator_filter: str = "knn",  # Combined filenames identify their KNN selection.
 ):
     if df.empty:
         return []
     df = df[df["Estimador"].astype(str).str.lower().isin(PLOT_ESTIMATORS)]
     if df.empty:
         return []
+    df = _representative_figure_dataframe(df, results_struct, args)
     os.makedirs(out_dir, exist_ok=True)
     saved = []
 
@@ -2718,6 +2903,7 @@ def generate_seven_global_charts(
         saved.append(new_chart1)
 
     saved.extend(generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args))
+    saved.extend(generate_accuracy_charts(results_struct, args, out_dir, opt_order))
     # Keep legacy combined filenames/layouts, but honor a single-classifier selection.
     if estimator_filter.lower() not in PLOT_ESTIMATORS:
         estimator_filter = PLOT_ESTIMATORS[0]
@@ -2799,74 +2985,13 @@ def generate_seven_global_charts(
     _save_chart(fig, out_dir, "05_convergence_por_dataset_knn.png")
     saved.append("05_convergence_por_dataset_knn.png")
 
-    pivot = plot_df.groupby(["GrupoGrafica", "Archivo"])["F1_test"].mean().unstack()
-    mat = pivot.reindex(index=opts, columns=datasets).values
-    fig, ax = plt.subplots(figsize=(max(10, 0.9 * len(datasets) + 4), max(5, 0.45 * len(opts) + 2)))
-    im = ax.imshow(mat, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
-    plt.colorbar(im, ax=ax, label="F1-Score (test)", shrink=0.8)
-    ax.set_xticks(range(len(datasets)))
-    ax.set_xticklabels(datasets, rotation=35, ha="right")
-    ax.set_yticks(range(len(opts)))
-    ax.set_yticklabels([label_map.get(o, o) for o in opts])
-    # for tick, opt in zip(ax.get_yticklabels(), opts):
-    #     if str(method_by_group.get(opt)).upper() == "MACRO-DE":
-    #         tick.set_color("red")
-    #         tick.set_fontweight("bold")
-    macro_idx = next(
-        (i for i, opt in enumerate(opts)
-         if str(method_by_group.get(opt)).upper() == "MACRO-DE"),
-        None,
-    )
-
-    if macro_idx is not None:
-        rect = plt.Rectangle((-0.5, macro_idx - 0.5), len(datasets),1, fill=False, edgecolor="black", linewidth=2.5, zorder=100)
-        ax.add_patch(rect)
-
-    ax.set_xlabel("Dataset")
-    ax.set_ylabel("Metaheuristics")
-    for i in range(len(opts)):
-        for j in range(len(datasets)):
-            value = mat[i, j]
-            if np.isfinite(value):
-                ax.text(j, i, f"{value:.4f}", ha="center", va="center", color="white" if value > 0.80 else "#222", fontsize=8)
-    fig.tight_layout()
-    _save_chart(fig, out_dir, "06_heatmap_f1_knn.png")
-    saved.append("06_heatmap_f1_knn.png")
-
-    data_violin = [run_plot_df[run_plot_df["GrupoGrafica"] == opt]["RS_test"].dropna().values for opt in run_opts]
-    fig, ax = plt.subplots(figsize=(max(12, 0.85 * len(run_opts) + 5), 6.5))
-    parts = ax.violinplot(data_violin, showmeans=False, showmedians=False, widths=0.78)
-    for body, opt in zip(parts["bodies"], run_opts):
-        body.set_facecolor(run_color_map.get(opt, "#888"))
-        body.set_edgecolor(run_color_map.get(opt, "#888"))
-        body.set_alpha(0.22)
-    for i, (opt, values) in enumerate(zip(run_opts, data_violin), start=1):
-        if values.size == 0:
-            continue
-        jitter = np.linspace(-0.08, 0.08, values.size) if values.size > 1 else np.array([0.0])
-        ax.scatter(np.full(values.size, i) + jitter, values, color=run_color_map.get(opt, "#888"), edgecolor="white", linewidth=0.5, s=35, zorder=3)
-        mean_val = float(np.nanmean(values))
-        median_val = float(np.nanmedian(values))
-        ax.scatter(i, mean_val, marker="D", color="black", edgecolor="white", linewidth=1.2, s=140, zorder=4)
-        ax.hlines(median_val, i - 0.25, i + 0.25, colors="black", linestyles="--", linewidth=1.2)
-        ax.text(i, mean_val + 0.018, f"{mean_val:.3f}", ha="center", va="bottom", fontsize=8, color="#333")
-    ax.set_xticks(range(1, len(run_opts) + 1))
-    ax.set_xticklabels([run_label_map.get(o, o) for o in run_opts], rotation=35, ha="right")
-    ax.set_ylabel("Recall (test)")
-    ax.set_ylim(0.0, 1.08)
-    ax.grid(axis="y", alpha=0.25)
-    ax.legend(
-        handles=[
-            plt.Line2D([0], [0], marker="D", color="w", markerfacecolor="#555", label="Mean"),
-            plt.Line2D([0], [0], color="#555", linestyle="--", label="Median"),
-            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#555", label="Value per dataset/run"),
-        ],
-        loc="lower right",
-        framealpha=0.9,
-    )
-    fig.tight_layout()
-    _save_chart(fig, out_dir, "07_violin_recall_knn.png")
-    saved.append("07_violin_recall_knn.png")
+    saved.append(_save_metric_heatmap(
+        plot_df, opts, label_map, out_dir, "06_heatmap_f1_knn.png", "F1_test", "F1-Score (test)",
+    ))
+    saved.append(_save_metric_violin(
+        run_plot_df, run_opts, run_color_map, run_label_map, out_dir,
+        "07_violin_recall_knn.png", "RS_test", "Recall (test)",
+    ))
 
     generate_global_accuracy_boxplot(
         run_plot_df,
@@ -3080,9 +3205,9 @@ def export_reporting_outputs(paths, args, dataset_names, results_struct, statist
     summary_csv = os.path.join(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv")
     summary_df.to_csv(summary_csv, index=False)
     generated_charts = generate_seven_global_charts(
-        summary_df,
+        generate_plot_dataframe(results_struct, args),
         results_struct,
-        paths.fig_dir,
+        os.path.join(paths.fig_dir, "full"),
         list(args.optimizers),
         args,
     )
@@ -3140,7 +3265,9 @@ def main():
     logging.getLogger("mealpy").setLevel(logging.WARNING)
 
     if args.report_only:
-        from reporting.core import run_report
+        from reporting.core import run_report, run_full_figures
+        if args.figures_only:
+            return run_full_figures(args)
         return run_report(args)
 
     if args.exp_id == 604:
