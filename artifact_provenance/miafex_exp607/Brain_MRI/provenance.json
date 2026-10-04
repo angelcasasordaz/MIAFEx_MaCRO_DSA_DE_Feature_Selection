@@ -1,0 +1,100 @@
+{
+  "MIAFEX_ARTIFACT_TAG": "exp607",
+  "artifact_sha256": {
+    "checkpoint": "a3a2077370d7deb7ce2b9534d8f4ab02a953f5685d481a9ccaef9f2b59d33c47",
+    "test_features_csv": "49f48a39ccfd330a9aa9a2253027fdb44465d1c5295b0ff362bfab9d34ff53fa",
+    "train_features_csv": "332e702c2647a2a0b6b9893f58642174749ae3138d89e1f8d14593ef441f67e1"
+  },
+  "configuration": {
+    "backbone_model": "MIAFEx: ViTForImageClassification + element-wise refinement + Linear(768, num_classes)",
+    "batch_size": 8,
+    "dataset_name": "Brain_MRI",
+    "dataset_root": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets/Brain_MRI",
+    "epochs": 50,
+    "extraction_representation": "last hidden-state CLS token * learned refinement_weights; 768 dimensions; eval/no_grad",
+    "image_source": {
+      "test": {
+        "classes": [
+          "glioma_tumor",
+          "meningioma_tumor",
+          "no_tumor",
+          "pituitary_tumor"
+        ],
+        "image_count": 639,
+        "sha256": "5f240cd0b4fc1546aaed069c53a2969f2a4b637a9ded75dc1480c87b7069d411"
+      },
+      "train": {
+        "classes": [
+          "glioma_tumor",
+          "meningioma_tumor",
+          "no_tumor",
+          "pituitary_tumor"
+        ],
+        "image_count": 2231,
+        "sha256": "9ce530b4a0f35c6e3b1bd7b2a6dda4d1719e0b37844ae1983319468c17fb78d5"
+      }
+    },
+    "learning_rate": 0.0001,
+    "optimizer": "torch.optim.NAdam (library defaults except learning_rate)",
+    "packages": {
+      "torch": "2.7.1",
+      "torchvision": "0.22.1",
+      "transformers": "4.48.3"
+    },
+    "preprocessing_transforms": {
+      "loader": "torchvision.datasets.ImageFolder (RGB)",
+      "test": [
+        "Resize((224, 224), torchvision defaults)",
+        "ToTensor()"
+      ],
+      "train": [
+        "Resize((224, 224), torchvision defaults)",
+        "ToTensor()"
+      ]
+    },
+    "pretrained_source": "google/vit-base-patch16-224-in21k",
+    "source_sha256": {
+      "extract_miafex_features.py": "5ff415fb42daf43aa61f3e2d630c6ec5ae07226d1c89abd0f97cb698a1ae3257",
+      "miafex_model.py": "b40f33d9156cd81db8295a6ebd372936f75ff0c11801c1ed86e20a45a9e1b64c",
+      "train_miafex.py": "01d917484b92dd2c18f341cecd5ff8952dbef2acac4185ffe0e27b7d1ce5b2a2"
+    },
+    "training_seed": null,
+    "training_seed_policy": "No explicit neural seed set by train_miafex; RNG state was not recorded"
+  },
+  "paths": {
+    "checkpoint": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/checkpoints/miafex_exp607/Brain_MRI/miafex_checkpoint.pth",
+    "test_features_csv": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets_features/miafex_exp607/Brain_MRI/test_features.csv",
+    "train_features_csv": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets_features/miafex_exp607/Brain_MRI/train_features.csv"
+  },
+  "provenance": {
+    "completion_evidence": {
+      "directory": "Results/EXP607/cache/combinations_v2",
+      "note": "All requested final rows have 20 valid completed runs and feature SHA-256 matches; read-only audit performed before the refactor.",
+      "validated_combinations": 154,
+      "validated_fs_runs": 3080
+    },
+    "configuration_basis": "Reconstructed from preserved configuration/source and training metrics, not an original training-time manifest.",
+    "configuration_evidence": {
+      "file": "main_best.py",
+      "git_revision": "f5c16eeeda81e06713ab9f97e241d1f4f6118a04",
+      "note": "Neural settings match preserved pre-refactor EXP607 configuration. Existing neural source files are byte-identical to this revision.",
+      "sha256": "986db4ac4a2eabb64e363666a9a3abf04117d11329ab75cd0c90af30a67beaa8"
+    },
+    "created_by_exp_id": 607,
+    "historical_limitations": [
+      "Original neural RNG state/seed was not recorded.",
+      "Exact resolved Hugging Face pretrained revision was not recorded.",
+      "Image content and package versions were fingerprinted at migration; no original training-time content/package manifest exists."
+    ],
+    "origin": "reconstructed_legacy_exp607",
+    "pretrained_resolved_revision": null,
+    "recorded_at_utc": "2026-10-04T13:27:51.986837+00:00",
+    "source_git_revision": "f5c16eeeda81e06713ab9f97e241d1f4f6118a04",
+    "training_metrics_evidence": {
+      "completed_epochs": 50,
+      "path": "checkpoints/miafex_exp607/Brain_MRI/metrics_curve.pkl",
+      "sha256": "5ec5b329edc80131a62fd78922e1418f6b72fbd03a62e5f955ad748d907ae799"
+    }
+  },
+  "schema_version": 1
+}

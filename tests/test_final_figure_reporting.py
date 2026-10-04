@@ -86,21 +86,18 @@ class FinalFigureReportingTests(unittest.TestCase):
                 row['FeatMean'] = 12.
         before = pickle.dumps(self.results)
         for classifier, expected_accuracy, expected_features in [('knn', .8, 8.), ('svm', .6, 12.)]:
+            self.args.plot_global_estimator = classifier
             captured = {}
-            def sink(fig, directory, filename):
-                captured[filename] = [line.get_ydata().copy() for line in fig.axes[0].lines]
-                Path(directory, filename).touch()
+            def sink(fig, path):
+                captured[Path(path).name] = [line.get_ydata().copy() for line in fig.axes[0].lines]
+                Path(path).touch()
                 m.plt.close(fig)
             with self.subTest(classifier=classifier), \
                     patch.object(m, 'PLOT_GLOBAL_ESTIMATOR', classifier), \
                     patch.object(m, 'PLOT_RUN_AGGREGATION', 'best'), \
                     patch.object(core, 'load_completed_cache', return_value=self.report), \
                     patch.object(figures, 'statistical_figures', return_value=[]), \
-                    patch.object(m, '_save_chart', side_effect=sink), \
-                    patch.object(m, '_draw_dataset_features_runtime', wraps=m._draw_dataset_features_runtime) as panels, \
-                    patch.object(m, '_draw_dataset_convergence', wraps=m._draw_dataset_convergence) as curves, \
-                    patch.object(m, 'generate_global_features_runtime') as tradeoff, \
-                    patch.object(m, 'generate_global_accuracy_boxplot') as boxplot, \
+                    patch.object(figures, 'save_png', side_effect=sink), \
                     redirect_stdout(io.StringIO()):
                 result = core.run_full_figures(self.args)
                 self.assertEqual(result['optimization_calls'], 0)
@@ -109,17 +106,12 @@ class FinalFigureReportingTests(unittest.TestCase):
                 for line in captured[radar_path]:
                     self.assertEqual(line[0], expected_accuracy)
                     self.assertEqual(line[4], expected_features / 20)
-                for spy in (tradeoff, boxplot):
-                    self.assertEqual(set(spy.call_args.args[0].Estimador), {classifier})
-                np.testing.assert_array_equal(tradeoff.call_args.args[0].N_Features_Selected, expected_features)
-                for call in panels.call_args_list[-2:]:
-                    self.assertEqual(set(call.args[2].Estimador), {classifier})
-                for call in curves.call_args_list[-2:]:
-                    self.assertEqual(call.kwargs['classifier'], classifier)
-                self.assertEqual(set(boxplot.call_args.args[0].Archivo), set(self.results))
-                self.assertEqual(len(boxplot.call_args.args[0]), 18)
-                # Secondary KNN metrics retain their classifier when globals select SVM.
-                self.assertIn('individual/06_heatmap_f1_knn.png', result['generated'])
+                selected = next(metric for metric in self.report.metrics if metric.run_key == 'FeatRuns')
+                np.testing.assert_array_equal(figures.metric_matrix(self.report, classifier, selected), expected_features)
+                self.assertEqual([name for name in result['generated'] if 'heatmap' in name],
+                                 [f'06_heatmap_accuracy_{classifier}.png'])
+                self.assertIn(f'07_violin_accuracy_{classifier}.png', result['generated'])
+                self.assertIn(f'05_convergence_por_dataset_{classifier}.png', result['generated'])
                 self.assertEqual(set(self.report.classifiers), {'knn', 'svm'})
         self.assertEqual(pickle.dumps(self.results), before)
 

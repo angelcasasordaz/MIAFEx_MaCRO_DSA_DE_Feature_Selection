@@ -45,31 +45,23 @@ class PlotAggregationTests(unittest.TestCase):
         self.assertEqual(pickle.dumps(self.results), before)
 
     def test_global_figure_entry_uses_representative_metrics_and_all_run_distributions(self):
+        from reporting import figures
         summary = f.generate_summary_dataframe(self.results, self.args)
         before = pickle.dumps(self.results)
         with tempfile.TemporaryDirectory() as directory:
             for mode, accuracy in (("best", .75), ("worst", .99),
                                    ("mean", self.row["AccMean"] / 100)):
                 with self.subTest(mode=mode), patch.object(f, "PLOT_RUN_AGGREGATION", mode), \
-                        patch.object(f, "PLOT_ESTIMATORS", ["knn"]), \
-                        patch.object(f, "generate_classifier_metric_grid_chart", return_value=None) as grid, \
-                        patch.object(f, "generate_individual_dataset_charts", return_value=[]) as individual, \
-                        patch.object(f, "plot_original_feature_counts", return_value={"Tiny": 10}), \
-                        patch.object(f, "_draw_dataset_radar") as radar, \
-                        patch.object(f, "_draw_dataset_features_runtime") as features, \
-                        patch.object(f, "generate_global_accuracy_boxplot") as distribution, \
-                        patch.object(f, "generate_global_features_runtime") as global_features, \
-                        patch.object(f, "_save_chart"):
+                        patch.object(figures, 'generate', return_value=[]) as generate:
                     f.generate_seven_global_charts(summary, self.results, directory,
                                                   self.args.optimizers, self.args,
                                                   estimator_filter=f.PLOT_GLOBAL_ESTIMATOR)
-                    for table in (grid.call_args.args[0], individual.call_args.args[0],
-                                  radar.call_args.args[2], features.call_args.args[2],
-                                  global_features.call_args.args[0]):
-                        self.assertEqual(table.iloc[0]["AS_test"], accuracy)
-                    table = distribution.call_args.args[0]
-                    self.assertEqual(len(table), 3)
-                    np.testing.assert_array_equal(table.AS_test, self.row["AccRuns"] / 100)
+                    report = generate.call_args.args[0]
+                    metric = next(item for item in report.metrics if item.run_key == 'AccRuns')
+                    np.testing.assert_allclose(figures.metric_matrix(report, 'knn', metric), accuracy)
+                    observed = figures.run_observations(report, 'knn', metric)
+                    self.assertEqual(observed.shape, (1, 3))
+                    np.testing.assert_array_equal(observed[0], self.row['AccRuns']/100)
                 f.plt.close("all")
         self.assertEqual(pickle.dumps(self.results), before)
 

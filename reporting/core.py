@@ -231,23 +231,9 @@ def _validate_row(row, identity, args, context):
         mean_key = metric.run_key.replace('Runs', 'Mean')
         if not np.isclose(row.get(mean_key, np.nan), values.mean(), rtol=1e-12, atol=1e-12):
             raise ValueError(f'Cached summary disagrees with runs: {context}/{mean_key}')
-    curves = row.get('CurvesAll')
-    if curves is not None:
-        if len(curves) != args.runs:
-            raise ValueError(f'Incomplete convergence run array: {context}')
-        for i, curve in enumerate(curves):
-            final = row['FitRuns'][i] if 'FitRuns' in row else None
-            m.validate_convergence_curve(curve, args.epochs, final)
-        evidence = row.get('ConvergenceRuns', {})
-        if not isinstance(evidence, dict) or set(evidence) - set(ids):
-            raise ValueError(f'Invalid convergence evidence: {context}')
-        for run, metadata in evidence.items():
-            m.validate_convergence_metadata(metadata, curves[run], args.epochs)
-    mean = np.asarray(row.get('Curve', []), dtype=float)
-    if mean.size:
-        m.validate_convergence_curve(mean, args.epochs)
-        if curves is None or not np.allclose(mean, m.pad_mean_curves(curves, args.epochs), rtol=1e-12, atol=1e-15):
-            raise ValueError(f'Invalid cached mean convergence: {context}')
+    # Classification/feature/runtime observations are independent of optional
+    # histories. The plotting layer validates stored curves and reports/skips
+    # unavailable histories and insets; never repair/reconstruct a cache here.
 
 
 def load_completed_cache(args):
@@ -505,6 +491,7 @@ def generate_outputs(report, figures, results):
     tag = report.exp_tag
     required = [f'Global_Results_{tag}.xlsx', f'Statistical_Results_{tag}.xlsx', f'Paper_Tables_{tag}.xlsx',
                 'statistics/statistical_summary.csv', 'statistics/pairwise_wilcoxon_holm.csv',
+                'statistics/matched_block_means.csv', 'statistics/omitted_blocks.csv',
                 'statistics/statistical_report.txt']
     with report_stage(f'{tag}: Global Results Excel'):
         m.export_global_excel(report.results, report.datasets, str(results / required[0]))
@@ -586,27 +573,28 @@ def run_full_figures(args):
     moved = (organize_full_figure_tree(figure_root, destination, report.datasets, report.classifiers)
              if destination_root == root else [])
     with report_stage('Generate representative FULL figures'), report_guard((destination,)) as guard:
-        generated = m.generate_seven_global_charts(
-            m.generate_plot_dataframe(report.results, report.args), report.results,
-            str(destination), report.args.optimizers, report.args,
-            estimator_filter=m.PLOT_GLOBAL_ESTIMATOR,
-        )
-        metric = next((metric for metric in report.metrics if metric.run_key == 'F1Runs'), report.metrics[0])
+        generated = []
+        skipped = figures.generate(report, destination, generated=generated)
+        metric = statistics.selected_metric(report)
         _, matrix = statistics.matched_block_matrix(
             report.indexed, report.datasets, report.classifiers, report.algorithms, metric,
+            expected_runs=getattr(report.args, 'runs', None),
         )
         analysis = statistics.analyze(matrix, report.algorithms, higher_is_better=metric.best_mode == 'max')
         stats_dir = destination / 'statistics'
         stats_dir.mkdir(exist_ok=True)
-        for stem, fig in figures.statistical_figures(analysis, report.algorithms, metric.name):
-            figures.save_png(fig, stats_dir / f'{stem}.png')
-            generated.append(f'statistics/{stem}.png')
+        with figures.plt.rc_context(figures.STYLE):
+            for stem, fig in figures.statistical_figures(analysis, report.algorithms, metric.name,
+                    reference=figures.reference_method(report), palette_name=figures.palette_name(report),
+                    language=figures.figure_language(report)):
+                figures.save_png(fig, stats_dir / f'{stem}.png')
+                generated.append(f'statistics/{stem}.png')
         if any(sha256(root / path) != digest for path, digest in report.sources.items()):
             raise ValueError('Source cache changed during figure generation')
-    print(f'[report] FULL figures: {destination}; global_classifier={m.PLOT_GLOBAL_ESTIMATOR}; '
+    print(f'[report] FULL figures: {destination}; global_classifier={figures.base_classifier(report)}; '
           f'aggregation={m.PLOT_RUN_AGGREGATION}; '
           f'optimization_calls={guard["optimization_calls"] + preflight["optimization_calls"]}', flush=True)
-    return {'figures': str(destination), 'generated': generated, 'moved': moved,
+    return {'figures': str(destination), 'generated': generated, 'moved': moved, 'skipped_outputs': skipped,
             'optimization_calls': guard['optimization_calls'] + preflight['optimization_calls']}
 
 
@@ -637,7 +625,15 @@ def run_report(args):
                          'source_directory': str(root / 'Results' / report.exp_tag / 'cache'),
                          'completed_runs': sorted({r['CompletedRuns'] for r in report.indexed.values()}),
                          'cache_identity': report.signature, 'scientific_identities': report.identities,
-                         'source_cache_sha256': report.sources, 'skipped_outputs': skipped}
+                         'source_cache_sha256': report.sources, 'skipped_outputs': skipped,
+                         'presentation': {'run_aggregation': framework().PLOT_RUN_AGGREGATION,
+                             'global_classifier': figures.base_classifier(report),
+                             'global_metric': figures.base_metric_token(report),
+                             'language': figures.figure_language(report),
+                             'palette': figures.palette_name(report),
+                             'reference_method': figures.reference_method(report),
+                             'statistical_metric': statistics.selected_metric(report).run_key},
+                         'main_numbered_figures': list(figures.base_figure_names(report))}
                 with report_stage('Validate every generated artifact'):
                     hashes = _validate_artifacts(fig, res, required)
                 with report_stage('Verify protected historical hashes'):

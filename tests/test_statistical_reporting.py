@@ -27,6 +27,8 @@ METRICS = {
 class StatisticalReportingTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(framework, 'PLOT_ESTIMATORS', ['knn', 'svm']))
+        # These synthetic CSVs exercise reporting, not neural artifact provenance.
+        self.enterContext(patch.object(framework.miafex_artifacts, 'validate_existing'))
         temporary = tempfile.TemporaryDirectory(prefix="statistical-reporting-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -172,7 +174,8 @@ class StatisticalReportingTests(unittest.TestCase):
         for filename, snapshot in snapshots.items():
             self.assertEqual((filename.read_bytes(), filename.stat().st_mtime_ns), snapshot)
         self.assertEqual(framework.build_cache_signature(scoped), signature)
-        framework.pd.testing.assert_frame_equal(chart.call_args.args[0], expected_summary)
+        framework.pd.testing.assert_frame_equal(chart.call_args.args[0],
+                                                framework.generate_plot_dataframe(expected_results, args))
         csv_path = Path(paths.res_dir) / f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv"
         self.assertEqual(csv_path.read_text(), expected_summary.to_csv(index=False))
         with (Path(paths.res_dir) / f"Statistical_Results_{paths.exp_tag}.xlsx").open("rb") as stream:

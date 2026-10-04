@@ -1,0 +1,100 @@
+{
+  "MIAFEX_ARTIFACT_TAG": "exp607",
+  "artifact_sha256": {
+    "checkpoint": "5b9edc363a722f07cf307edfd853952e71364b793cf751bc81f6c6ce66208e42",
+    "test_features_csv": "69cf28a201f25d69ade5f56f3a728c366d49ebc4375e896e17116783bf1e7575",
+    "train_features_csv": "b0d9dd06d49615fb5c523c9176bcf8888f969515c26a0dc19200190299765bb6"
+  },
+  "configuration": {
+    "backbone_model": "MIAFEx: ViTForImageClassification + element-wise refinement + Linear(768, num_classes)",
+    "batch_size": 8,
+    "dataset_name": "Chest_CT",
+    "dataset_root": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets/Chest_CT",
+    "epochs": 50,
+    "extraction_representation": "last hidden-state CLS token * learned refinement_weights; 768 dimensions; eval/no_grad",
+    "image_source": {
+      "test": {
+        "classes": [
+          "adenocarcinoma",
+          "large.cell.carcinoma",
+          "normal",
+          "squamous.cell.carcinoma"
+        ],
+        "image_count": 288,
+        "sha256": "20c307eee381b53d5e544c20847bf55f6630b23ae80ecf7c6be4dfa745d47276"
+      },
+      "train": {
+        "classes": [
+          "adenocarcinoma",
+          "large.cell.carcinoma",
+          "normal",
+          "squamous.cell.carcinoma"
+        ],
+        "image_count": 558,
+        "sha256": "4e416e58acaba5db5a0f9a644428229e118363820d025ad4837203974db69b91"
+      }
+    },
+    "learning_rate": 0.0001,
+    "optimizer": "torch.optim.NAdam (library defaults except learning_rate)",
+    "packages": {
+      "torch": "2.7.1",
+      "torchvision": "0.22.1",
+      "transformers": "4.48.3"
+    },
+    "preprocessing_transforms": {
+      "loader": "torchvision.datasets.ImageFolder (RGB)",
+      "test": [
+        "Resize((224, 224), torchvision defaults)",
+        "ToTensor()"
+      ],
+      "train": [
+        "Resize((224, 224), torchvision defaults)",
+        "ToTensor()"
+      ]
+    },
+    "pretrained_source": "google/vit-base-patch16-224-in21k",
+    "source_sha256": {
+      "extract_miafex_features.py": "5ff415fb42daf43aa61f3e2d630c6ec5ae07226d1c89abd0f97cb698a1ae3257",
+      "miafex_model.py": "b40f33d9156cd81db8295a6ebd372936f75ff0c11801c1ed86e20a45a9e1b64c",
+      "train_miafex.py": "01d917484b92dd2c18f341cecd5ff8952dbef2acac4185ffe0e27b7d1ce5b2a2"
+    },
+    "training_seed": null,
+    "training_seed_policy": "No explicit neural seed set by train_miafex; RNG state was not recorded"
+  },
+  "paths": {
+    "checkpoint": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/checkpoints/miafex_exp607/Chest_CT/miafex_checkpoint.pth",
+    "test_features_csv": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets_features/miafex_exp607/Chest_CT/test_features.csv",
+    "train_features_csv": "/home/angel/Desktop/MIAFEx_MaCRO_DSA_DE_Feature_Selection/datasets_features/miafex_exp607/Chest_CT/train_features.csv"
+  },
+  "provenance": {
+    "completion_evidence": {
+      "directory": "Results/EXP607/cache/combinations_v2",
+      "note": "All requested final rows have 20 valid completed runs and feature SHA-256 matches; read-only audit performed before the refactor.",
+      "validated_combinations": 154,
+      "validated_fs_runs": 3080
+    },
+    "configuration_basis": "Reconstructed from preserved configuration/source and training metrics, not an original training-time manifest.",
+    "configuration_evidence": {
+      "file": "main_best.py",
+      "git_revision": "f5c16eeeda81e06713ab9f97e241d1f4f6118a04",
+      "note": "Neural settings match preserved pre-refactor EXP607 configuration. Existing neural source files are byte-identical to this revision.",
+      "sha256": "986db4ac4a2eabb64e363666a9a3abf04117d11329ab75cd0c90af30a67beaa8"
+    },
+    "created_by_exp_id": 607,
+    "historical_limitations": [
+      "Original neural RNG state/seed was not recorded.",
+      "Exact resolved Hugging Face pretrained revision was not recorded.",
+      "Image content and package versions were fingerprinted at migration; no original training-time content/package manifest exists."
+    ],
+    "origin": "reconstructed_legacy_exp607",
+    "pretrained_resolved_revision": null,
+    "recorded_at_utc": "2026-10-04T13:27:54.517211+00:00",
+    "source_git_revision": "f5c16eeeda81e06713ab9f97e241d1f4f6118a04",
+    "training_metrics_evidence": {
+      "completed_epochs": 50,
+      "path": "checkpoints/miafex_exp607/Chest_CT/metrics_curve.pkl",
+      "sha256": "17e800a8337c183b5dc5bbdc92162cdae7623637b986f0774f7eeca00a078868"
+    }
+  },
+  "schema_version": 1
+}

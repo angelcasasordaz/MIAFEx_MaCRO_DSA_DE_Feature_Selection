@@ -22,7 +22,8 @@ class FullPlottingTests(unittest.TestCase):
         self.addCleanup(m.plt.close, 'all')
         self.args = m.parse_args(['--output-root', self.temp.name, '--exp-id', '913',
                                  '--optimizers', 'DE', 'PSO', 'JADE', '--estimators', 'knn', 'svm',
-                                 '--runs', '3', '--epochs', '3', '--pop-size', '5'])
+                                 '--runs', '3', '--epochs', '3', '--pop-size', '5',
+                                 '--pipeline-mode', 'feature_selection'])
         self.row = m.build_label_payload(
             'knn', [95, 80, 90], [.97, .71, .85], [.96, .72, .86], [.94, .70, .84],
             [.30, .10, .20], [2, 8, 5], [1, 9, 4],
@@ -88,39 +89,32 @@ class FullPlottingTests(unittest.TestCase):
             fig = figures.violin_figure(observations, self.report.algorithms, 'knn', 'Accuracy')
             clouds = [collection for collection in fig.axes[0].collections
                       if len(collection.get_offsets()) == 6]
-            self.assertEqual(len(clouds), 3)
+            self.assertEqual(len(clouds), 0)
+            self.assertEqual(sum(text.get_text() == '0.883' for text in fig.axes[0].texts), 3)
             m.plt.close(fig)
 
     def test_accuracy_files_style_order_and_individual_paths(self):
         captured = {}
-        def sink(fig, directory, filename):
-            captured[filename] = (Path(directory), fig)
-            Path(directory, filename).touch()
-        with patch.object(m, 'PLOT_RUN_AGGREGATION', 'best'), patch.object(m, '_save_chart', side_effect=sink):
+        def sink(fig, path):
+            captured[Path(path).name] = (Path(path).parent, fig)
+            Path(path).touch()
+        with patch.object(m, 'PLOT_RUN_AGGREGATION', 'best'), patch.object(figures, 'save_png', side_effect=sink):
             files = m.generate_seven_global_charts(m.generate_summary_dataframe(self.results, self.args),
                                                    self.results, self.temp.name, self.args.optimizers, self.args,
                                                    estimator_filter=m.PLOT_GLOBAL_ESTIMATOR)
+        self.assertEqual([path for path in files if 'heatmap' in path], ['06_heatmap_accuracy_knn.png'])
+        heat = captured['06_heatmap_accuracy_knn.png'][1].axes[0]
+        np.testing.assert_array_equal(heat.images[0].get_array(), np.full((3, 2), .8))
+        self.assertEqual([tick.get_text() for tick in heat.get_xticklabels()], ['First', 'Second'])
+        self.assertEqual([tick.get_text() for tick in heat.get_yticklabels()], self.args.optimizers)
         for classifier in ('knn', 'svm'):
-            for stem in ('06_heatmap_accuracy', '07_violin_accuracy'):
-                relative_dir = '' if classifier == 'knn' else 'individual/'
-                self.assertIn(f'{relative_dir}{stem}_{classifier}.png', files)
-                self.assertEqual(captured[f'{stem}_{classifier}.png'][0],
-                                 Path(self.temp.name) / relative_dir)
-            heat = captured[f'06_heatmap_accuracy_{classifier}.png'][1].axes[0]
-            np.testing.assert_array_equal(heat.images[0].get_array(), np.full((3, 2), .8))
-            self.assertEqual([tick.get_text() for tick in heat.get_xticklabels()], ['First', 'Second'])
-            self.assertEqual(heat.images[0].get_cmap().name, captured['06_heatmap_f1_knn.png'][1].axes[0].images[0].get_cmap().name)
-            self.assertEqual([tick.get_text() for tick in heat.get_yticklabels()],
-                             [tick.get_text() for tick in captured['06_heatmap_f1_knn.png'][1].axes[0].get_yticklabels()])
             for dataset in self.results:
-                for family in ('01_resultados_clasificador', '02_radar', '03_features_runtime', '05_convergence'):
+                for family in ('radar', 'features_runtime', 'convergence'):
                     filename = f'{family}_{dataset}_{classifier}.png'
                     self.assertIn('individual/' + filename, files)
                     self.assertEqual(captured[filename][0], Path(self.temp.name) / 'individual')
-        self.assertIn('individual/06_heatmap_f1_knn.png', files)
-        self.assertIn('individual/07_violin_recall_knn.png', files)
-        self.assertEqual(captured['06_heatmap_f1_knn.png'][0], Path(self.temp.name) / 'individual')
-        self.assertEqual(captured['07_violin_recall_knn.png'][0], Path(self.temp.name) / 'individual')
+        self.assertIn('07_violin_accuracy_knn.png', files)
+        self.assertIn('individual/generic_radar_svm.png', files)
         self.assertEqual(len(files), len(set(files)))
 
     def test_export_boundary_passes_selected_data_and_preserves_summary_tables(self):
@@ -132,6 +126,7 @@ class FullPlottingTests(unittest.TestCase):
                     patch.object(m, 'export_statistical_excel') as stats_table, \
                     patch.object(m, 'export_friedman_analysis') as friedman, \
                     patch.object(m, 'generate_seven_global_charts', return_value=[]) as chart, \
+                    patch.object(statistics, 'export', return_value=[]), \
                     redirect_stdout(io.StringIO()):
                 m.export_reporting_outputs(paths, self.args, list(self.results), self.results, self.results)
                 np.testing.assert_allclose(chart.call_args.args[0].AS_test, accuracy)
@@ -187,7 +182,7 @@ class FullPlottingTests(unittest.TestCase):
         scientific.mkdir(parents=True)
         (scientific / 'protected.pkl').write_bytes(b'protected cache')
         with patch.object(core, 'load_completed_cache', return_value=self.report), \
-                patch.object(m, 'generate_seven_global_charts', return_value=[]) as generate, \
+                patch.object(figures, 'generate', return_value=[]) as generate, \
                 patch.object(figures, 'save_png', side_effect=lambda fig, path: m.plt.close(fig)), \
                 redirect_stdout(io.StringIO()):
             result = core.run_full_figures(self.args)
@@ -196,8 +191,8 @@ class FullPlottingTests(unittest.TestCase):
         self.assertTrue((destination / 'individual/06_heatmap_f1_knn.png').is_file())
         self.assertTrue((destination / 'statistics/generic_average_rank.png').is_file())
         self.assertFalse(list(source.glob('*.png')))
-        self.assertEqual(generate.call_args.args[2], str(destination))
-        self.assertEqual(generate.call_args.kwargs['estimator_filter'], m.PLOT_GLOBAL_ESTIMATOR)
+        self.assertIs(generate.call_args.args[0], self.report)
+        self.assertEqual(generate.call_args.args[1], destination)
         self.assertEqual(result['optimization_calls'], 0)
         self.assertTrue(all(name.startswith('statistics/') for name in result['generated']))
         self.assertEqual((scientific / 'protected.pkl').read_bytes(), b'protected cache')

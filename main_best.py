@@ -14,6 +14,7 @@ import tempfile
 import time
 import warnings
 import scientific_cache
+import miafex_artifacts
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from multiprocessing import get_context
@@ -99,7 +100,7 @@ def automatic_worker_count() -> int:
 # User-editable configuration: the full experiment used by PyCharm's Run action.
 # Dataset and pipeline
 DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
-PIPELINE_MODE = "full"  # Options: "extract", "feature_selection", "full"
+PIPELINE_MODE = "feature_selection"  # Options: "extract", "feature_selection", "full"
 MIAFEX_DATASETS = None
 # ["Brain_MRI"]
 # None: all valid discovered datasets.
@@ -107,10 +108,12 @@ MAFESE_DATASET_SUITE = "test14"
 
 # MIAFEx artifacts and neural-network settings
 MIAFEX_DATASET_ROOT = "datasets"
-MIAFEX_CHECKPOINT_ROOT = "checkpoints/miafex_exp607"
-FEATURE_DATASET_ROOT = "datasets_features/miafex_exp607"
-MIAFEX_TRAIN = "yes"  # Options: "auto", "yes", "no"
-MIAFEX_EXTRACT = "yes"  # Options: "auto", "yes", "no"
+MIAFEX_ARTIFACT_TAG = "exp607"  # Neural artifact identity; independent of downstream EXP_ID.
+MIAFEX_CHECKPOINT_ROOT = f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}"
+FEATURE_DATASET_ROOT = f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}"
+MIAFEX_PROVENANCE_ROOT = f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}"
+MIAFEX_TRAIN = "auto"  # Reuse validated checkpoint; "yes" requires an unused artifact version.
+MIAFEX_EXTRACT = "auto"  # Reuse validated features; "yes" requires unpublished features.
 MIAFEX_EPOCHS = 50  # Neural-network training epochs.
 MIAFEX_BATCH_SIZE = 8
 MIAFEX_LEARNING_RATE = 1e-4
@@ -119,8 +122,8 @@ MIAFEX_LEARNING_RATE = 1e-4
 OPTIMIZERS = [
     # "MaCRO-DE",
     # "DSADE",
-    # "MaCRO-DE-t",
-    "MaCRO-DE-t-v2", # Independently selectable; retains supplied v2 defaults.
+    "MaCRO-DE-t",
+    # "MaCRO-DE-t-v2", # Independently selectable; retains supplied v2 defaults.
     "DE",
     "JADE",
     "SHADE",
@@ -151,11 +154,11 @@ MACRO_DE_T_V2_BETA_MAX = 0.60
 MACRO_DE_T_V2_MAHAL_Q = 0.50
 
 # Experiment and cache reuse
-EXP_ID = 607
-REUSE_CACHE = False
-REUSE_CACHE_FROM_EXP_ID = None  # None: current EXP only; another ID: read-only fallback.
+EXP_ID = 608
+REUSE_CACHE = True
+REUSE_CACHE_FROM_EXP_ID = 607  # None: current EXP only; another ID: read-only fallback.
 FIGURES_ONLY = False
-REPORT_ONLY = False  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
+REPORT_ONLY = True  # Explicit opt-in; ordinary PyCharm Run retains the experiment pipeline.
 # Scientific versions describe the implementation that actually executes.
 # Bounds/decoding and explicit seeding affect every optimizer, including DE variants.
 BINARY_REPRESENTATION_REVISIONS = {
@@ -166,6 +169,11 @@ SEED_POLICY_REVISION = "explicit-selector-seed-v1"
 WRAPPER_SCIENCE_REVISION = "mafese-prepared-partitions-corrected-binary-seeded-v2"
 PLOT_ESTIMATORS = ["knn", "svm"]  # Figures/reports only; never affects experiments or cache signatures.
 PLOT_GLOBAL_ESTIMATOR = "knn"  # Options: "knn", "svm"; global single-classifier figures only.
+PLOT_GLOBAL_METRIC = "accuracy"  # "accuracy", "precision", "recall", "f1"; figures only.
+FIGURE_LANGUAGE = "en"  # "en", "es"; visible text only, identities/filenames stay unchanged.
+PLOT_COLOR_PALETTE = "dark_classic"
+# Alternatives: "deep", "muted", "tab20_dark", "dark2", "paired", "accent".
+STATISTICAL_METRIC = "f1"  # Matched dataset/classifier blocks; arithmetic run means, independent of plot aggregation.
 PLOT_RUN_AGGREGATION = "best"  # "best", "worst", "mean"; figures only, never cache signatures.
 INDIVIDUAL_POLAR_CURVE_SIZE = (7.0, 5.4)
 
@@ -406,10 +414,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     miafex = parser.add_argument_group("MIAFEx")
     miafex.add_argument("--dataset-root", default=None, help="Raiz del dataset MIAFEx con subdirectorios train/ y test/")
     miafex.add_argument("--miafex-dataset-root", default=MIAFEX_DATASET_ROOT, help="Raiz que contiene los datasets de imagenes")
-    miafex.add_argument("--miafex-checkpoint-root", default=MIAFEX_CHECKPOINT_ROOT, help="Raiz de checkpoints; un subdirectorio por dataset")
-    miafex.add_argument("--feature-dataset-root", default=FEATURE_DATASET_ROOT, help="Raiz de features reutilizables; un subdirectorio por dataset")
-    miafex.add_argument("--train-miafex", default=MIAFEX_TRAIN, choices=["auto", "yes", "no"], help="auto: reutilizar checkpoint existente; yes: entrenar; no: no entrenar")
-    miafex.add_argument("--extract-miafex", default=MIAFEX_EXTRACT, choices=["auto", "yes", "no"], help="auto: reutilizar CSV existente; yes: extraer; no: exigir CSV existente")
+    miafex.add_argument("--miafex-artifact-tag", default=MIAFEX_ARTIFACT_TAG, help="Version neuronal reutilizable, independiente de EXP_ID")
+    miafex.add_argument("--miafex-checkpoint-root", default=(None if MIAFEX_CHECKPOINT_ROOT == f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}" else MIAFEX_CHECKPOINT_ROOT), help="Override de checkpoints; por defecto checkpoints/miafex_<artifact-tag>")
+    miafex.add_argument("--feature-dataset-root", default=(None if FEATURE_DATASET_ROOT == f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}" else FEATURE_DATASET_ROOT), help="Override de features; por defecto datasets_features/miafex_<artifact-tag>")
+    miafex.add_argument("--miafex-provenance-root", default=(None if MIAFEX_PROVENANCE_ROOT == f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}" else MIAFEX_PROVENANCE_ROOT), help="Override de metadata; por defecto artifact_provenance/miafex_<artifact-tag>")
+    miafex.add_argument("--train-miafex", default=MIAFEX_TRAIN, choices=["auto", "yes", "no"], help="auto: reutilizar checkpoint validado; yes: entrenar version nueva; no: no entrenar")
+    miafex.add_argument("--extract-miafex", default=MIAFEX_EXTRACT, choices=["auto", "yes", "no"], help="auto: reutilizar CSV validado; yes: extraer features nuevas; no: exigir CSV existente")
     miafex.add_argument("--miafex-output", default=None, help="Override compatible del directorio de checkpoint para un unico dataset")
     miafex.add_argument("--miafex-epochs", type=int, default=MIAFEX_EPOCHS, help="Epocas de entrenamiento de la red neuronal MIAFEx")
     miafex.add_argument("--miafex-batch-size", type=int, default=MIAFEX_BATCH_SIZE, help="Batch size para MIAFEx")
@@ -453,6 +463,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                            help="Validate completed caches and append a 600 dpi full_repN report; never run science")
     execution.add_argument("--report-output-root", default=None,
                            help="Optional destination for full_repN; --output-root remains the cache source")
+    presentation = parser.add_argument_group("Presentation only")
+    presentation.add_argument("--plot-global-estimator", default=PLOT_GLOBAL_ESTIMATOR,
+                              help="Classifier for main numbered figures; must have selected completed results")
+    presentation.add_argument("--plot-global-metric", default=PLOT_GLOBAL_METRIC,
+                              choices=["accuracy", "precision", "recall", "f1"])
+    presentation.add_argument("--figure-language", default=FIGURE_LANGUAGE, choices=["en", "es"])
+    presentation.add_argument("--plot-color-palette", default=PLOT_COLOR_PALETTE,
+                              choices=["dark_classic", "deep", "muted", "tab20_dark", "dark2", "paired", "accent"])
+    presentation.add_argument("--statistical-metric", default=STATISTICAL_METRIC,
+                              choices=["accuracy", "precision", "recall", "f1"])
     execution.add_argument("--parallel", default="yes" if PARALLEL else "no", choices=["yes", "no"], help="Ejecutar runs en paralelo: yes/no")
     execution.add_argument("--n-workers", type=int, default=N_WORKERS, help="Maximo de procesos; se limita automaticamente a los runs pendientes")
 
@@ -465,7 +485,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     macro_v2.add_argument("--macro-de-t-v2-beta-min", type=float, default=MACRO_DE_T_V2_BETA_MIN)
     macro_v2.add_argument("--macro-de-t-v2-beta-max", type=float, default=MACRO_DE_T_V2_BETA_MAX)
     macro_v2.add_argument("--macro-de-t-v2-mahal-q", type=float, default=MACRO_DE_T_V2_MAHAL_Q)
-    return parser.parse_args(argv)
+    return miafex_artifacts.resolve_roots(parser.parse_args(argv))
 
 def resolve_optimizers(args: argparse.Namespace) -> List[str]:
     return list(dict.fromkeys(resolve_optimizer_name(name) for name in args.optimizers))
@@ -725,21 +745,35 @@ def load_miafex_feature_data(csv_paths: Dict[str, str]) -> Data:
 
 
 def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
-    """Prepare/reuse one dataset using the existing training and extraction code."""
+    """Validate one immutable neural version once, outside the FS repetitions."""
+    if args.pipeline_mode == "feature_selection":
+        return _prepare_miafex_csv(args)
+    with miafex_artifacts.artifact_lock(args):
+        return _prepare_miafex_csv(args)
+
+
+def _prepare_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
+    """Prepare/reuse one dataset using the unchanged trainer and extractor."""
     csv_paths = miafex_feature_paths(args)
     missing = [path for path in csv_paths.values() if not os.path.isfile(path)]
+    metadata = miafex_artifacts.validate_existing(args, report=True)
     if args.pipeline_mode == "feature_selection":
         if missing:
             raise FileNotFoundError(
                 f"Prepared train/test feature CSVs missing: {', '.join(missing)}. "
                 "Generate it with --pipeline-mode extract or full first."
             )
-        print(f"[features] {args.dataset_name}: reusing {csv_paths} (feature_selection only)")
+        if metadata is None:
+            miafex_artifacts.fail(f"features have no provenance for {args.dataset_name}")
         return csv_paths
 
     checkpoint_path = os.path.join(args.miafex_output, "miafex_checkpoint.pth")
     run_training = args.train_miafex == "yes" or (args.train_miafex == "auto" and not os.path.isfile(checkpoint_path))
     run_extraction = args.extract_miafex == "yes" or (args.extract_miafex == "auto" and bool(missing))
+    if run_training and (os.path.exists(checkpoint_path) or len(missing) != len(csv_paths)):
+        miafex_artifacts.fail(f"TRAIN NEW would replace a checkpoint or invalidate existing features for {args.dataset_name}; use auto/no to reuse")
+    if run_extraction and len(missing) != len(csv_paths):
+        miafex_artifacts.fail(f"EXTRACT NEW would overwrite existing features for {args.dataset_name}; use auto/no to reuse")
     if not run_extraction and missing:
         raise FileNotFoundError(f"Prepared feature CSVs missing with --extract-miafex no: {', '.join(missing)}")
     if run_extraction and not run_training and not os.path.isfile(checkpoint_path):
@@ -749,22 +783,34 @@ def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
             raise ImportError("MIAFEx training/extraction dependencies could not be imported.") from MIAFEX_IMPORT_ERROR
         if not valid_miafex_dataset(args.dataset_root):
             raise ValueError(f"Invalid MIAFEx train/test class folders: {args.dataset_root}")
+        if metadata is None:
+            metadata = miafex_artifacts.new_metadata(args)
+            # Reserve this configuration before any generation. An interrupted
+            # preparation cannot later adopt another configuration under this tag.
+            miafex_artifacts.save_metadata(args, metadata)
 
     if run_training:
-        print(f"[checkpoint] {args.dataset_name}: training for {args.miafex_epochs} neural-network epochs")
-        checkpoint_path = train_miafex(
-            train_root=os.path.join(args.dataset_root, "train"),
-            output_dir=args.miafex_output,
-            num_classes=None,
-            num_epochs=args.miafex_epochs,
-            batch_size=args.miafex_batch_size,
-            learning_rate=args.miafex_learning_rate,
-            device=args.miafex_device,
-        )
-        if not os.path.isfile(checkpoint_path):
-            raise FileNotFoundError(f"MIAFEx training did not produce a checkpoint: {checkpoint_path}")
-    elif os.path.isfile(checkpoint_path):
-        print(f"[checkpoint] {args.dataset_name}: reusing {checkpoint_path}")
+        print(f"[checkpoint] {args.dataset_name}: TRAIN NEW ({args.miafex_epochs} neural-network epochs)")
+        os.makedirs(args.miafex_output, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".train-", dir=args.miafex_output) as temporary:
+            produced = train_miafex(
+                train_root=os.path.join(args.dataset_root, "train"),
+                output_dir=temporary,
+                num_classes=None,
+                num_epochs=args.miafex_epochs,
+                batch_size=args.miafex_batch_size,
+                learning_rate=args.miafex_learning_rate,
+                device=args.miafex_device,
+            )
+            if not os.path.isfile(produced):
+                raise FileNotFoundError(f"MIAFEx training did not produce a checkpoint: {produced}")
+            for filename in os.listdir(temporary):
+                destination = os.path.join(args.miafex_output, filename)
+                if os.path.exists(destination):
+                    miafex_artifacts.fail(f"training output already exists: {destination}")
+            for filename in os.listdir(temporary):
+                os.replace(os.path.join(temporary, filename), os.path.join(args.miafex_output, filename))
+        miafex_artifacts.record_outputs(args, metadata)
 
     if run_extraction:
         # Stage each split separately: the existing extractor writes fixed names.
@@ -775,7 +821,7 @@ def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
                 output_dir = os.path.dirname(csv_path) or "."
                 os.makedirs(output_dir, exist_ok=True)
                 temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix=f".extract-{split}-", dir=output_dir))
-                print(f"[features] {args.dataset_name}: extracting {split}/ images to {csv_path}")
+                print(f"[features] {args.dataset_name}: EXTRACT NEW {split}/ -> {csv_path}")
                 staged[split] = extract_miafex_features(
                     data_dir=os.path.join(args.dataset_root, split),
                     checkpoint_path=checkpoint_path,
@@ -793,6 +839,11 @@ def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
                         mappings.append(json.load(stream))
             if mappings and (len(mappings) != 2 or mappings[0] != mappings[1]):
                 raise ValueError("Train/test extraction class mappings do not match.")
+            for split in staged:
+                output_dir = os.path.dirname(csv_paths[split])
+                for filename in (os.path.basename(csv_paths[split]), f"{split}_features.npy", f"{split}_class_to_idx.json"):
+                    if os.path.exists(os.path.join(output_dir, filename)):
+                        miafex_artifacts.fail(f"extraction output already exists: {os.path.join(output_dir, filename)}")
             for split, path in staged.items():
                 for original, filename in (("miafex_features.npy", f"{split}_features.npy"),
                                            ("class_to_idx.json", f"{split}_class_to_idx.json")):
@@ -800,8 +851,7 @@ def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
                     if os.path.isfile(artifact):
                         os.replace(artifact, os.path.join(os.path.dirname(csv_paths[split]), filename))
                 os.replace(path, csv_paths[split])
-    else:
-        print(f"[features] {args.dataset_name}: reusing {csv_paths}")
+        miafex_artifacts.record_outputs(args, metadata)
 
     return csv_paths
 
@@ -1836,42 +1886,15 @@ def optimizer_display_label(name: str) -> str:
 
 
 def optimizer_plot_color(name: str) -> str:
-    """Stable optimizer colors shared by every classifier and transfer variant."""
-    identity = optimizer_display_label(name).upper()
-    # Fixed EXP604 colors; never rebuild this palette from the selected methods.
-    colors = {
-        "MACRO-DE-T": "#5a4262", "BRO": "#6972c8", "DBO": "#6b9dfb",
-        "MACRO-DE-T-V2": "#167d8d",
-        "DE": "#53c9ef", "FLA": "#48eac5", "FOX": "#77fb92",
-        "GWO": "#b6fd63", "HHO": "#e0e95e", "JADE": "#fbc860",
-        "PSO": "#fc984d", "RUN": "#e96a3b", "SHADE": "#c74b34",
-        "WOA": "#953635", "MACRO-DE": "#333333", "DSADE": "#a65e9c",
-    }
-    if identity in colors:
-        return colors[identity]
-    # Unlike Python's hash(), SHA-256 is stable across processes and machines.
-    digest = hashlib.sha256(identity.encode("utf-8")).digest()
-    return "#" + "".join(f"{64 + channel % 144:02x}" for channel in digest[:3])
+    """Central presentation palette; stable across subsets and all figure types."""
+    from full_plot_style import palette
+    return palette([name], PLOT_COLOR_PALETTE)[name]
 
 
 def optimizer_plot_style(name: str) -> dict:
-    """Name-based line/marker styles, independent of plot order and membership."""
-    identity = optimizer_display_label(name).upper()
-    styles = {
-        "MACRO-DE-T": ("-", "o"), "BRO": ("--", "s"), "DBO": (":", "^"),
-        "MACRO-DE-T-V2": ("-.", "D"),
-        "DE": ("-.", "v"), "FLA": ("--", "D"), "FOX": (":", "P"),
-        "GWO": ("-.", "X"), "HHO": ("--", "<"), "JADE": ("-", ">"),
-        "PSO": ("--", "h"), "RUN": (":", "p"), "SHADE": ("-.", "*"),
-        "WOA": ("--", "d"), "MACRO-DE": ("-", "o"), "DSADE": ("-", "s"),
-    }
-    if identity in styles:
-        linestyle, marker = styles[identity]
-    else:
-        digest = hashlib.sha256(identity.encode("utf-8")).digest()
-        linestyle = ("-", "--", "-.", ":")[digest[0] % 4]
-        marker = ("o", "s", "^", "v", "D", "P", "X", "h")[digest[1] % 8]
-    return {"linestyle": linestyle, "marker": marker}
+    """Central deterministic presentation line/marker styles."""
+    from full_plot_style import line_style
+    return line_style(name)
 
 
 def _macro_t_underlay(line):
@@ -2707,6 +2730,7 @@ def _convergence_marker_indices(length, count=9):
 
 
 def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map, *, classifier=None):
+    from full_plot_style import highlight_macro_t_convergence
     sub = curve_plot_df[curve_plot_df["Archivo"] == dataset] if not curve_plot_df.empty else pd.DataFrame()
     plotted = []
     ax.set_facecolor("white")
@@ -2733,6 +2757,7 @@ def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_colo
         line, = ax.plot(x, curve, markevery=_convergence_marker_indices(len(curve)), markersize=3.5,
                         linewidth=2.0 if is_macro_t else 1.3, **style)
         if is_macro_t:
+            highlight_macro_t_convergence(line)
             _macro_t_underlay(line)
         plotted.append((curve, style, is_macro_t))
     window = _convergence_zoom_window([curve for curve, _, _ in plotted])
@@ -2754,6 +2779,7 @@ def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_colo
                                      markevery=_convergence_marker_indices(len(samples), 4), markersize=2.5,
                                      linewidth=1.4 if is_macro_t else 0.9, **style)
             if is_macro_t:
+                highlight_macro_t_convergence(zoom_line)
                 _macro_t_underlay(zoom_line)
         ax.indicate_inset_zoom(zoom_ax, edgecolor="#777777", alpha=0.5)
     else:
@@ -2987,125 +3013,22 @@ def generate_seven_global_charts(
     *,
     estimator_filter: str,
 ):
-    estimator_filter = estimator_filter.lower()
-    if estimator_filter not in {"knn", "svm"}:
-        raise ValueError('PLOT_GLOBAL_ESTIMATOR must be "knn" or "svm".')
+    """Compatibility entry point for the shared nine-figure publication pipeline."""
+    from reporting.figures import report_from_results, generate
     if df.empty:
         return []
-    df = df[df["Estimador"].astype(str).str.lower().isin(PLOT_ESTIMATORS)]
-    if df.empty:
-        return []
-    df = _representative_figure_dataframe(df, results_struct, args)
-    os.makedirs(out_dir, exist_ok=True)
-    saved = []
-
-    chart1 = generate_classifier_metric_grid_chart(df, out_dir, opt_order)
-    if chart1:
-        new_chart1 = "01_resultados_clasificador_todos_datasets.png"
-        os.replace(os.path.join(out_dir, chart1), os.path.join(out_dir, new_chart1))
-        saved.append(new_chart1)
-
-    saved.extend(generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args))
-    saved.extend(generate_accuracy_charts(results_struct, args, out_dir, opt_order))
-    saved.extend(generate_secondary_metric_charts(results_struct, args, out_dir, opt_order))
-    global_df = df[df["Estimador"].astype(str).str.lower() == estimator_filter].copy()
-    if global_df.empty:
-        return saved
-    plot_df, opts, color_map, label_map = prepare_plot_groups(global_df, opt_order)
-    if not opts:
-        return saved
-    method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
-    datasets = sorted(plot_df["Archivo"].dropna().unique())
-    original_counts = plot_original_feature_counts(args, datasets)
-    n_rows, n_cols = _grid_shape(len(datasets))
-
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(5.0 * n_cols, 4.8 * n_rows),
-        subplot_kw=dict(polar=True),
-        squeeze=False,
-    )
-    for idx, dataset in enumerate(datasets):
-        ax = axes[idx // n_cols, idx % n_cols]
-        _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group,
-                            original_features=original_counts[dataset])
-    for idx in range(len(datasets), n_rows * n_cols):
-        axes[idx // n_cols, idx % n_cols].set_visible(False)
-    fig.legend(handles=_plot_legend_patches(opts, color_map, label_map), loc="lower center", ncol=min(len(opts), 6), fontsize=9)
-    fig.tight_layout(rect=[0.0, 0.05, 1.0, 1.0])
-    filename = f"02_radar_por_dataset_{estimator_filter}.png"
-    _save_chart(fig, out_dir, filename)
-    saved.append(filename)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.6 * n_rows), squeeze=False)
-    for idx, dataset in enumerate(datasets):
-        ax1 = axes[idx // n_cols, idx % n_cols]
-        _draw_dataset_features_runtime(ax1, dataset, plot_df, opts, color_map, label_map)
-    for idx in range(len(datasets), n_rows * n_cols):
-        axes[idx // n_cols, idx % n_cols].set_visible(False)
-    fig.tight_layout(rect=[0.0, 0.02, 1.0, 1.0])
-    filename = f"03_features_runtime_por_dataset_{estimator_filter}.png"
-    _save_chart(fig, out_dir, filename)
-    saved.append(filename)
-
-    run_df = build_run_level_dataframe(results_struct, args, estimator_filter)
-    run_source = run_df if not run_df.empty else plot_df
-    run_plot_df, run_opts, run_color_map, run_label_map = prepare_plot_groups(run_source, opt_order)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.6 * n_rows), squeeze=False)
-    for idx, dataset in enumerate(datasets):
-        ax = axes[idx // n_cols, idx % n_cols]
-        sub = run_plot_df[run_plot_df["Archivo"] == dataset]
-        data_box = [sub[sub["GrupoGrafica"] == opt]["AS_test"].dropna().values for opt in run_opts]
-        bp = ax.boxplot(data_box, patch_artist=True, widths=0.55, showmeans=True)
-        for patch, opt in zip(bp["boxes"], run_opts):
-            patch.set_facecolor(run_color_map.get(opt, "#888"))
-            patch.set_alpha(0.60)
-        ax.set_xticks(range(1, len(run_opts) + 1))
-        ax.set_xticklabels([run_label_map.get(o, o) for o in run_opts], rotation=45, ha="right", fontsize=7)
-        ax.set_ylim(0.0, 1.08)
-        ax.set_ylabel("Accuracy (test)", fontsize=9)
-        ax.set_title(dataset, fontsize=11, fontweight="bold")
-        ax.grid(axis="y", alpha=0.25)
-    for idx in range(len(datasets), n_rows * n_cols):
-        axes[idx // n_cols, idx % n_cols].set_visible(False)
-    fig.tight_layout(rect=[0.0, 0.02, 1.0, 1.0])
-    filename = f"04_boxplot_accuracy_por_dataset_{estimator_filter}.png"
-    _save_chart(fig, out_dir, filename)
-    saved.append(filename)
-
-    curve_df = build_curve_dataframe(results_struct, args, estimator_filter)
-    if curve_df.empty:
-        curve_plot_df = pd.DataFrame()
-        curve_opts, curve_color_map, curve_label_map = opts, color_map, label_map
-    else:
-        curve_plot_df, curve_opts, curve_color_map, curve_label_map = prepare_plot_groups(curve_df, opt_order)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.8 * n_cols, 4.4 * n_rows), squeeze=False)
-    for idx, dataset in enumerate(datasets):
-        ax = axes[idx // n_cols, idx % n_cols]
-        _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map, classifier=estimator_filter)
-    for idx in range(len(datasets), n_rows * n_cols):
-        axes[idx // n_cols, idx % n_cols].set_visible(False)
-    _convergence_legend(fig, curve_opts, curve_color_map, curve_label_map)
-    filename = f"05_convergence_por_dataset_{estimator_filter}.png"
-    _save_chart(fig, out_dir, filename)
-    saved.append(filename)
-
-    generate_global_accuracy_boxplot(
-        run_plot_df,
-        out_dir,
-        opt_order
-    )
-    saved.append("08_global_accuracy_distribution.png")
-
-    generate_global_features_runtime(
-        plot_df,
-        out_dir,
-        opt_order
-    )
-    saved.append("09_global_features_runtime_tradeoff.png")
-    return saved
+    selected = set(zip(df["Archivo"], df["Configuracion"]))
+    results = {dataset: {label: row for label, row in rows.items() if (dataset, label) in selected}
+               for dataset, rows in results_struct.items()}
+    results = {dataset: rows for dataset, rows in results.items() if rows}
+    plot_args = argparse.Namespace(**{**vars(args), "optimizers": list(opt_order),
+                                     "plot_global_estimator": estimator_filter.lower()})
+    report = report_from_results(plot_args, results)
+    generated = []
+    skipped = generate(report, out_dir, generated=generated)
+    for item in skipped:
+        print(f"[plot-skipped] {item['output']}: {item['reason']}", flush=True)
+    return generated
 
 def generate_global_accuracy_boxplot(df, out_dir, opt_order):
 
@@ -3309,8 +3232,14 @@ def export_reporting_outputs(paths, args, dataset_names, results_struct, statist
         os.path.join(paths.fig_dir, "full"),
         list(args.optimizers),
         args,
-        estimator_filter=PLOT_GLOBAL_ESTIMATOR,
+        estimator_filter=getattr(args, "plot_global_estimator", PLOT_GLOBAL_ESTIMATOR),
     )
+    from reporting.figures import report_from_results
+    from reporting.statistics import export as export_matched_statistics
+    statistical_report = report_from_results(args, statistical_results)
+    export_matched_statistics(statistical_report,
+                              os.path.join(paths.fig_dir, "full", "statistics"),
+                              os.path.join(paths.res_dir, "statistics"))
     return exported, summary_csv, generated_charts
 
 
@@ -3361,6 +3290,11 @@ def print_experiment_summary(args: argparse.Namespace, paths: Paths, dataset_nam
 def main():
     started_at = time.monotonic()
     args = parse_args()
+    print(f"EXP_ID: {args.exp_id}")
+    print(f"MIAFEX_ARTIFACT_TAG: {args.miafex_artifact_tag}")
+    print(f"MIAFEx checkpoint root: {args.miafex_checkpoint_root}")
+    print(f"MIAFEx feature-dataset root: {args.feature_dataset_root}")
+    print(f"MIAFEx provenance root: {args.miafex_provenance_root}")
     logging.disable(logging.INFO)
     logging.getLogger("mealpy").setLevel(logging.WARNING)
 
@@ -3422,6 +3356,12 @@ def main():
         dataset_args = resolve_miafex_dataset_args(metadata_args)
         dataset_names = list(dataset_args)
         miafex_csv_path = {name: miafex_feature_paths(scoped) for name, scoped in dataset_args.items()}
+        # Read-only validation also covers cache-complete reporting; all
+        # downstream repetitions consume this one fixed artifact version.
+        for scoped in dataset_args.values():
+            if args.pipeline_mode != "extract":
+                validation_args = argparse.Namespace(**{**vars(scoped), "pipeline_mode": "feature_selection"})
+                miafex_artifacts.validate_existing(validation_args, report=True)
         if args.pipeline_mode == "extract":
             for name, scoped in dataset_args.items():
                 miafex_csv_path[name] = resolve_miafex_csv(scoped)

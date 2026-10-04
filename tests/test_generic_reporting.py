@@ -21,6 +21,7 @@ ORIGINAL_FEATURE_LOADER = m.load_miafex_feature_data
 
 def arguments(root):
     return m.parse_args(['--report-only', '--exp-id', '913', '--output-root', str(root),
+                         '--pipeline-mode', 'feature_selection',
                          '--miafex-datasets', 'First', 'Second',
                          '--feature-dataset-root', str(root / 'features'),
                          '--optimizers', 'DE', 'PSO', 'JADE', '--estimators', 'knn', 'rf',
@@ -59,9 +60,14 @@ def caches(args):
     return args
 
 
-def tiny_figures(*args):
+def tiny_figures(*args, **kwargs):
     fig = plt.figure(figsize=(.5, .5))
     yield 'tiny', fig
+
+
+def tiny_numbered_figures(report, skipped):
+    for name in figures.base_figure_names(report):
+        yield Path(name).stem, plt.figure(figsize=(.3, .3))
 
 
 class GenericReportTests(unittest.TestCase):
@@ -70,6 +76,8 @@ class GenericReportTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.stack = ExitStack(); self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(figures, 'base_publication_figures', tiny_numbered_figures))
+        self.stack.enter_context(patch.object(figures, 'per_dataset_figures', return_value=iter(())))
         for name in ('run_single', 'execute_pending_runs', 'build_optimizer', 'get_dataset', 'save_cache',
                      'resolve_execution_config', 'resolve_miafex_csv', 'train_miafex', 'extract_miafex_features',
                      'load_miafex_feature_data', 'resolve_cached_payload'):
@@ -164,11 +172,12 @@ class GenericReportTests(unittest.TestCase):
             skipped = []
             generated = list(figures.publication_figures(report, skipped))
             try:
-                self.assertEqual(len(generated), 4 * len(classifiers))
-                self.assertEqual(sum(item['output'].startswith('Convergence') for item in skipped),
+                self.assertEqual(len(generated), 2 * len(classifiers))
+                self.assertEqual(sum(item['output'].startswith('Convergence inset') for item in skipped),
                                  len(datasets) * len(classifiers))
                 for _, fig in generated:
                     labels = [label.get_text() for ax in fig.axes for label in ax.get_xticklabels()+ax.get_yticklabels()]
+                    labels.extend(label.get_text() for legend in fig.legends for label in legend.get_texts())
                     self.assertTrue(set(algorithms).issubset(labels))
             finally:
                 for _, fig in generated: plt.close(fig)
@@ -232,6 +241,7 @@ class AdditionalCacheTests(unittest.TestCase):
     setUp = GenericReportTests.setUp
     def test_available_metrics_and_absent_curves_are_reported(self):
         args = arguments(self.root); caches(args)
+        args.statistical_metric = 'accuracy'
         for path in self.root.rglob('*.pkl'):
             with path.open('rb') as stream: payload = pickle.load(stream)
             for row in [payload['row']]:

@@ -23,9 +23,8 @@ def report_fixture(datasets, algorithms, classifiers):
 
 
 class GenericPublicationTypesTests(unittest.TestCase):
-    def test_eight_types_adapt_to_actual_dimensions_and_classifiers(self):
-        types = {'summary', 'radar', 'heatmap', 'precision', 'accuracy_boxplot',
-                 'recall_violin', 'convergence', 'features_runtime'}
+    def test_non_heatmap_diagnostics_adapt_to_actual_dimensions_and_classifiers(self):
+        types = {'summary', 'radar', 'precision', 'convergence', 'features_runtime'}
         for datasets, algorithms, classifiers in [(('Only',), ('DE',), ('tree',)),
                                                    (('A', 'B', 'C', 'D'), ('DE', 'PSO', 'JADE'), ('knn', 'rf'))]:
             report = report_fixture(datasets, algorithms, classifiers)
@@ -41,14 +40,12 @@ class GenericPublicationTypesTests(unittest.TestCase):
                     fig.canvas.draw()  # Small in-memory default DPI only.
                 finally:
                     plt.close(fig)
-            for ci in range(1, len(classifiers) + 1):
+            for classifier in classifiers:
                 for kind in types:
-                    self.assertTrue(any(name.startswith(f'generic_{kind}_c{ci}') for name in names), kind)
-            self.assertEqual(len(names), (8 + len(report.metrics)) * len(classifiers))
-            if len(datasets) == 1:
-                self.assertTrue(any(item['output'].startswith('Precision CI') for item in skipped))
-            else:
-                self.assertEqual(skipped, [])
+                    self.assertIn(f'generic_{kind}_{classifier}', names)
+            self.assertEqual(len(names), 5 * len(classifiers))
+            self.assertFalse(any('heatmap' in name for name in names))
+            self.assertEqual(skipped, [])
 
     def test_dynamic_ci_and_constant_violin_observations(self):
         values = np.array([[.4, .5, .6, .7], [.2, .3, .4, .5]])
@@ -57,9 +54,10 @@ class GenericPublicationTypesTests(unittest.TestCase):
         self.assertIsNone(figures.dataset_mean_ci(values[:, :1])[1])
         fig = figures.violin_figure(np.full((2, 4), .7), ['Alpha', 'Beta'], 'custom')
         try:
-            # Constant samples retain four scatter observations per algorithm.
+            # Constant samples retain their true mean/median, without raw points.
             clouds = [c for c in fig.axes[0].collections if hasattr(c, 'get_offsets') and len(c.get_offsets()) == 4]
-            self.assertEqual(len(clouds), 2)
+            self.assertEqual(len(clouds), 0)
+            self.assertEqual(sum(text.get_text() == '0.700' for text in fig.axes[0].texts), 2)
         finally: plt.close(fig)
 
     def test_four_statistical_types_use_actual_algorithm_count(self):
