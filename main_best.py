@@ -119,6 +119,8 @@ MIAFEX_BATCH_SIZE = 8
 MIAFEX_LEARNING_RATE = 1e-4
 
 # Feature selection: supported optimizers/classifiers remain available via config/CLI.
+DEFAULT_FITNESS_ALPHA = 0.90
+DEFAULT_FITNESS_BETA = 0.10
 OPTIMIZERS = [
     # "MaCRO-DE",
     # "DSADE",
@@ -1246,7 +1248,11 @@ def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: a
     # MAFESE's internal fitness validation uses only these training rows.
     # The prepared test partition is supplied only to final evaluation below.
     with corrected_transfer_binary():
-        selector.fit(data.X_train, data.y_train, **fit_kwargs)
+        selector.fit(
+            data.X_train, data.y_train,
+            fit_weights=(DEFAULT_FITNESS_ALPHA, DEFAULT_FITNESS_BETA),
+            **fit_kwargs,
+        )
     runtime = time.time() - t0
 
     final_best = float(selector.optimizer.g_best.target.fitness)
