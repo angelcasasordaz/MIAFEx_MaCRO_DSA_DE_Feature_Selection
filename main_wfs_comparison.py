@@ -108,7 +108,25 @@ def automatic_worker_count() -> int:
     ram_limit = max(1, (available - AUTO_RAM_RESERVE_BYTES) // AUTO_WORKER_RAM_BYTES)
     return min(cpu_limit, ram_limit)
 
-# User-editable configuration: the full experiment used by PyCharm's Run action.
+# User-editable configuration: the active experiment used by PyCharm's Run action.
+# EXP610 internal fitness-weight diagnostic (prepared exp607 features only).
+EXPERIMENT_MODE = "sensitivity_weights"
+EXP_ID = 610
+
+SENSITIVITY_WEIGHT_DATASET = "Histological_Biopsy"
+SENSITIVITY_WEIGHT_OPTIMIZERS = [
+    # "PSO",
+    "MaCRO-DE-t-v2",
+    # "DE",
+]
+# Preserve the original diagnostic weight order.
+SENSITIVITY_WEIGHT_PAIRS = [
+    (0.99, 0.01),
+    (0.95, 0.05),
+    (0.90, 0.10),
+]
+
+# Shared framework settings below; the active diagnostic uses the block above.
 # Dataset and pipeline
 DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
 PIPELINE_MODE = "feature_selection"  # Options: "extract", "feature_selection", "full"
@@ -163,7 +181,6 @@ MACRO_DE_T_V2_BETA_MAX = 0.60
 MACRO_DE_T_V2_MAHAL_Q = 0.50
 
 # Experiment and cache reuse
-EXP_ID = 610
 REUSE_CACHE = False
 REUSE_CACHE_FROM_EXP_ID = None
 FIGURES_ONLY = False
@@ -4319,24 +4336,58 @@ def framework_main():
 
 # Isolated diagnostic. The copied comparison/framework helpers above are not
 # entry points: no EXP cache, WFS, neural training or extraction path is called.
-ABLATION_DATASET = "Histological_Biopsy"
-ABLATION_NAME = f"FS_WEIGHT_ABLATION_{ABLATION_DATASET}"
-ABLATION_ALGORITHMS = ("PSO", "MaCRO-DE-t-v2")
-ABLATION_WEIGHTS = ((0.99, 0.01), (0.95, 0.05), (0.90, 0.10))
+ABLATION_NAME = f"FS_WEIGHT_ABLATION_{SENSITIVITY_WEIGHT_DATASET}"
 ABLATION_METRICS = ("Accuracy", "Precision", "Recall", "F1", "SelectedFeatures",
                     "SelectedFeatureRatio", "Fitness", "Runtime")
 ABLATION_COLUMNS = ("Dataset", "Optimizer", "Alpha", "Beta", "Run", "Seed", *ABLATION_METRICS)
 
 
 def ablation_settings():
-    """Scientific settings are fixed; CLI options only affect execution/output."""
+    """Read top-level science settings; CLI options only affect execution/output."""
     return argparse.Namespace(
-        dataset_source="miafex", dataset_name=ABLATION_DATASET,
-        optimizers=list(ABLATION_ALGORITHMS), runs=20, epochs=200, pop_size=30,
-        seed_base=1234, test_size=0.2, random_state=42,
-        macro_de_t_v2_beta_min=0.10, macro_de_t_v2_beta_max=0.60,
-        macro_de_t_v2_mahal_q=0.50,
+        dataset_source="miafex", dataset_name=SENSITIVITY_WEIGHT_DATASET,
+        optimizers=list(SENSITIVITY_WEIGHT_OPTIMIZERS), runs=RUNS, epochs=FS_EPOCHS, pop_size=POP_SIZE,
+        seed_base=SEED_BASE, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+        macro_de_t_v2_beta_min=MACRO_DE_T_V2_BETA_MIN, macro_de_t_v2_beta_max=MACRO_DE_T_V2_BETA_MAX,
+        macro_de_t_v2_mahal_q=MACRO_DE_T_V2_MAHAL_Q,
     )
+
+
+def print_sensitivity_weight_configuration(settings):
+    """Show the active user-editable experiment before any preflight or runs."""
+    print("=" * 60)
+    print(f"EXP{EXP_ID}")
+    print(f"Mode: {EXPERIMENT_MODE}")
+    print(f"Dataset: {SENSITIVITY_WEIGHT_DATASET}")
+    print("Optimizers:")
+    for optimizer in SENSITIVITY_WEIGHT_OPTIMIZERS:
+        print(f"  - {optimizer}")
+    print("Weight pairs:")
+    for alpha, beta in SENSITIVITY_WEIGHT_PAIRS:
+        print(f"  - alpha={alpha:.2f} beta={beta:.2f}")
+    print(f"Runs: {settings.runs}")
+    print(f"Selected optimized runs: {len(settings.optimizers) * len(SENSITIVITY_WEIGHT_PAIRS) * settings.runs}")
+    print(f"Epochs: {settings.epochs}")
+    print(f"Population: {settings.pop_size}")
+    print("Classifier: KNN")
+    print("Transfer function: vstf_01")
+    print("=" * 60, flush=True)
+
+
+def sensitivity_weight_source_hash(obj):
+    """Preserve EXP610 resume fingerprints across configuration-name cleanup.
+
+    Only these renamed identifiers are normalized; scientific source changes
+    still change the hash. The existing resume validation remains unchanged.
+    """
+    source = inspect.getsource(inspect.unwrap(obj))
+    for current, previous in (
+        ("SENSITIVITY_WEIGHT_DATASET", "ABLATION_DATASET"),
+        ("SENSITIVITY_WEIGHT_OPTIMIZERS", "ABLATION_ALGORITHMS"),
+        ("SENSITIVITY_WEIGHT_PAIRS", "ABLATION_WEIGHTS"),
+    ):
+        source = source.replace(current, previous)
+    return hashlib.sha256(source.encode()).hexdigest()
 
 
 def ablation_scores(y_true, y_pred):
@@ -4367,7 +4418,7 @@ def ablation_problem_factory(X_train, y_train, weights):
     This closure contains only prepared training data. MAFESE's Data.X_test is
     required to equal its ordinary internal validation split (random_state=41).
     """
-    if weights not in ABLATION_WEIGHTS or sum(weights) != 1.0:
+    if weights not in SENSITIVITY_WEIGHT_PAIRS or sum(weights) != 1.0:
         raise ValueError("Only the three normalized diagnostic weights are allowed")
     expected = Data(X_train.copy(), y_train.copy())
     expected.split_train_test(test_size=0.2)
@@ -4459,7 +4510,7 @@ def ablation_select(X_train, y_train, algorithm, weights, run_id, settings):
     validate_convergence_curve(selector.optimizer.history.list_global_best_fit,
                                settings.epochs, float(target.fitness))
     return {
-        "Dataset": ABLATION_DATASET, "Optimizer": algorithm,
+        "Dataset": SENSITIVITY_WEIGHT_DATASET, "Optimizer": algorithm,
         "Alpha": weights[0], "Beta": weights[1], "Run": run_id, "Seed": seed,
         "SelectedFeatures": count, "SelectedFeatureRatio": ratio,
         "Fitness": float(target.fitness), "Runtime": runtime,
@@ -4492,7 +4543,7 @@ def ablation_preflight(settings, paths):
     """Read-only sanity checks before ANY optimization or output creation."""
     if "fs_problem" not in inspect.signature(MhaSelector.fit).parameters:
         raise RuntimeError("Installed MAFESE must accept fs_problem")
-    if any(sum(weights) != 1.0 for weights in ABLATION_WEIGHTS):
+    if any(sum(weights) != 1.0 for weights in SENSITIVITY_WEIGHT_PAIRS):
         raise ValueError("alpha + beta must equal one")
     data = load_miafex_feature_data(paths)  # Checks existence, ordered columns and labels.
     for array in (data.X_train, data.y_train, data.X_test, data.y_test):
@@ -4500,7 +4551,7 @@ def ablation_preflight(settings, paths):
     # Exercise the actual problem factory with the native MAFESE split, before
     # solve() can be called. Verify the objective identity and binary contract.
     from mafese.wrapper.mha import ClassificationMetric
-    for weights in ABLATION_WEIGHTS:
+    for weights in SENSITIVITY_WEIGHT_PAIRS:
         internal = Data(data.X_train.copy(), data.y_train.copy())
         internal.split_train_test(test_size=0.2)
         factory = ablation_problem_factory(data.X_train, data.y_train, weights)
@@ -4553,21 +4604,24 @@ def ablation_summary(rows):
 
 def ablation_figures(summary, baseline, destination):
     """Five compact diagnostics and a combined panel, all at 600 dpi."""
-    colors = {"PSO": "#27649A", "MaCRO-DE-t-v2": "#B64C32"}
-    markers = {"PSO": "o", "MaCRO-DE-t-v2": "s"}
-    labels = [f"{alpha:.2f}/{beta:.2f}" for alpha, beta in ABLATION_WEIGHTS]
+    colors = {"PSO": "#27649A", "MaCRO-DE-t-v2": "#B64C32", "DE": "#367C47"}
+    markers = {"PSO": "o", "MaCRO-DE-t-v2": "s", "DE": "^"}
+    for index, algorithm in enumerate(SENSITIVITY_WEIGHT_OPTIMIZERS):
+        colors.setdefault(algorithm, plt.get_cmap("tab10")(index % 10))
+        markers.setdefault(algorithm, ("o", "s", "^", "D", "v")[index % 5])
+    labels = [f"{alpha:.2f}/{beta:.2f}" for alpha, beta in SENSITIVITY_WEIGHT_PAIRS]
 
     def panel(ax, metric, ylabel, reference=False):
-        for algorithm in ABLATION_ALGORITHMS:
+        for algorithm in SENSITIVITY_WEIGHT_OPTIMIZERS:
             values = summary[summary.Optimizer == algorithm].set_index(["Alpha", "Beta"])
-            means = [values.loc[weights, f"{metric}_mean"] for weights in ABLATION_WEIGHTS]
-            deviations = [values.loc[weights, f"{metric}_std"] for weights in ABLATION_WEIGHTS]
-            ax.errorbar(np.arange(3), means, yerr=deviations, capsize=3, lw=1.2,
+            means = [values.loc[weights, f"{metric}_mean"] for weights in SENSITIVITY_WEIGHT_PAIRS]
+            deviations = [values.loc[weights, f"{metric}_std"] for weights in SENSITIVITY_WEIGHT_PAIRS]
+            ax.errorbar(np.arange(len(labels)), means, yerr=deviations, capsize=3, lw=1.2,
                         marker=markers[algorithm], ms=4, color=colors[algorithm], label=algorithm)
         if reference:
             ax.axhline(baseline[metric], color="#555555", ls="--", lw=1,
                        label="ALL-FEATURES-KNN")
-        ax.set_xticks(np.arange(3), labels)
+        ax.set_xticks(np.arange(len(labels)), labels)
         ax.set_xlabel(r"Fitness weights $\alpha/\beta$")
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.2, lw=0.5)
@@ -4594,7 +4648,7 @@ def ablation_figures(summary, baseline, destination):
             ax.legend(frameon=False)
             save(fig, name)
         fig, ax = plt.subplots(figsize=(5.0, 3.3))
-        for algorithm in ABLATION_ALGORITHMS:
+        for algorithm in SENSITIVITY_WEIGHT_OPTIMIZERS:
             values = summary[summary.Optimizer == algorithm]
             ax.scatter(values.SelectedFeatures_mean, values.Accuracy_mean,
                        marker=markers[algorithm], color=colors[algorithm], s=28, label=algorithm)
@@ -4640,184 +4694,363 @@ def ablation_atomic_csv(table, path):
             os.unlink(temporary)
 
 
-def ablation_read_resume(destination, expected, data):
-    """Reuse only this diagnostic's locally saved EXP610 runs, never other EXPs."""
-    previous = json.loads((destination / "manifest.json").read_text())
-    for field in ("experiment", "exp_id", "diagnostic", "dataset", "input_feature_count",
-                  "prepared_partitions", "algorithms", "fitness_weights", "objective", "runs",
-                  "epochs", "population_size", "run_ids", "seed_base", "seeds", "transfer_function",
-                  "classifier", "classifier_parameters", "MaCRO-DE-t-v2_parameters", "metric_averaging",
-                  "metric_scale", "std_ddof", "index_base", "runtime_scope", "selection_protocol"):
-        if previous.get(field) != expected[field]:
-            raise ValueError(f"EXP610 resume science mismatch: {field}")
-    for field in ("framework_identities", "selection_source", "problem_factory_source", "python", "wrapper_revision"):
-        if previous["source_version"].get(field) != expected["source_version"][field]:
-            raise ValueError(f"EXP610 resume implementation mismatch: {field}")
-    table = pd.read_csv(destination / "per_run_results.csv", float_precision="round_trip")
-    if tuple(table.columns) != ABLATION_COLUMNS:
-        raise ValueError("EXP610 per-run columns differ from the diagnostic schema")
-    indices = json.loads((destination / "selected_feature_indices.json").read_text())
-    rows, seen = table.to_dict("records"), set()
-    for row in rows:
-        algorithm, weights = row["Optimizer"], (row["Alpha"], row["Beta"])
-        for field in ("Run", "Seed", "SelectedFeatures"):
-            if row[field] != int(row[field]):
-                raise ValueError(f"Non-integer saved {field}")
-            row[field] = int(row[field])
-        run = row["Run"]
-        key = algorithm, weights, run
-        if (row["Dataset"] != ABLATION_DATASET or algorithm not in ABLATION_ALGORITHMS
-                or weights not in ABLATION_WEIGHTS or not 0 <= run < expected["runs"]
-                or row["Seed"] != expected["seed_base"] + run or key in seen):
-            raise ValueError("Invalid/duplicate saved diagnostic run identity")
-        seen.add(key)
-        mask_indices = indices[algorithm][f"{weights[0]:.2f}/{weights[1]:.2f}"][str(run)]
-        if (not mask_indices or any(type(index) is not int for index in mask_indices)
-                or mask_indices != sorted(set(mask_indices))
-                or not 0 <= mask_indices[0] <= mask_indices[-1] < expected["input_feature_count"]
-                or len(mask_indices) != row["SelectedFeatures"]
-                or row["SelectedFeatureRatio"] != len(mask_indices) / expected["input_feature_count"]):
-            raise ValueError("Saved mask/count/ratio mismatch")
-        if not np.isfinite([row[metric] for metric in ABLATION_METRICS]).all():
-            raise ValueError("Non-finite saved diagnostic metrics")
-        # Validate the common external metrics, not any native method-specific scores.
-        measured = ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test, mask_indices)
-        if any(not np.isclose(row[metric], score, rtol=0, atol=1e-12) for metric, score in measured.items()):
-            raise ValueError("Saved external-test metrics do not match the diagnostic implementation")
-    saved_keys = {(algorithm, (alpha, beta), int(run)) for algorithm in ABLATION_ALGORITHMS
-                  for alpha, beta in ABLATION_WEIGHTS
-                  for run in indices[algorithm][f"{alpha:.2f}/{beta:.2f}"]}
-    if saved_keys != seen or previous["completed_runs"] != len(rows):
-        raise ValueError("Saved per-run CSV, masks and manifest must describe the same completed runs")
-    prior_sources = previous["source_version"].get("prior_test_main_sha256", [])
-    previous_hash = previous["source_version"]["test_main_sha256"]
-    if previous_hash != expected["source_version"]["test_main_sha256"]:
-        prior_sources = list(dict.fromkeys([*prior_sources, previous_hash]))
-    expected["source_version"]["prior_test_main_sha256"] = prior_sources
-    print(f"[resume] Validated {len(rows)}/120 local EXP610 runs; prepared test metrics and masks agree", flush=True)
-    return rows, indices
+def ablation_run_key(row):
+    """Stable logical slot: changed science in the same slot must fail, not fork."""
+    return scientific_cache.identity_digest({
+        "dataset": row["Dataset"], "optimizer": resolve_optimizer_name(row["Optimizer"]),
+        "alpha": row["Alpha"], "beta": row["Beta"], "run": int(row["Run"]),
+    })
 
 
-def run_weight_ablation(output_root, workers, validate_only=False, resume=False):
-    settings = ablation_settings()
-    project = Path(__file__).resolve().parent
-    feature_dir = project / "datasets_features/miafex_exp607" / ABLATION_DATASET
-    paths = {split: str(feature_dir / f"{split}_features.csv") for split in ("train", "test")}
-    settings.train_features_csv, settings.test_features_csv = paths["train"], paths["test"]
-    print(ABLATION_DATASET + "\n" + "-" * 48)
-    for algorithm in ABLATION_ALGORITHMS:
-        for alpha, beta in ABLATION_WEIGHTS:
-            print(f"{algorithm:<16} alpha={alpha:.2f} beta={beta:.2f}")
-    print("ALL-FEATURES-KNN baseline\n" + "-" * 48, flush=True)
-    res_dir, fig_dir = ablation_output_dirs(output_root, require_empty=not (resume or validate_only))
-    data = ablation_preflight(settings, paths)
-    identities = {algorithm: build_combination_identity(settings, ABLATION_DATASET, "knn", algorithm, "vstf_01")
-                  for algorithm in ABLATION_ALGORITHMS}
-    if validate_only:
-        print("Validation complete; no optimization or diagnostic output writes.", flush=True)
-        return
-    hashes = {split: scientific_cache.file_digest(path) for split, path in paths.items()}
-    manifest = {
-        "experiment": f"EXP{EXP_ID}", "exp_id": EXP_ID, "diagnostic": ABLATION_NAME,
-        "purpose": "Internal fitness-weight diagnostic",
-        "dataset": ABLATION_DATASET, "input_feature_count": data.X_train.shape[1],
-        "prepared_partitions": {split: {"path": paths[split], "sha256": hashes[split]}
-                                for split in paths},
-        "algorithms": list(ABLATION_ALGORITHMS),
-        "fitness_weights": [{"alpha": alpha, "beta": beta} for alpha, beta in ABLATION_WEIGHTS],
+def ablation_run_identity(manifest, row):
+    """One run's science; optimizer/weight selections and run totals are excluded."""
+    framework = json.loads(json.dumps(manifest["source_version"]["framework_identities"][row["Optimizer"]]))
+    framework.pop("runs", None)
+    framework["seeds"].pop("run_seeds", None)
+    framework["seeds"].pop("base", None)
+    framework["objective"]["weights"] = [row["Alpha"], row["Beta"]]
+    source = manifest["source_version"]
+    return {
+        "schema": 2, "experiment": "EXP610", "mode": manifest.get("mode", "sensitivity_weights"),
+        "dataset": row["Dataset"], "optimizer": resolve_optimizer_name(row["Optimizer"]),
+        "alpha": row["Alpha"], "beta": row["Beta"], "run": int(row["Run"]), "seed": int(row["Seed"]),
+        "epochs": manifest["epochs"], "population_size": manifest["population_size"],
+        "input_feature_count": manifest["input_feature_count"],
+        "classifier": manifest["classifier"], "classifier_parameters": manifest["classifier_parameters"],
+        "transfer_function": manifest["transfer_function"],
+        "prepared_hashes": {split: item["sha256"] for split, item in manifest["prepared_partitions"].items()},
+        "metric_averaging": manifest["metric_averaging"], "selection_protocol": manifest["selection_protocol"],
+        "runtime_scope": manifest["runtime_scope"], "framework": framework,
+        "implementation": {"selection_source": source["selection_source"],
+                           "problem_factory_source": source["problem_factory_source"],
+                           "wrapper_revision": source["wrapper_revision"], "python": source["python"],
+                           "scores_source": source.get("scores_source", comparison_source_hash(ablation_scores)),
+                           "evaluation_source": source.get("evaluation_source", comparison_source_hash(ablation_evaluate))},
+    }
+
+
+def ablation_make_manifest(settings, paths, data):
+    return {
+        "store_schema": 2, "experiment": f"EXP{EXP_ID}", "exp_id": EXP_ID, "mode": EXPERIMENT_MODE,
+        "diagnostic": ABLATION_NAME, "purpose": "Internal fitness-weight diagnostic",
+        "dataset": settings.dataset_name, "input_feature_count": data.X_train.shape[1],
+        "prepared_partitions": {split: {"path": path, "sha256": scientific_cache.file_digest(path)}
+                                for split, path in paths.items()},
+        "algorithms": list(settings.optimizers),
+        "fitness_weights": [{"alpha": alpha, "beta": beta} for alpha, beta in SENSITIVITY_WEIGHT_PAIRS],
         "objective": "alpha * (1 - Accuracy_validation) + beta * (selected_features / total_features)",
         "runs": settings.runs, "epochs": settings.epochs, "population_size": settings.pop_size,
         "run_ids": list(range(settings.runs)), "seed_base": settings.seed_base,
         "seeds": [settings.seed_base + run for run in range(settings.runs)],
         "transfer_function": "vstf_01", "classifier": "KNN",
         "classifier_parameters": get_general_estimator("classification", "knn").get_params(),
-        "MaCRO-DE-t-v2_parameters": {"beta_min": 0.10, "beta_max": 0.60, "mahalanobis_q": 0.50},
+        "MaCRO-DE-t-v2_parameters": {"beta_min": settings.macro_de_t_v2_beta_min,
+                                    "beta_max": settings.macro_de_t_v2_beta_max,
+                                    "mahalanobis_q": settings.macro_de_t_v2_mahal_q},
         "metric_averaging": {"Precision": "weighted", "Recall": "weighted", "F1": "weighted", "zero_division": 0},
-        "metric_scale": "Accuracy/Precision/Recall/F1 in [0, 1]",
-        "std_ddof": 1, "index_base": 0, "runtime_scope": "selector.fit only (seconds)",
+        "metric_scale": "Accuracy/Precision/Recall/F1 in [0, 1]", "std_ddof": 1, "index_base": 0,
+        "runtime_scope": "selector.fit only (seconds)",
         "selection_protocol": "MAFESE train-only internal validation: test_size=0.2, random_state=41, no stratification; external test only after selection",
-        "source_version": {"framework_identities": identities, "test_main_sha256": scientific_cache.file_digest(__file__),
-                           "selection_source": comparison_source_hash(ablation_select),
-                           "problem_factory_source": comparison_source_hash(ablation_problem_factory),
-                           "python": sys.version, "wrapper_revision": WRAPPER_SCIENCE_REVISION},
-        "status": "running", "completed_runs": 0,
+        "source_version": {
+            "framework_identities": {algorithm: build_combination_identity(settings, settings.dataset_name, "knn", algorithm, "vstf_01")
+                                     for algorithm in settings.optimizers},
+            "test_main_sha256": scientific_cache.file_digest(__file__), "python": sys.version,
+            "selection_source": sensitivity_weight_source_hash(ablation_select),
+            "problem_factory_source": sensitivity_weight_source_hash(ablation_problem_factory),
+            "scores_source": comparison_source_hash(ablation_scores),
+            "evaluation_source": comparison_source_hash(ablation_evaluate),
+            "wrapper_revision": WRAPPER_SCIENCE_REVISION,
+        },
     }
-    # The framework identity helper reports the comparison's fixed weights.
-    # Expose the diagnostic factor explicitly in each local identity instead.
-    for identity in identities.values():
-        identity["objective"]["weights"] = manifest["fitness_weights"]
+
+
+@wrapper_resources()
+def ablation_validate_record(record, data=None):
+    """Validate stored bits/counts and, for selected runs, common test metrics."""
+    row, indices, identity = record["row"], record["indices"], record["identity"]
+    for field in ("Run", "Seed", "SelectedFeatures"):
+        if row[field] != int(row[field]):
+            raise ValueError(f"Non-integer saved {field}")
+    if (not indices or any(type(index) is not int for index in indices)
+            or indices != sorted(set(indices))
+            or not 0 <= indices[0] <= indices[-1] < identity["input_feature_count"]
+            or len(indices) != row["SelectedFeatures"]
+            or row["SelectedFeatureRatio"] != len(indices) / identity["input_feature_count"]):
+        raise ValueError("Saved mask/count/ratio mismatch")
+    if not np.isfinite([row[metric] for metric in ABLATION_METRICS]).all():
+        raise ValueError("Non-finite saved diagnostic metrics")
+    if (row["Run"] < 0 or row["Runtime"] < 0 or row["Alpha"] + row["Beta"] != 1.0
+            or not 0 <= row["Alpha"] <= 1 or not 0 <= row["Beta"] <= 1
+            or identity["experiment"] != "EXP610" or identity["mode"] != "sensitivity_weights"
+            or (identity["dataset"], identity["optimizer"], identity["alpha"], identity["beta"], identity["run"], identity["seed"])
+            != (row["Dataset"], resolve_optimizer_name(row["Optimizer"]), row["Alpha"], row["Beta"], row["Run"], row["Seed"])):
+        raise ValueError("Saved run identity disagrees with its row")
+    if data is not None:
+        measured = ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test, indices)
+        if any(not np.isclose(row[metric], score, rtol=0, atol=1e-12) for metric, score in measured.items()):
+            raise ValueError("Saved weighted external-test metrics do not match the diagnostic implementation")
+
+
+def ablation_read_store(destination):
+    """Read immutable run records, or migrate the old CSV/masks IN MEMORY.
+
+    No output writes occur here. Inactive optimizer records remain in the store.
+    Immutable records also recover runs committed before a projection/manifest
+    write was interrupted; they are authoritative over incomplete projections.
+    """
+    records, projected_keys = {}, []
+    run_dir = destination / "runs"
+    if run_dir.is_symlink():
+        raise ValueError("EXP610 run store may not redirect through a symlink")
+    for path in sorted(run_dir.glob("*.json")):
+        if path.is_symlink():
+            raise ValueError(f"EXP610 run record may not redirect: {path}")
+        record = json.loads(path.read_text())
+        key = ablation_run_key(record["row"])
+        if path.stem != key or key in records:
+            raise ValueError(f"Invalid/duplicate EXP610 run record: {path}")
+        ablation_validate_record(record)
+        records[key] = record
+    legacy_paths = [destination / name for name in
+                    ("manifest.json", "per_run_results.csv", "selected_feature_indices.json")]
+    previous = None
+    if any(path.exists() for path in legacy_paths):
+        if not all(path.is_file() for path in legacy_paths):
+            raise ValueError("EXP610 manifest, per-run CSV and masks must all exist; existing data preserved")
+        previous = json.loads(legacy_paths[0].read_text())
+        if previous.get("exp_id") != 610 or previous.get("experiment") != "EXP610":
+            raise ValueError("Existing results are not an EXP610 diagnostic")
+        table = pd.read_csv(legacy_paths[1], float_precision="round_trip")
+        if tuple(table.columns) != ABLATION_COLUMNS:
+            raise ValueError("EXP610 per-run columns differ from the diagnostic schema")
+        indices = json.loads(legacy_paths[2].read_text())
+        if not records and previous.get("completed_runs") != len(table):
+            raise ValueError("Legacy EXP610 manifest/CSV completed counts disagree")
+        legacy_weights = {(item["alpha"], item["beta"]) for item in previous["fitness_weights"]}
+        for row in table.to_dict("records"):
+            for field in ("Run", "Seed", "SelectedFeatures"):
+                if row[field] != int(row[field]):
+                    raise ValueError(f"Non-integer saved {field}")
+                row[field] = int(row[field])
+            key = ablation_run_key(row)
+            if key in projected_keys:
+                raise ValueError("Duplicate EXP610 per-run row")
+            projected_keys.append(key)
+            mask = indices.get(row["Optimizer"], {}).get(f"{row['Alpha']:.2f}/{row['Beta']:.2f}", {}).get(str(row["Run"]))
+            if key in records:
+                if records[key]["row"] != row or (mask is not None and records[key]["indices"] != mask):
+                    raise ValueError("EXP610 immutable record disagrees with the CSV/masks; preserved")
+            else:
+                if previous.get("store_schema", 1) >= 2:
+                    raise ValueError(f"Missing immutable EXP610 run record: {key}")
+                if ((row["Alpha"], row["Beta"]) not in legacy_weights or mask is None
+                        or row["Dataset"] != previous["dataset"]
+                        or not 0 <= row["Run"] < previous["runs"]
+                        or row["Seed"] != previous["seed_base"] + row["Run"]
+                        or row["Optimizer"] not in previous["source_version"]["framework_identities"]):
+                    raise ValueError("Legacy EXP610 row disagrees with its declared weights/mask/dataset/seed")
+                record = {"row": row, "indices": mask, "identity": ablation_run_identity(previous, row)}
+                ablation_validate_record(record)
+                records[key] = record
+        for algorithm, pairs in indices.items():
+            for weights, runs in pairs.items():
+                alpha, beta = map(float, weights.split("/"))
+                for run, mask in runs.items():
+                    key = ablation_run_key({"Dataset": previous["dataset"], "Optimizer": algorithm,
+                                           "Alpha": alpha, "Beta": beta, "Run": int(run)})
+                    if key not in records or records[key]["indices"] != mask:
+                        raise ValueError("Orphan/conflicting EXP610 mask; existing data preserved")
+    ordered = {key: records[key] for key in projected_keys}
+    ordered.update({key: record for key, record in records.items() if key not in ordered})
+    return {"records": ordered, "previous": previous,
+            "needs_projection": set(projected_keys) != set(records)}
+
+
+def ablation_plan(settings, manifest, records):
+    """Select compatible completed slots; schedule only missing selected slots."""
+    canonical = [resolve_optimizer_name(algorithm) for algorithm in settings.optimizers]
+    if len(set(canonical)) != len(canonical) or len(set(SENSITIVITY_WEIGHT_PAIRS)) != len(SENSITIVITY_WEIGHT_PAIRS):
+        raise ValueError("Optimizer selection and weight selection may not contain duplicates")
+    selected, jobs, reused = {}, [], 0
+    for algorithm in settings.optimizers:
+        for alpha, beta in SENSITIVITY_WEIGHT_PAIRS:
+            for run in range(settings.runs):
+                row = {"Dataset": settings.dataset_name, "Optimizer": algorithm, "Alpha": alpha,
+                       "Beta": beta, "Run": run, "Seed": settings.seed_base + run}
+                key = ablation_run_key(row)
+                identity = ablation_run_identity(manifest, row)
+                selected[key] = identity
+                if key in records:
+                    if records[key]["identity"] != identity:
+                        changed = [field for field in identity if records[key]["identity"].get(field) != identity[field]]
+                        raise ValueError(f"Incompatible EXP610 combination: {algorithm} {alpha:.2f}/{beta:.2f} "
+                                         f"run={run} seed={row['Seed']}; changed {changed}. Existing run preserved.")
+                    reused += 1
+                else:
+                    jobs.append((algorithm, (alpha, beta), run))
+    return {"selected": selected, "jobs": jobs, "expected_runs": len(selected), "reused_runs": reused}
+
+
+def ablation_selected_rows(records, plan, settings):
+    """Report only selected slots; never relabel or delete the persistent rows."""
+    labels = {resolve_optimizer_name(algorithm): algorithm for algorithm in settings.optimizers}
+    rows = [{**record["row"], "Optimizer": labels[record["identity"]["optimizer"]]}
+            for key, record in records.items() if key in plan["selected"]]
+    return sorted(rows, key=lambda row: (settings.optimizers.index(row["Optimizer"]),
+                                        SENSITIVITY_WEIGHT_PAIRS.index((row["Alpha"], row["Beta"])), row["Run"]))
+
+
+def ablation_persist_record(destination, record):
+    """Atomic, exclusive commit. A completed combination is NEVER overwritten."""
+    run_dir = destination / "runs"
+    if run_dir.is_symlink():
+        raise ValueError("EXP610 run store may not redirect through a symlink")
+    run_dir.mkdir(exist_ok=True)
+    path = run_dir / f"{ablation_run_key(record['row'])}.json"
+    if path.exists():
+        if json.loads(path.read_text()) != record:
+            raise ValueError(f"Conflicting completed EXP610 combination; preserved: {path}")
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=run_dir,
+                                         prefix=".run-", suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            json.dump(record, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)  # Exclusive publication, including concurrent writers.
+        except FileExistsError:
+            if json.loads(path.read_text()) != record:
+                raise ValueError(f"Conflicting completed EXP610 combination; preserved: {path}")
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def ablation_publish(destination, manifest, records, plan, settings, *, project_store=False, status="running"):
+    """Persistent tables keep ALL rows; summary and selection metadata are active-only."""
+    if project_store:
+        rows, indices = [], {}
+        for record in records.values():
+            row = record["row"]
+            rows.append(row)
+            indices.setdefault(row["Optimizer"], {}).setdefault(f"{row['Alpha']:.2f}/{row['Beta']:.2f}", {})[str(row["Run"])] = record["indices"]
+        ablation_atomic_csv(pd.DataFrame(rows, columns=ABLATION_COLUMNS), destination / "per_run_results.csv")
+        scientific_cache.atomic_json(destination / "selected_feature_indices.json", indices)
+    selected_rows = ablation_selected_rows(records, plan, settings)
+    ablation_atomic_csv(ablation_summary(selected_rows), destination / "summary.csv")
+    manifest.update(
+        status=status, completed_runs=len(records), persistent_completed_runs=len(records),
+        persistent_optimizers=list(dict.fromkeys(record["row"]["Optimizer"] for record in records.values())),
+        persistent_combinations={key: record["identity"] for key, record in records.items()},
+        selected_optimizers=list(settings.optimizers), selected_combinations=plan["selected"],
+        expected_runs=plan["expected_runs"], selected_completed_runs=len(selected_rows),
+    )
+    scientific_cache.atomic_json(destination / "manifest.json", manifest)
+
+
+def run_weight_ablation(output_root, workers, validate_only=False, resume=False):
+    """Normal Run is incremental; --resume remains a backwards-compatible alias."""
+    settings = ablation_settings()
+    project = Path(__file__).resolve().parent
+    feature_dir = project / "datasets_features/miafex_exp607" / settings.dataset_name
+    paths = {split: str(feature_dir / f"{split}_features.csv") for split in ("train", "test")}
+    settings.train_features_csv, settings.test_features_csv = paths["train"], paths["test"]
+    print_sensitivity_weight_configuration(settings)
+    res_dir, fig_dir = ablation_output_dirs(output_root, require_empty=False)
+    data = ablation_preflight(settings, paths)
+    manifest = ablation_make_manifest(settings, paths, data)
+    store = ablation_read_store(res_dir)
+    records = store["records"]
+    plan = ablation_plan(settings, manifest, records)
+    for key in plan["selected"]:
+        if key in records:
+            ablation_validate_record(records[key], data)
+    print(f"[selection] {len(settings.optimizers) * len(SENSITIVITY_WEIGHT_PAIRS)} optimizer/weight combinations; "
+          f"{plan['expected_runs']} selected runs; {plan['reused_runs']} reused; "
+          f"{len(plan['jobs'])} missing; {len(records)} persistent completed runs", flush=True)
+    if validate_only:
+        print("Validation complete; no optimization, migration writes, or report writes.", flush=True)
+        return plan
     for destination in (res_dir, fig_dir):
         destination.mkdir(parents=True, exist_ok=True)
-    rows, selected_indices = [], {algorithm: {f"{alpha:.2f}/{beta:.2f}": {}
-                                            for alpha, beta in ABLATION_WEIGHTS}
-                                 for algorithm in ABLATION_ALGORITHMS}
-    if resume:
-        rows, selected_indices = ablation_read_resume(res_dir, manifest, data)
-
-    def publish():
-        ablation_atomic_csv(pd.DataFrame(rows, columns=ABLATION_COLUMNS), res_dir / "per_run_results.csv")
-        ablation_atomic_csv(ablation_summary(rows), res_dir / "summary.csv")
-        scientific_cache.atomic_json(res_dir / "selected_feature_indices.json", selected_indices)
-        manifest["completed_runs"] = len(rows)
-        scientific_cache.atomic_json(res_dir / "manifest.json", manifest)
-
-    def record(result):
-        row, indices = result
-        if len(indices) != row["SelectedFeatures"] or row["SelectedFeatureRatio"] != len(indices) / data.X_train.shape[1]:
-            raise ValueError("Selected count/ratio does not match the winning indices")
-        row.update(ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test, indices))
-        rows.append(row)
-        rows.sort(key=lambda item: (ABLATION_ALGORITHMS.index(item["Optimizer"]),
-                                   ABLATION_WEIGHTS.index((item["Alpha"], item["Beta"])), item["Run"]))
-        selected_indices[row["Optimizer"]][f"{row['Alpha']:.2f}/{row['Beta']:.2f}"][str(row["Run"])] = indices
-        publish()
-        print(f"[{len(rows)}/120] {row['Optimizer']} {row['Alpha']:.2f}/{row['Beta']:.2f} "
-              f"run={row['Run']} seed={row['Seed']} accuracy={row['Accuracy']:.4f} "
-              f"features={row['SelectedFeatures']} runtime={row['Runtime']:.1f}s", flush=True)
-
+    previous = store["previous"]
+    if previous:
+        prior = previous["source_version"].get("prior_test_main_sha256", [])
+        manifest["source_version"]["prior_test_main_sha256"] = list(dict.fromkeys(
+            [*prior, previous["source_version"]["test_main_sha256"]]))
+    baseline_path = res_dir / "baseline_all_features.csv"
+    baseline = {"Dataset": settings.dataset_name, "Optimizer": "ALL-FEATURES-KNN",
+                **ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test,
+                                    np.arange(data.X_train.shape[1])),
+                "SelectedFeatures": data.X_train.shape[1], "SelectedFeatureRatio": 1.0,
+                "Fitness": np.nan, "Runtime": np.nan}
+    if baseline_path.exists():
+        saved = pd.read_csv(baseline_path, float_precision="round_trip")
+        if len(saved) != 1 or any(saved.iloc[0][key] != baseline[key] for key in baseline if key not in ("Fitness", "Runtime")):
+            raise ValueError("Existing ALL-FEATURES-KNN baseline is incompatible; preserved")
     with ablation_write_guard((res_dir, fig_dir)):
-        baseline = {"Dataset": ABLATION_DATASET, "Optimizer": "ALL-FEATURES-KNN",
-                    **ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test,
-                                        np.arange(data.X_train.shape[1])),
-                    "SelectedFeatures": data.X_train.shape[1], "SelectedFeatureRatio": 1.0,
-                    "Fitness": np.nan, "Runtime": np.nan}
-        ablation_atomic_csv(pd.DataFrame([baseline]), res_dir / "baseline_all_features.csv")
-        publish()
-        completed = {(row["Optimizer"], (row["Alpha"], row["Beta"]), row["Run"]) for row in rows}
-        jobs = [(algorithm, weights, run) for algorithm in ABLATION_ALGORITHMS
-                for weights in ABLATION_WEIGHTS for run in range(settings.runs)
-                if (algorithm, weights, run) not in completed]
+        if not baseline_path.exists():
+            ablation_atomic_csv(pd.DataFrame([baseline]), baseline_path)
+        # Read-only legacy adoption above becomes immutable EXP610 records here.
+        # Existing raw CSV/mask projections are left byte-for-byte intact unless
+        # missing committed/new runs require an updated persistent projection.
+        for record in records.values():
+            ablation_persist_record(res_dir, record)
+        project_store = store["needs_projection"] or not (res_dir / "per_run_results.csv").exists()
+        ablation_publish(res_dir, manifest, records, plan, settings, project_store=project_store)
+
+        def record_result(result):
+            row, indices = result
+            key = ablation_run_key(row)
+            if key in records or key not in plan["selected"]:
+                raise ValueError("Attempted replacement/unselected EXP610 run; completed data preserved")
+            row.update(ablation_evaluate(data.X_train, data.y_train, data.X_test, data.y_test, indices))
+            record = {"row": row, "indices": indices, "identity": plan["selected"][key]}
+            ablation_validate_record(record)
+            ablation_persist_record(res_dir, record)
+            records[key] = record
+            ablation_publish(res_dir, manifest, records, plan, settings, project_store=True)
+            completed = len(ablation_selected_rows(records, plan, settings))
+            print(f"[{completed}/{plan['expected_runs']}] {row['Optimizer']} {row['Alpha']:.2f}/{row['Beta']:.2f} "
+                  f"run={row['Run']} seed={row['Seed']} accuracy={row['Accuracy']:.4f} "
+                  f"features={row['SelectedFeatures']} runtime={row['Runtime']:.1f}s", flush=True)
+
         try:
+            jobs = plan["jobs"]
             if not jobs:
-                print("[resume] All 120 EXP610 runs are complete; refreshing diagnostic figures only", flush=True)
+                print(f"[resume] All {plan['expected_runs']} selected EXP610 runs are complete; no optimization", flush=True)
             elif workers == 1:
                 for algorithm, weights, run in jobs:
-                    record(ablation_select(data.X_train, data.y_train, algorithm, weights, run, settings))
+                    record_result(ablation_select(data.X_train, data.y_train, algorithm, weights, run, settings))
             else:
-                # Only prepared TRAIN arrays are serialized to worker processes.
                 with ProcessPoolExecutor(max_workers=min(workers, len(jobs)), mp_context=get_context("spawn")) as pool:
                     pending = {pool.submit(ablation_select, data.X_train, data.y_train, algorithm, weights, run, settings)
                                for algorithm, weights, run in jobs}
                     while pending:
                         done, pending = wait(pending, timeout=60, return_when=FIRST_COMPLETED)
                         for future in done:
-                            record(future.result())
+                            record_result(future.result())
                         if not done:
-                            print(f"[progress] {len(rows)}/120 complete; {len(pending)} pending", flush=True)
+                            completed = len(ablation_selected_rows(records, plan, settings))
+                            print(f"[progress] {completed}/{plan['expected_runs']} selected runs complete", flush=True)
             for split, path in paths.items():
-                if scientific_cache.file_digest(path) != hashes[split]:
+                if scientific_cache.file_digest(path) != manifest["prepared_partitions"][split]["sha256"]:
                     raise ValueError(f"Prepared {split} CSV changed during the diagnostic")
-            if len(rows) != 120:
-                raise ValueError("Diagnostic must complete exactly 120 optimized runs")
-            ablation_figures(ablation_summary(rows), baseline, fig_dir)
-            manifest["status"] = "complete"
-            publish()
+            selected_rows = ablation_selected_rows(records, plan, settings)
+            if len(selected_rows) != plan["expected_runs"]:
+                raise ValueError("Diagnostic must complete every selected optimizer/weight/run slot")
+            ablation_figures(ablation_summary(selected_rows), baseline, fig_dir)
+            ablation_publish(res_dir, manifest, records, plan, settings, status="complete")
         except BaseException as exc:
-            manifest["status"] = "incomplete"
             manifest["error"] = f"{type(exc).__name__}: {exc}"
-            publish()
+            ablation_publish(res_dir, manifest, records, plan, settings, status="incomplete")
             raise
     print(f"Completed: {res_dir}\nFigures: {fig_dir}", flush=True)
+    return plan
 
 
 def main():
@@ -4825,7 +5058,7 @@ def main():
     sys.dont_write_bytecode = True
     parser = argparse.ArgumentParser(description="Histological_Biopsy MAFESE fitness-weight ablation")
     parser.add_argument("--validate-only", action="store_true", help="Read-only preflight; no expensive runs or outputs")
-    parser.add_argument("--resume", action="store_true", help="Continue only validated diagnostic runs already saved under EXP610")
+    parser.add_argument("--resume", action="store_true", help="Compatibility alias: incremental resume is automatic on normal Run")
     parser.add_argument("--output-root", default=str(Path(__file__).resolve().parent),
                         help="Fresh parent for separate Results/Figures diagnostic directories")
     parser.add_argument("--n-workers", type=int, default=N_WORKERS,
@@ -4835,7 +5068,10 @@ def main():
         parser.error("--n-workers must be positive")
     logging.disable(logging.INFO)
     logging.getLogger("mealpy").setLevel(logging.WARNING)
-    run_weight_ablation(args.output_root, args.n_workers, args.validate_only, args.resume)
+    if EXPERIMENT_MODE == "sensitivity_weights":
+        run_weight_ablation(args.output_root, args.n_workers, args.validate_only, args.resume)
+    else:
+        parser.error(f"Unsupported EXP610 experiment mode: {EXPERIMENT_MODE}")
 
 
 if __name__ == "__main__":
