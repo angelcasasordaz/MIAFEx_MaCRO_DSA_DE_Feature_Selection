@@ -1,0 +1,4335 @@
+# MIAFEx + Metaheuristic Feature Selection Framework
+# Standard library imports
+import argparse
+import csv
+import hashlib
+import importlib
+import importlib.util
+import importlib.metadata
+import json
+import logging
+import os
+import pickle
+import sys
+import tempfile
+import time
+import warnings
+
+import scientific_cache
+import miafex_artifacts
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import ExitStack, contextmanager
+from multiprocessing import get_context
+from dataclasses import dataclass
+from pathlib import Path
+import inspect
+from typing import Dict, List
+
+# Third-party imports
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.patheffects as patheffects
+import numpy as np
+import pandas as pd
+from joblib import parallel_config
+from threadpoolctl import threadpool_limits
+from scipy.stats import friedmanchisquare, rankdata, wilcoxon
+from mafese import Data, MhaSelector, get_dataset
+from mafese.utils.mealpy_util import FeatureSelectionProblem
+from mafese.utils.estimator import get_general_estimator
+from mealpy.swarm_based.DMOA import OriginalDMOA
+from sklearn.base import clone
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.neighbors import KNeighborsClassifier
+
+# Local project imports
+from FS.de import jfs as wfs_de_jfs
+from FS.pso import jfs as wfs_pso_jfs
+from FS.macro_de_t_wfs import jfs as wfs_macro_de_t_jfs
+from FS.macro_de_t_v2_wfs import jfs as wfs_macro_de_t_v2_jfs
+from dbo_optimizer import DBOOptimizer
+from dsade_awad_optimizer import DSADE
+from macro_de_optimizer import MaCRO_DE
+from macro_de_t_optimizer import MaCRO_DE_t
+from macro_de_t_v2_optimizer import MaCRO_DE_t_v2
+from corrected_binary import CorrectedTransferBinaryVar, BinaryRespawnBRO, corrected_transfer_binary
+from algorithm_acronym_list import (
+    list_available_optimizers,
+    optimizer_acronym,
+    resolve_optimizer_name,
+)
+
+try:
+    from train_miafex import train_miafex
+    from extract_miafex_features import extract_miafex_features
+    MIAFEX_IMPORT_ERROR = None
+except Exception as exc:
+    train_miafex = None
+    extract_miafex_features = None
+    MIAFEX_IMPORT_ERROR = exc
+
+def available_memory_bytes() -> int | None:
+    """Available RAM (not total RAM), or None if the OS cannot report it."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return max(0, int(line.split()[1]) * 1024)
+    except (OSError, ValueError):
+        pass
+    try:
+        return max(0, int(importlib.import_module("psutil").virtual_memory().available))
+    except (ImportError, AttributeError, OSError, ValueError):
+        pass
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages >= 0 and page_size > 0:
+            return int(pages * page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    return None
+
+def automatic_worker_count() -> int:
+    """Cap workers by usable CPUs and available RAM; always allow one worker."""
+    cpus = os.cpu_count() or 1
+    try:
+        cpus = min(cpus, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    cpu_limit = max(1, int(cpus * AUTO_WORKER_CPU_FRACTION))
+    available = available_memory_bytes()
+    if available is None:
+        return cpu_limit
+    ram_limit = max(1, (available - AUTO_RAM_RESERVE_BYTES) // AUTO_WORKER_RAM_BYTES)
+    return min(cpu_limit, ram_limit)
+
+# User-editable configuration: the full experiment used by PyCharm's Run action.
+# Dataset and pipeline
+DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
+PIPELINE_MODE = "feature_selection"  # Options: "extract", "feature_selection", "full"
+MIAFEX_DATASETS = None
+# ["Brain_MRI"]
+# None: all valid discovered datasets.
+MAFESE_DATASET_SUITE = "test14"
+
+# MIAFEx artifacts and neural-network settings
+MIAFEX_DATASET_ROOT = "datasets"
+MIAFEX_ARTIFACT_TAG = "exp607"  # Neural artifact identity; independent of downstream EXP_ID.
+MIAFEX_CHECKPOINT_ROOT = f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}"
+FEATURE_DATASET_ROOT = f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}"
+MIAFEX_PROVENANCE_ROOT = f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}"
+MIAFEX_TRAIN = "no"  # Comparison consumes existing exp607 artifacts read-only.
+MIAFEX_EXTRACT = "no"
+MIAFEX_EPOCHS = 50  # Neural-network training epochs.
+MIAFEX_BATCH_SIZE = 8
+MIAFEX_LEARNING_RATE = 1e-4
+
+# Feature selection: supported optimizers/classifiers remain available via config/CLI.
+DEFAULT_FITNESS_ALPHA = 0.90
+DEFAULT_FITNESS_BETA = 0.10
+OPTIMIZERS = ["DE", "PSO", "MaCRO-DE-t", "MaCRO-DE-t-v2"]
+ESTIMATORS = ["knn"]
+TRANSFER_FUNCTIONS = ["vstf_01"]
+COMPARISON_ALGORITHMS = ("DE", "PSO", "MaCRO-DE-t", "MaCRO-DE-t-v2")
+COMPARISON_METHODS = tuple(f"{family}-{algorithm}" for family in ("MAFESE", "WFS")
+                           for algorithm in COMPARISON_ALGORITHMS)
+COMPARISON_PAIRS = {algorithm: [f"MAFESE-{algorithm}", f"WFS-{algorithm}"]
+                    for algorithm in COMPARISON_ALGORITHMS}
+WFS_ADAPTERS = {"DE": wfs_de_jfs, "PSO": wfs_pso_jfs,
+                "MaCRO-DE-t": wfs_macro_de_t_jfs, "MaCRO-DE-t-v2": wfs_macro_de_t_v2_jfs}
+MAFESE_REUSE_EXP_ID = 608  # Strictly read-only; never a destination for this comparison.
+WFS_RESUME_VERSION = 1
+WFS_K = 3
+COMPARISON_OUTPUT_NAME = "wfs_methodology_comparison"
+COMPARISON_METRICS = ("Accuracy", "Precision", "Recall", "F1", "SelectedFeatures", "Fitness", "Runtime")
+COMPARISON_COLUMNS = ("Dataset", "Run", "Seed", "Method", *COMPARISON_METRICS, "Source")
+RUNS = 20
+FS_EPOCHS = 200  # Metaheuristic feature-selection iterations.
+POP_SIZE = 30
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+SEED_BASE = 1234
+DSADE_BETA_MIN = 0.2
+DSADE_BETA_MAX = 0.8
+DSADE_PCR = 0.2
+DSADE_MAHAL_Q = 0.68
+MACRO_DE_T_V2_BETA_MIN = 0.10
+MACRO_DE_T_V2_BETA_MAX = 0.60
+MACRO_DE_T_V2_MAHAL_Q = 0.50
+
+# Experiment and cache reuse
+EXP_ID = 609
+REUSE_CACHE = False
+REUSE_CACHE_FROM_EXP_ID = None
+FIGURES_ONLY = False
+REPORT_ONLY = False
+# Scientific versions describe the implementation that actually executes.
+# Bounds/decoding and explicit seeding affect every optimizer, including DE variants.
+BINARY_REPRESENTATION_REVISIONS = {
+    "default": CorrectedTransferBinaryVar.IMPLEMENTATION_REVISION,
+}
+OPTIMIZER_REPAIR_REVISIONS = {"OriginalBRO": BinaryRespawnBRO.IMPLEMENTATION_REVISION}
+SEED_POLICY_REVISION = "explicit-selector-seed-v1"
+WRAPPER_SCIENCE_REVISION = "mafese-prepared-partitions-corrected-binary-seeded-v2"
+PLOT_ESTIMATORS = ["knn", "svm"]  # Figures/reports only; never affects experiments or cache signatures.
+PLOT_GLOBAL_ESTIMATOR = "knn"  # Options: "knn", "svm"; global single-classifier figures only.
+PLOT_GLOBAL_METRIC = "accuracy"  # "accuracy", "precision", "recall", "f1"; figures only.
+FIGURE_LANGUAGE = "en"  # "en", "es"; visible text only, identities/filenames stay unchanged.
+PLOT_COLOR_PALETTE = "dark_classic"
+# Alternatives: "deep", "muted", "tab20_dark", "dark2", "paired", "accent".
+STATISTICAL_METRIC = "f1"  # Matched dataset/classifier blocks; arithmetic run means, independent of plot aggregation.
+PLOT_RUN_AGGREGATION = "best"  # "best", "worst", "mean"; figures only, never cache signatures.
+INDIVIDUAL_POLAR_CURVE_SIZE = (7.0, 5.4)
+
+# Parallelize independent runs; each wrapper uses one native/joblib thread.
+PARALLEL = True
+AUTO_WORKER_CPU_FRACTION = 2 / 3
+# Spawned workers import the full stack (~735 MiB before feature matrices).
+AUTO_WORKER_RAM_BYTES = 1024**3
+AUTO_RAM_RESERVE_BYTES = 512 * 1024**2
+N_WORKERS = automatic_worker_count()  # Also capped by pending runs at execution time.
+PROGRESS_INTERVAL_SECONDS = 60.0
+
+# Backend and output
+DEFAULT_COMPUTE_MODE = "torch-gpu"
+DEFAULT_ML_BACKEND = "auto"
+OUTPUT_ROOT = "."
+
+# Supported values and compatibility aliases (edit the configuration above).
+COMPUTE_MODES = ("cpu", "torch-gpu", "gpu-full")
+ML_BACKENDS = ("auto", "sklearn", "cuml")
+DEFAULT_OPTIMIZERS = OPTIMIZERS
+DEFAULT_ESTIMATORS = ESTIMATORS
+DEFAULT_TRANSFER_FUNCTIONS = TRANSFER_FUNCTIONS
+
+TEST_datasets_clasific_14 = [
+    "BreastCancer",
+    "BreastEW",
+    "Glass",
+    "HeartEW",
+    "Ionosphere",
+    "Lymphography",
+    "Sonar",
+    "SpectEW",
+    "Tic-tac-toe",
+    "Wine",
+    "WaveformEW",
+    "Zoo",
+]
+SUPPORTED_ESTIMATORS = ["knn", "svm", "rf", "adaboost", "xgb", "tree", "ann"]
+SUPPORTED_TRANSFER_FUNCTIONS = [
+    "vstf_01",
+    "vstf_02",
+    "vstf_03",
+    "vstf_04",
+    "sstf_01",
+    "sstf_02",
+    "sstf_03",
+    "sstf_04",
+]
+
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+})
+
+
+# Helper types and validation functions
+@dataclass
+class Paths:
+    exp_tag: str
+    fig_dir: str
+    res_dir: str
+    cache_dir: str
+
+
+@dataclass(frozen=True)
+class BackendAvailability:
+    torch_installed: bool
+    torch_cuda_available: bool
+    gpu_device_name: str | None
+    cupy_available: bool
+    cuml_available: bool
+    torch_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    compute_mode: str
+    requested_ml_backend: str
+    selected_ml_backend: str
+    miafex_device: str
+    availability: BackendAvailability
+
+
+def _module_available(module_name: str) -> bool:
+    """Check an optional dependency without importing or initializing it."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _package_version(distribution_name: str) -> str:
+    try:
+        return importlib.metadata.version(distribution_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def detect_backend_availability() -> BackendAvailability:
+    """Detect GPU capabilities while keeping CuPy and cuML imports lazy."""
+    torch_installed = _module_available("torch")
+    torch_cuda_available = False
+    gpu_device_name = None
+    torch_error = None
+
+    if torch_installed:
+        try:
+            torch = importlib.import_module("torch")
+            torch_cuda_available = bool(torch.cuda.is_available())
+            if torch_cuda_available:
+                gpu_device_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+        except Exception as exc:
+            torch_error = f"{type(exc).__name__}: {exc}"
+
+    return BackendAvailability(
+        torch_installed=torch_installed,
+        torch_cuda_available=torch_cuda_available,
+        gpu_device_name=gpu_device_name,
+        cupy_available=_module_available("cupy"),
+        cuml_available=_module_available("cuml"),
+        torch_error=torch_error,
+    )
+
+
+def resolve_execution_config(args: argparse.Namespace) -> ExecutionConfig:
+    availability = detect_backend_availability()
+    miafex_device = "cpu"
+    if args.compute_mode in {"torch-gpu", "gpu-full"} and availability.torch_cuda_available:
+        miafex_device = "cuda"
+
+    # Keep the established sklearn classifiers until explicit cuML adapters exist.
+    selected_ml_backend = "sklearn" if args.ml_backend == "auto" else args.ml_backend
+    return ExecutionConfig(
+        compute_mode=args.compute_mode,
+        requested_ml_backend=args.ml_backend,
+        selected_ml_backend=selected_ml_backend,
+        miafex_device=miafex_device,
+        availability=availability,
+    )
+
+
+def print_backend_report(config: ExecutionConfig) -> None:
+    availability = config.availability
+    print("=" * 60)
+    print(" Execution backend")
+    print("=" * 60)
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    print(f"{'Python':<24}: {python_version}")
+    for label, distribution_name in (
+        ("NumPy", "numpy"),
+        ("SciPy", "scipy"),
+        ("pandas", "pandas"),
+        ("scikit-learn", "scikit-learn"),
+        ("matplotlib", "matplotlib"),
+        ("MAFESE", "mafese"),
+        ("MEALPY", "mealpy"),
+        ("Permetrics", "permetrics"),
+        ("PyTorch", "torch"),
+        ("torchvision", "torchvision"),
+        ("transformers", "transformers"),
+        ("timm", "timm"),
+    ):
+        print(f"{label:<24}: {_package_version(distribution_name)}")
+    print(f"{'PyTorch CUDA available':<24}: {'yes' if availability.torch_cuda_available else 'no'}")
+    print(f"{'GPU device':<24}: {availability.gpu_device_name or 'none detected'}")
+    print(f"{'CuPy available':<24}: {'yes' if availability.cupy_available else 'no'}")
+    print(f"{'cuML available':<24}: {'yes' if availability.cuml_available else 'no'}")
+    print(f"{'Selected compute mode':<24}: {config.compute_mode}")
+    print(f"{'ML backend request':<24}: {config.requested_ml_backend}")
+    print(f"{'Selected ML backend':<24}: {config.selected_ml_backend}")
+    print(f"{'MIAFEx torch device':<24}: {config.miafex_device}")
+    print(f"{'Feature selection':<24}: CPU (MEALPY/MAFESE unchanged)")
+    print(f"{'Classifier implementation':<24}: sklearn (unchanged)")
+
+    if availability.torch_error:
+        print(f"[backend] PyTorch CUDA detection failed: {availability.torch_error}")
+    if config.compute_mode in {"torch-gpu", "gpu-full"} and not availability.torch_cuda_available:
+        print("[backend] CUDA was requested but is unavailable; using the project's existing CPU fallback.")
+    if config.compute_mode == "gpu-full":
+        if not availability.cupy_available:
+            print("[backend] gpu-full: CuPy is not installed; optional CuPy support is disabled.")
+        if not availability.cuml_available:
+            print("[backend] gpu-full: cuML is not installed; optional cuML support is disabled.")
+        print("[backend] gpu-full is capability-only for now; optimizer and classifier logic is unchanged.")
+    if config.selected_ml_backend == "cuml":
+        print("[backend] cuML was selected as a future backend; classifiers remain sklearn until adapters are implemented.")
+    print("=" * 60)
+
+
+def validate_execution_config(config: ExecutionConfig) -> None:
+    if config.selected_ml_backend != "cuml":
+        return
+    if config.compute_mode != "gpu-full":
+        raise ValueError("--ml-backend cuml requires --compute-mode gpu-full.")
+    if not config.availability.cuml_available:
+        raise RuntimeError(
+            "--ml-backend cuml was requested, but cuML is not installed. "
+            "Select auto/sklearn or install a CUDA-compatible cuML build after checking the driver/CUDA version."
+        )
+    try:
+        importlib.import_module("cuml")
+    except Exception as exc:
+        raise RuntimeError(
+            "--ml-backend cuml was requested and the module was found, but it could not be imported. "
+            "Check that the cuML build matches the NVIDIA driver and CUDA environment."
+        ) from exc
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="MIAFEx feature datasets + MAFESE/MEALPY feature selection",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    general = parser.add_argument_group("General")
+    general.add_argument("--exp-id", type=int, default=EXP_ID, help="ID numerico del experimento")
+    general.add_argument("--output-root", default=OUTPUT_ROOT, help="Raiz para Figures/Results")
+    general.add_argument("--pipeline-mode", default=PIPELINE_MODE, choices=["extract", "feature_selection", "full"],
+                         help="extract: prepare/reuse features only; feature_selection: existing CSVs only; full: both stages")
+
+    dataset = parser.add_argument_group("Dataset")
+    dataset.add_argument("--dataset-source", default=DATASET_SOURCE, choices=["mafese", "miafex"], help="Origen de datasets")
+    dataset.add_argument("--dataset-suite", default=MAFESE_DATASET_SUITE, choices=["test14"], help="Suite de datasets")
+    selection = dataset.add_mutually_exclusive_group()
+    selection.add_argument("--dataset-name", default=None, help="Seleccionar un unico dataset MIAFEx")
+    selection.add_argument("--miafex-datasets", nargs="+", default=MIAFEX_DATASETS,
+                           help="Seleccionar datasets MIAFEx; None usa todos los descubiertos")
+    dataset.add_argument("--features-csv", default=None,
+                         help="Ubicacion legacy: usa train_features.csv y test_features.csv junto a esta ruta; nunca divide un CSV unico")
+    dataset.add_argument("--train-features-csv", default=None, help="Override del CSV de entrenamiento MIAFEx para un unico dataset")
+    dataset.add_argument("--test-features-csv", default=None, help="Override del CSV de prueba MIAFEx para un unico dataset")
+    dataset.add_argument("--list-miafex-datasets", action="store_true", help="Listar datasets de imagenes validos bajo --miafex-dataset-root")
+    dataset.add_argument("--test-size", type=float, default=TEST_SIZE, help="Holdout ratio")
+    dataset.add_argument("--random-state", type=int, default=RANDOM_STATE, help="Semilla de split")
+
+    miafex = parser.add_argument_group("MIAFEx")
+    miafex.add_argument("--dataset-root", default=None, help="Raiz del dataset MIAFEx con subdirectorios train/ y test/")
+    miafex.add_argument("--miafex-dataset-root", default=MIAFEX_DATASET_ROOT, help="Raiz que contiene los datasets de imagenes")
+    miafex.add_argument("--miafex-artifact-tag", default=MIAFEX_ARTIFACT_TAG, help="Version neuronal reutilizable, independiente de EXP_ID")
+    miafex.add_argument("--miafex-checkpoint-root", default=(None if MIAFEX_CHECKPOINT_ROOT == f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}" else MIAFEX_CHECKPOINT_ROOT), help="Override de checkpoints; por defecto checkpoints/miafex_<artifact-tag>")
+    miafex.add_argument("--feature-dataset-root", default=(None if FEATURE_DATASET_ROOT == f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}" else FEATURE_DATASET_ROOT), help="Override de features; por defecto datasets_features/miafex_<artifact-tag>")
+    miafex.add_argument("--miafex-provenance-root", default=(None if MIAFEX_PROVENANCE_ROOT == f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}" else MIAFEX_PROVENANCE_ROOT), help="Override de metadata; por defecto artifact_provenance/miafex_<artifact-tag>")
+    miafex.add_argument("--train-miafex", default=MIAFEX_TRAIN, choices=["auto", "yes", "no"], help="auto: reutilizar checkpoint validado; yes: entrenar version nueva; no: no entrenar")
+    miafex.add_argument("--extract-miafex", default=MIAFEX_EXTRACT, choices=["auto", "yes", "no"], help="auto: reutilizar CSV validado; yes: extraer features nuevas; no: exigir CSV existente")
+    miafex.add_argument("--miafex-output", default=None, help="Override compatible del directorio de checkpoint para un unico dataset")
+    miafex.add_argument("--miafex-epochs", type=int, default=MIAFEX_EPOCHS, help="Epocas de entrenamiento de la red neuronal MIAFEx")
+    miafex.add_argument("--miafex-batch-size", type=int, default=MIAFEX_BATCH_SIZE, help="Batch size para MIAFEx")
+    miafex.add_argument("--miafex-learning-rate", type=float, default=MIAFEX_LEARNING_RATE, help="Learning rate para MIAFEx")
+
+    feature_selection = parser.add_argument_group("Feature Selection")
+    feature_selection.add_argument("--optimizers", nargs="+", default=list(OPTIMIZERS), help="Lista de optimizadores")
+    feature_selection.add_argument("--list-optimizers", action="store_true", help="Listar optimizadores MEALPY/custom disponibles")
+    feature_selection.add_argument("--estimators", nargs="+", default=list(ESTIMATORS), help="Lista de clasificadores")
+    feature_selection.add_argument("--transfer-functions", nargs="+", default=list(TRANSFER_FUNCTIONS), help="Lista de transfer functions")
+    feature_selection.add_argument("--runs", type=int, default=RUNS, help="Ejecuciones independientes por combinacion")
+    feature_selection.add_argument("--epochs", "--fs-epochs", dest="epochs", type=int, default=FS_EPOCHS, help="Iteraciones de seleccion de features (metaheuristica), no epocas MIAFEx")
+    feature_selection.add_argument("--pop-size", type=int, default=POP_SIZE, help="Tamano de poblacion")
+
+    execution = parser.add_argument_group("Execution")
+    execution.add_argument(
+        "--compute-mode",
+        default=DEFAULT_COMPUTE_MODE,
+        choices=COMPUTE_MODES,
+        help="Backend mode: cpu, torch-gpu (recommended), or gpu-full (optional capability detection)",
+    )
+    execution.add_argument(
+        "--ml-backend",
+        default=DEFAULT_ML_BACKEND,
+        choices=ML_BACKENDS,
+        help="ML backend selector; auto preserves sklearn, cuml is a future integration hook",
+    )
+    execution.add_argument(
+        "--show-backends",
+        action="store_true",
+        help="Print Python/GPU/backend availability and exit without running an experiment",
+    )
+    execution.add_argument("--seed-base", type=int, default=SEED_BASE, help="Semilla base por run")
+    execution.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=REUSE_CACHE, help="Usar cache si existe")
+    execution.add_argument("--reuse-cache-from-exp-id", type=lambda value: None if value.lower() == "none" else int(value),
+                           default=REUSE_CACHE_FROM_EXP_ID,
+                           help="EXP fuente de solo lectura si no hay cache actual compatible; 'none' desactiva importacion")
+    execution.add_argument("--figures-only", action="store_true", default=FIGURES_ONLY, help="Regenerar solo graficas desde cache existente")
+    execution.add_argument("--report-only", "--full-replica-report-only", dest="report_only",
+                           action="store_true", default=REPORT_ONLY,
+                           help="Validate completed caches and append a 600 dpi full_repN report; never run science")
+    execution.add_argument("--report-output-root", default=None,
+                           help="Optional destination for full_repN; --output-root remains the cache source")
+    presentation = parser.add_argument_group("Presentation only")
+    presentation.add_argument("--plot-global-estimator", default=PLOT_GLOBAL_ESTIMATOR,
+                              help="Classifier for main numbered figures; must have selected completed results")
+    presentation.add_argument("--plot-global-metric", default=PLOT_GLOBAL_METRIC,
+                              choices=["accuracy", "precision", "recall", "f1"])
+    presentation.add_argument("--figure-language", default=FIGURE_LANGUAGE, choices=["en", "es"])
+    presentation.add_argument("--plot-color-palette", default=PLOT_COLOR_PALETTE,
+                              choices=["dark_classic", "deep", "muted", "tab20_dark", "dark2", "paired", "accent"])
+    presentation.add_argument("--statistical-metric", default=STATISTICAL_METRIC,
+                              choices=["accuracy", "precision", "recall", "f1"])
+    execution.add_argument("--parallel", default="yes" if PARALLEL else "no", choices=["yes", "no"], help="Ejecutar runs en paralelo: yes/no")
+    execution.add_argument("--n-workers", type=int, default=N_WORKERS, help="Maximo de procesos; se limita automaticamente a los runs pendientes")
+
+    macro_dsade = parser.add_argument_group("MaCRO-DE / DSADE")
+    macro_dsade.add_argument("--dsade-beta-min", type=float, default=DSADE_BETA_MIN)
+    macro_dsade.add_argument("--dsade-beta-max", type=float, default=DSADE_BETA_MAX)
+    macro_dsade.add_argument("--dsade-pcr", type=float, default=DSADE_PCR)
+    macro_dsade.add_argument("--dsade-mahal-q", type=float, default=DSADE_MAHAL_Q)
+    macro_v2 = parser.add_argument_group("MaCRO-DE-t-v2 (adaptive pcr)")
+    macro_v2.add_argument("--macro-de-t-v2-beta-min", type=float, default=MACRO_DE_T_V2_BETA_MIN)
+    macro_v2.add_argument("--macro-de-t-v2-beta-max", type=float, default=MACRO_DE_T_V2_BETA_MAX)
+    macro_v2.add_argument("--macro-de-t-v2-mahal-q", type=float, default=MACRO_DE_T_V2_MAHAL_Q)
+    return miafex_artifacts.resolve_roots(parser.parse_args(argv))
+
+def resolve_optimizers(args: argparse.Namespace) -> List[str]:
+    return list(dict.fromkeys(resolve_optimizer_name(name) for name in args.optimizers))
+
+def validate_selection_options(args: argparse.Namespace) -> None:
+    invalid_estimators = [e for e in args.estimators if e not in SUPPORTED_ESTIMATORS]
+    if invalid_estimators:
+        raise ValueError(
+            f"Clasificadores no soportados: {invalid_estimators}. "
+            f"Validos: {', '.join(SUPPORTED_ESTIMATORS)}"
+        )
+    invalid_tf = [tf for tf in args.transfer_functions if tf not in SUPPORTED_TRANSFER_FUNCTIONS]
+    if invalid_tf:
+        raise ValueError(
+            f"Transfer functions no soportadas: {invalid_tf}. "
+            f"Validas: {', '.join(SUPPORTED_TRANSFER_FUNCTIONS)}"
+        )
+
+def make_paths(args: argparse.Namespace, *, exp_id: int | None = None, create: bool = True) -> Paths:
+    exp_tag = f"EXP{args.exp_id if exp_id is None else exp_id:03d}"
+    fig_dir = os.path.join(args.output_root, "Figures", exp_tag)
+    res_dir = os.path.join(args.output_root, "Results", exp_tag)
+    cache_dir = os.path.join(res_dir, "cache")
+    if create:
+        for p in (fig_dir, res_dir, cache_dir):
+            os.makedirs(p, exist_ok=True)
+    return Paths(exp_tag=exp_tag, fig_dir=fig_dir, res_dir=res_dir, cache_dir=cache_dir)
+
+def resolve_mafese_dataset_names(args: argparse.Namespace) -> List[str]:
+    if args.dataset_suite == "test14":
+        return list(TEST_datasets_clasific_14)
+    raise ValueError(f"Suite de datasets no soportada: {args.dataset_suite}")
+
+
+def valid_miafex_dataset(dataset_root: str) -> bool:
+    """Require matching, populated ImageFolder classes in train and test."""
+    class_names = []
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+    for split in ("train", "test"):
+        folder = os.path.join(dataset_root, split)
+        if not os.path.isdir(folder):
+            return False
+        classes = {item.name: item.path for item in os.scandir(folder)
+                   if item.is_dir() and not item.name.startswith(".")}
+        if not classes or any(
+            not any(filename.lower().endswith(image_extensions)
+                    for _, _, files in os.walk(path) for filename in files)
+            for path in classes.values()
+        ):
+            return False
+        class_names.append(set(classes))
+    return class_names[0] == class_names[1]
+
+
+def discover_miafex_datasets(base_dir=MIAFEX_DATASET_ROOT) -> Dict[str, str]:
+    if not os.path.isdir(base_dir):
+        return {}
+
+    discovered = {}
+    for item in os.scandir(base_dir):
+        if not item.is_dir():
+            continue
+        dataset_root = item.path
+        if valid_miafex_dataset(dataset_root):
+            discovered[item.name] = dataset_root
+    return dict(sorted(discovered.items(), key=lambda row: row[0].lower()))
+
+
+def audit_miafex_datasets(args: argparse.Namespace) -> None:
+    """Report prepared image partitions without altering their membership."""
+    selected = [args.dataset_name] if args.dataset_name else args.miafex_datasets
+    if args.dataset_root:
+        roots = {os.path.basename(os.path.normpath(args.dataset_root)): args.dataset_root}
+    elif selected is not None:
+        roots = {name: os.path.join(args.miafex_dataset_root, name) for name in selected}
+    else:
+        roots = ({item.name: item.path for item in os.scandir(args.miafex_dataset_root)
+                  if item.is_dir()} if os.path.isdir(args.miafex_dataset_root) else {})
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+    for name, root in sorted(roots.items(), key=lambda row: row[0].lower()):
+        counts, classes = {}, {}
+        for split in ("train", "test"):
+            folder = os.path.join(root, split)
+            classes[split] = (sorted(item.name for item in os.scandir(folder)
+                                     if item.is_dir() and not item.name.startswith("."))
+                              if os.path.isdir(folder) else [])
+            counts[split] = sum(
+                filename.lower().endswith(image_extensions)
+                for label in classes[split]
+                for _, _, files in os.walk(os.path.join(folder, label))
+                for filename in files
+            )
+        valid = valid_miafex_dataset(root)
+        print(f"[dataset-audit] {name}: train={counts['train']}, test={counts['test']}, "
+              f"classes(train)={classes['train']}, classes(test)={classes['test']}, "
+              f"train/test valid={'yes' if valid else 'no'}, path={os.path.abspath(root)}")
+    if not roots:
+        print(f"[dataset-audit] No dataset folders under {os.path.abspath(args.miafex_dataset_root)}.")
+
+
+def print_miafex_datasets(datasets: Dict[str, str], base_dir=MIAFEX_DATASET_ROOT) -> None:
+    if not datasets:
+        print(f"No MIAFEx image datasets found in: {base_dir}")
+        print()
+        print("Expected structure:")
+        print(os.path.join(base_dir, "DatasetName", "train", "<class>"))
+        print(os.path.join(base_dir, "DatasetName", "test", "<class>"))
+        return
+    print("Available MIAFEx datasets:")
+    for idx, name in enumerate(datasets, start=1):
+        print(f"{idx}. {name}")
+
+
+def resolve_miafex_dataset_root(args: argparse.Namespace) -> None:
+    if args.dataset_root:
+        return
+
+    discovered = discover_miafex_datasets(args.miafex_dataset_root)
+    if args.dataset_name in discovered:
+        args.dataset_root = discovered[args.dataset_name]
+        return
+
+    available = ", ".join(discovered.keys()) if discovered else "none"
+    raise ValueError(
+        f"Dataset MIAFEx '{args.dataset_name}' no encontrado en {args.miafex_dataset_root}. "
+        f"Datasets disponibles: {available}"
+    )
+
+
+def resolve_miafex_dataset_args(args: argparse.Namespace) -> Dict[str, argparse.Namespace]:
+    """Select datasets and scope the existing single-dataset options per dataset."""
+    discovered = discover_miafex_datasets(args.miafex_dataset_root)
+    available = dict(discovered)
+    if args.pipeline_mode == "feature_selection" or args.figures_only:
+        # Feature-only runs can work even when the original images are offline.
+        if os.path.isdir(args.feature_dataset_root):
+            for item in os.scandir(args.feature_dataset_root):
+                if item.is_dir() and all(os.path.isfile(os.path.join(item.path, f"{split}_features.csv"))
+                                        for split in ("train", "test")):
+                    available.setdefault(item.name, os.path.join(args.miafex_dataset_root, item.name))
+
+    selected = [args.dataset_name] if args.dataset_name else args.miafex_datasets
+    if selected is None:
+        selected = ([os.path.basename(os.path.normpath(args.dataset_root))] if args.dataset_root
+                    else sorted(available, key=str.lower))
+    if not selected:
+        raise ValueError(f"No MIAFEx datasets selected or discovered under {args.miafex_dataset_root}.")
+    if any(not isinstance(name, str) or name in {".", ".."} or not name
+           or "/" in name or "\\" in name for name in selected):
+        raise ValueError("MIAFEx dataset selections must be directory names, not paths.")
+    selected = list(dict.fromkeys(selected))
+    if len(selected) != 1 and any((args.dataset_root, args.features_csv, args.train_features_csv,
+                                   args.test_features_csv, args.miafex_output)):
+        raise ValueError("Dataset, feature-CSV and checkpoint directory overrides require a single selected dataset.")
+
+    resolved = {}
+    for name in selected:
+        scoped = argparse.Namespace(**vars(args))
+        scoped.dataset_name = name
+        if not scoped.dataset_root:
+            if name in available:
+                scoped.dataset_root = available[name]
+            elif not (scoped.features_csv or (scoped.train_features_csv and scoped.test_features_csv)) and not args.figures_only:
+                raise ValueError(f"Unknown MIAFEx dataset '{name}'. Available: {', '.join(sorted(available)) or 'none'}")
+            else:
+                scoped.dataset_root = os.path.join(args.miafex_dataset_root, name)
+        scoped.miafex_output = args.miafex_output or os.path.join(args.miafex_checkpoint_root, name)
+        feature_dir = (os.path.dirname(args.features_csv) or ".") if args.features_csv else os.path.join(args.feature_dataset_root, name)
+        scoped.train_features_csv = args.train_features_csv or os.path.join(feature_dir, "train_features.csv")
+        scoped.test_features_csv = args.test_features_csv or os.path.join(feature_dir, "test_features.csv")
+        if os.path.realpath(scoped.train_features_csv) == os.path.realpath(scoped.test_features_csv):
+            raise ValueError("Train and test feature CSVs must have different paths.")
+        scoped.features_csv = args.features_csv or scoped.train_features_csv
+        resolved[name] = scoped
+    return resolved
+
+
+def read_miafex_csv(csv_path: str):
+    if not csv_path:
+        raise ValueError("--features-csv es requerido cuando --dataset-source=miafex")
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV de features no encontrado: {os.path.abspath(csv_path)}")
+
+    try:
+        df = pd.read_csv(csv_path)
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"CSV de features vacio: {os.path.abspath(csv_path)}") from exc
+
+    if df.empty:
+        raise ValueError(f"CSV de features vacio: {os.path.abspath(csv_path)}")
+    if df.shape[1] < 2:
+        raise ValueError("El CSV de MIAFEx debe contener al menos una columna de features y una etiqueta.")
+
+    label_col = "label" if "label" in df.columns else df.columns[-1]
+    y_series = df[label_col]
+    X_df = df.drop(columns=[label_col])
+
+    try:
+        X = X_df.to_numpy(dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError("Las columnas de features del CSV de MIAFEx deben ser numericas.") from exc
+
+    if not np.isfinite(X).all() or y_series.isna().any():
+        raise ValueError(f"Non-finite features or missing labels in: {csv_path}")
+    return X_df, y_series
+
+
+def load_miafex_csv(csv_path: str):
+    """Read an individual CSV; paired partitions use load_miafex_feature_data."""
+    X_df, y_series = read_miafex_csv(csv_path)
+    y_values = y_series.to_numpy()
+    if pd.api.types.is_numeric_dtype(y_series):
+        y = y_values
+    else:
+        y = LabelEncoder().fit_transform(y_values.astype(str))
+
+    classes = np.unique(y)
+    if classes.size < 2:
+        raise ValueError("El CSV de MIAFEx debe contener al menos 2 clases.")
+
+    return X_df.to_numpy(dtype=np.float64), y
+
+
+def miafex_feature_paths(args: argparse.Namespace) -> Dict[str, str]:
+    return {"train": args.train_features_csv, "test": args.test_features_csv}
+
+
+def load_miafex_feature_data(csv_paths: Dict[str, str]) -> Data:
+    """Load the prepared partitions directly; never concatenate or resplit them."""
+    X_train, y_train = read_miafex_csv(csv_paths["train"])
+    X_test, y_test = read_miafex_csv(csv_paths["test"])
+    if list(X_train.columns) != list(X_test.columns):
+        raise ValueError("Train/test feature columns must match in both names and order.")
+    if pd.api.types.is_numeric_dtype(y_train) != pd.api.types.is_numeric_dtype(y_test):
+        raise ValueError("Train/test labels must use the same type and class mapping.")
+    if pd.api.types.is_numeric_dtype(y_train):
+        y_train, y_test = y_train.to_numpy(), y_test.to_numpy()
+        if not np.isfinite(y_train).all() or not np.isfinite(y_test).all():
+            raise ValueError("Train/test labels must be finite.")
+        if not set(np.unique(y_test)).issubset(np.unique(y_train)):
+            raise ValueError("Test labels contain classes absent from the training partition.")
+    else:
+        encoder = LabelEncoder().fit(y_train.astype(str))
+        y_train = encoder.transform(y_train.astype(str))
+        try:
+            y_test = encoder.transform(y_test.astype(str))
+        except ValueError as exc:
+            raise ValueError("Test labels contain classes absent from the training partition.") from exc
+    if np.unique(y_train).size < 2:
+        raise ValueError("The training feature CSV must contain at least two classes.")
+    data = Data()
+    data.set_train_test(
+        X_train=X_train.to_numpy(dtype=np.float64), y_train=y_train,
+        X_test=X_test.to_numpy(dtype=np.float64), y_test=y_test,
+    )
+    return data
+
+
+def resolve_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
+    """Validate one immutable neural version once, outside the FS repetitions."""
+    if args.pipeline_mode == "feature_selection":
+        return _prepare_miafex_csv(args)
+    with miafex_artifacts.artifact_lock(args):
+        return _prepare_miafex_csv(args)
+
+
+def _prepare_miafex_csv(args: argparse.Namespace) -> Dict[str, str]:
+    """Prepare/reuse one dataset using the unchanged trainer and extractor."""
+    csv_paths = miafex_feature_paths(args)
+    missing = [path for path in csv_paths.values() if not os.path.isfile(path)]
+    metadata = miafex_artifacts.validate_existing(args, report=True)
+    if args.pipeline_mode == "feature_selection":
+        if missing:
+            raise FileNotFoundError(
+                f"Prepared train/test feature CSVs missing: {', '.join(missing)}. "
+                "Generate it with --pipeline-mode extract or full first."
+            )
+        if metadata is None:
+            miafex_artifacts.fail(f"features have no provenance for {args.dataset_name}")
+        return csv_paths
+
+    checkpoint_path = os.path.join(args.miafex_output, "miafex_checkpoint.pth")
+    run_training = args.train_miafex == "yes" or (args.train_miafex == "auto" and not os.path.isfile(checkpoint_path))
+    run_extraction = args.extract_miafex == "yes" or (args.extract_miafex == "auto" and bool(missing))
+    if run_training and (os.path.exists(checkpoint_path) or len(missing) != len(csv_paths)):
+        miafex_artifacts.fail(f"TRAIN NEW would replace a checkpoint or invalidate existing features for {args.dataset_name}; use auto/no to reuse")
+    if run_extraction and len(missing) != len(csv_paths):
+        miafex_artifacts.fail(f"EXTRACT NEW would overwrite existing features for {args.dataset_name}; use auto/no to reuse")
+    if not run_extraction and missing:
+        raise FileNotFoundError(f"Prepared feature CSVs missing with --extract-miafex no: {', '.join(missing)}")
+    if run_extraction and not run_training and not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint missing with --train-miafex no: {os.path.abspath(checkpoint_path)}")
+    if run_training or run_extraction:
+        if MIAFEX_IMPORT_ERROR is not None:
+            raise ImportError("MIAFEx training/extraction dependencies could not be imported.") from MIAFEX_IMPORT_ERROR
+        if not valid_miafex_dataset(args.dataset_root):
+            raise ValueError(f"Invalid MIAFEx train/test class folders: {args.dataset_root}")
+        if metadata is None:
+            metadata = miafex_artifacts.new_metadata(args)
+            # Reserve this configuration before any generation. An interrupted
+            # preparation cannot later adopt another configuration under this tag.
+            miafex_artifacts.save_metadata(args, metadata)
+
+    if run_training:
+        print(f"[checkpoint] {args.dataset_name}: TRAIN NEW ({args.miafex_epochs} neural-network epochs)")
+        os.makedirs(args.miafex_output, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".train-", dir=args.miafex_output) as temporary:
+            produced = train_miafex(
+                train_root=os.path.join(args.dataset_root, "train"),
+                output_dir=temporary,
+                num_classes=None,
+                num_epochs=args.miafex_epochs,
+                batch_size=args.miafex_batch_size,
+                learning_rate=args.miafex_learning_rate,
+                device=args.miafex_device,
+            )
+            if not os.path.isfile(produced):
+                raise FileNotFoundError(f"MIAFEx training did not produce a checkpoint: {produced}")
+            for filename in os.listdir(temporary):
+                destination = os.path.join(args.miafex_output, filename)
+                if os.path.exists(destination):
+                    miafex_artifacts.fail(f"training output already exists: {destination}")
+            for filename in os.listdir(temporary):
+                os.replace(os.path.join(temporary, filename), os.path.join(args.miafex_output, filename))
+        miafex_artifacts.record_outputs(args, metadata)
+
+    if run_extraction:
+        # Stage each split separately: the existing extractor writes fixed names.
+        # Publish only after both extractions and their schema checks succeed.
+        with ExitStack() as stack:
+            staged = {}
+            for split, csv_path in csv_paths.items():
+                output_dir = os.path.dirname(csv_path) or "."
+                os.makedirs(output_dir, exist_ok=True)
+                temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix=f".extract-{split}-", dir=output_dir))
+                print(f"[features] {args.dataset_name}: EXTRACT NEW {split}/ -> {csv_path}")
+                staged[split] = extract_miafex_features(
+                    data_dir=os.path.join(args.dataset_root, split),
+                    checkpoint_path=checkpoint_path,
+                    output_dir=temporary,
+                    batch_size=args.miafex_batch_size,
+                    device=args.miafex_device,
+                    run_ml_baselines=False,
+                )
+            load_miafex_feature_data(staged)
+            mappings = []
+            for path in staged.values():
+                mapping_path = os.path.join(os.path.dirname(path), "class_to_idx.json")
+                if os.path.isfile(mapping_path):
+                    with open(mapping_path, encoding="utf-8") as stream:
+                        mappings.append(json.load(stream))
+            if mappings and (len(mappings) != 2 or mappings[0] != mappings[1]):
+                raise ValueError("Train/test extraction class mappings do not match.")
+            for split in staged:
+                output_dir = os.path.dirname(csv_paths[split])
+                for filename in (os.path.basename(csv_paths[split]), f"{split}_features.npy", f"{split}_class_to_idx.json"):
+                    if os.path.exists(os.path.join(output_dir, filename)):
+                        miafex_artifacts.fail(f"extraction output already exists: {os.path.join(output_dir, filename)}")
+            for split, path in staged.items():
+                for original, filename in (("miafex_features.npy", f"{split}_features.npy"),
+                                           ("class_to_idx.json", f"{split}_class_to_idx.json")):
+                    artifact = os.path.join(os.path.dirname(path), original)
+                    if os.path.isfile(artifact):
+                        os.replace(artifact, os.path.join(os.path.dirname(csv_paths[split]), filename))
+                os.replace(path, csv_paths[split])
+        miafex_artifacts.record_outputs(args, metadata)
+
+    return csv_paths
+
+
+class SafeOriginalDMOA(OriginalDMOA):
+    """OriginalDMOA with numerically safe updates for binary feature-selection spaces."""
+
+    def evolve(self, epoch):
+        cf = (1.0 - epoch / self.epoch) ** (2.0 * epoch / self.epoch)
+        fit_list = np.array([agent.target.fitness for agent in self.pop])
+        mean_cost = np.mean(fit_list)
+        fi = np.exp(-fit_list / (mean_cost + self.EPSILON))
+
+        for idx in range(0, self.pop_size):
+            alpha = self.get_index_roulette_wheel_selection(fi)
+            k = self.generator.choice(list(set(range(0, self.pop_size)) - {idx, alpha}))
+            phi = (self.peep / 2) * self.generator.uniform(-1, 1, self.problem.n_dims)
+            new_pos = self.pop[alpha].solution + phi * (self.pop[alpha].solution - self.pop[k].solution)
+            new_pos = self.correct_solution(new_pos)
+            agent = self.generate_agent(new_pos)
+            if self.compare_target(agent.target, self.pop[idx].target, self.problem.minmax):
+                self.pop[idx] = agent
+            else:
+                self.C[idx] += 1
+
+        sm = np.zeros(self.pop_size)
+        for idx in range(0, self.pop_size):
+            k = self.generator.choice(list(set(range(0, self.pop_size)) - {idx}))
+            phi = (self.peep / 2) * self.generator.uniform(-1, 1, self.problem.n_dims)
+            new_pos = self.pop[idx].solution + phi * (self.pop[idx].solution - self.pop[k].solution)
+            new_pos = self.correct_solution(new_pos)
+            agent = self.generate_agent(new_pos)
+            current_fit = self.pop[idx].target.fitness
+            trial_fit = agent.target.fitness
+            denom = max(abs(trial_fit), abs(current_fit), self.EPSILON)
+            sm[idx] = (trial_fit - current_fit) / denom
+            if self.compare_target(agent.target, self.pop[idx].target, self.problem.minmax):
+                self.pop[idx] = agent
+            else:
+                self.C[idx] += 1
+
+        for idx in range(0, self.n_baby_sitter):
+            if self.C[idx] >= self.L:
+                self.pop[idx] = self.generate_agent()
+                self.C[idx] = 0
+
+        new_tau = np.mean(sm)
+        for idx in range(0, self.pop_size):
+            m = np.full(self.problem.n_dims, sm[idx], dtype=float)
+            phi = (self.peep / 2) * self.generator.uniform(-1, 1, self.problem.n_dims)
+            if new_tau > self.tau:
+                new_pos = self.pop[idx].solution - cf * phi * self.generator.random() * (self.pop[idx].solution - m)
+            else:
+                new_pos = self.pop[idx].solution + cf * phi * self.generator.random() * (self.pop[idx].solution - m)
+            self.tau = new_tau
+            new_pos = self.correct_solution(new_pos)
+            self.pop[idx] = self.generate_agent(new_pos)
+
+
+def build_optimizer(name: str, args: argparse.Namespace):
+    resolved_name = resolve_optimizer_name(name)
+    resolved_upper = resolved_name.upper()
+    if resolved_upper in {"DSA-DE", "DSADE"}:
+        return DSADE(
+            epoch=args.epochs,
+            pop_size=args.pop_size,
+            beta_min=args.dsade_beta_min,
+            beta_max=args.dsade_beta_max,
+            pcr=args.dsade_pcr,
+            mahalanobis_q=args.dsade_mahal_q,
+        )
+    if resolved_upper == "MACRO-DE-T-V2":
+        return MaCRO_DE_t_v2(
+            epoch=args.epochs,
+            pop_size=args.pop_size,
+            beta_min=args.macro_de_t_v2_beta_min,
+            beta_max=args.macro_de_t_v2_beta_max,
+            mahalanobis_q=args.macro_de_t_v2_mahal_q,
+        )
+    if resolved_upper == "MACRO-DE-T":
+        return MaCRO_DE_t(
+            epoch=args.epochs,
+            pop_size=args.pop_size,
+            wf=0.5,
+            cr=0.9,
+            mahalanobis_q=args.dsade_mahal_q,
+        )
+    if resolved_upper in {"MACRO-DE", "MACRO_DE"}:
+        return MaCRO_DE(
+            epoch=args.epochs,
+            pop_size=args.pop_size,
+            beta_min=args.dsade_beta_min,
+            beta_max=args.dsade_beta_max,
+            pcr=args.dsade_pcr,
+            mahalanobis_q=args.dsade_mahal_q,
+        )
+    if resolved_upper == "DBO":
+        return DBOOptimizer(epoch=args.epochs, pop_size=args.pop_size)
+    if resolved_upper == "ORIGINALBRO":
+        return BinaryRespawnBRO(epoch=args.epochs, pop_size=args.pop_size)
+    if resolved_upper == "ORIGINALDMOA":
+        return SafeOriginalDMOA(epoch=args.epochs, pop_size=args.pop_size)
+    return resolved_name
+
+def _legacy_cache_settings(args: argparse.Namespace) -> dict:
+    """Original signature fields, retained to locate validated pre-migration caches."""
+    payload = {
+        "dataset_source": args.dataset_source,
+        "dataset_name": args.dataset_name,
+        "features_csv": args.features_csv,
+        "dataset_root": args.dataset_root,
+        "train_miafex": args.train_miafex,
+        "extract_miafex": args.extract_miafex,
+        "miafex_output": args.miafex_output,
+        "miafex_epochs": int(args.miafex_epochs),
+        "miafex_batch_size": int(args.miafex_batch_size),
+        "miafex_learning_rate": float(args.miafex_learning_rate),
+        "optimizers": list(args.optimizers),
+        "transfer_functions": list(args.transfer_functions),
+        "runs": int(args.runs),
+        "epochs": int(args.epochs),
+        "pop_size": int(args.pop_size),
+        "test_size": float(args.test_size),
+        "random_state": int(args.random_state),
+        "seed_base": int(args.seed_base),
+        "obj_name": "AS",
+        "fitness_mode": "minimize_metric_loss_plus_feature_ratio_v1",
+        "dsade_beta_min": float(args.dsade_beta_min),
+        "dsade_beta_max": float(args.dsade_beta_max),
+        "dsade_pcr": float(args.dsade_pcr),
+        "dsade_mahal_q": float(args.dsade_mahal_q),
+    }
+    if args.dataset_source == "miafex":
+        # Do not resume results produced by the obsolete single-CSV resplit flow.
+        payload["miafex_partition_mode"] = "prepared_train_test_v1"
+        payload["train_features_csv"] = args.train_features_csv
+        payload["test_features_csv"] = args.test_features_csv
+    return payload
+
+
+def _hash_cache_settings(payload: dict) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+
+
+def optimizer_implementation_revisions(args: argparse.Namespace) -> dict:
+    revisions = {
+        "DSADE": DSADE.IMPLEMENTATION_REVISION,
+        "MaCRO-DE-t": MaCRO_DE_t.IMPLEMENTATION_REVISION,
+        "MaCRO-DE-t-v2": MaCRO_DE_t_v2.IMPLEMENTATION_REVISION,
+    }
+    resolved = {resolve_optimizer_name(name) for name in args.optimizers}
+    return {name: revision for name, revision in revisions.items() if name in resolved}
+
+
+def build_legacy_group_signature(args: argparse.Namespace) -> str:
+    payload = _legacy_cache_settings(args)
+    # Scheduling, output locations and stage switches do not identify the science.
+    # Keep RUNS and all scientific settings, including the prepared CSV paths.
+    for key in ("train_miafex", "extract_miafex", "miafex_output", "dataset_root", "features_csv"):
+        payload.pop(key)
+    if args.dataset_source == "mafese":
+        payload["dataset_suite"] = args.dataset_suite
+    revisions = optimizer_implementation_revisions(args)
+    if revisions:
+        payload["optimizer_implementation_revisions"] = revisions
+    return _hash_cache_settings(payload)
+
+
+def build_cache_signature(args: argparse.Namespace) -> str:
+    """Display-only request settings; compatibility uses full combination identities."""
+    return _hash_cache_settings({key: getattr(args, key) for key in
+                                ("dataset_source", "dataset_name", "runs", "epochs", "pop_size", "seed_base")})
+
+
+def build_combination_identity(args, dataset, estimator, method, transfer):
+    """Scientific identity independent of experiment ID and selected method lists."""
+    import mealpy
+    from mealpy.utils.space import TransferBinaryVar, BinaryVar
+    method = resolve_optimizer_name(method)
+    custom = {"DSADE": DSADE, "MaCRO-DE": MaCRO_DE, "MaCRO-DE-t": MaCRO_DE_t,
+              "MaCRO-DE-t-v2": MaCRO_DE_t_v2,
+              "DBO": DBOOptimizer, "OriginalDMOA": SafeOriginalDMOA, "OriginalBRO": BinaryRespawnBRO}
+    cls = custom.get(method) or mealpy.get_optimizer_by_class(method)
+    source_hash = lambda obj: hashlib.sha256(inspect.getsource(inspect.unwrap(obj)).encode()).hexdigest()
+    implementation = {
+        "revision": getattr(cls, "IMPLEMENTATION_REVISION", "upstream-v1"),
+        "sources": {f"{base.__module__}.{base.__name__}": source_hash(base)
+                    for base in cls.__mro__ if base is not object},
+        "modules": {base.__module__: scientific_cache.file_digest(inspect.getsourcefile(base))
+                    for base in cls.__mro__ if base is not object},
+    }
+    if method == "MaCRO-DE-t-v2":
+        from macro_de_t_v2_source import macro_de_t_backend, transport
+        from cec_de_mc_cf import compute_backend
+        # Covariance and transport are dependencies outside the optimizer MRO.
+        for module in (macro_de_t_backend, transport, compute_backend):
+            implementation["modules"][module.__name__] = scientific_cache.file_digest(module.__file__)
+        implementation["canonical_name"] = cls.CANONICAL_NAME
+    if args.dataset_source == "miafex":
+        prepared = {split: scientific_cache.file_digest(path)
+                    for split, path in miafex_feature_paths(args).items()}
+    else:
+        data = get_dataset(dataset)
+        if data is None:
+            raise ValueError(f"Cannot identify dataset {dataset}")
+        prepared = {key: scientific_cache.identity_digest(
+            {"shape": list(np.asarray(value).shape), "values": np.asarray(value).tolist()})
+            for key, value in (("X", data.X), ("y", data.y))}
+    parameters = {}
+    if method in {"DSADE", "MaCRO-DE"}:
+        parameters = {key: getattr(args, key) for key in
+                      ("dsade_beta_min", "dsade_beta_max", "dsade_pcr", "dsade_mahal_q")}
+    elif method == "MaCRO-DE-t":
+        parameters = {"wf": 0.5, "cr": 0.9, "dsade_mahal_q": args.dsade_mahal_q}
+    elif method == "MaCRO-DE-t-v2":
+        parameters = {
+            "beta_min": args.macro_de_t_v2_beta_min,
+            "beta_max": args.macro_de_t_v2_beta_max,
+            "mahalanobis_q": args.macro_de_t_v2_mahal_q,
+            "pcr_policy": "0.1 + 0.25 * (1.0 - dM)",
+        }
+    return {
+        "schema": 2, "dataset": dataset, "dataset_source": args.dataset_source,
+        "classifier": estimator.lower(), "optimizer": method, "transfer_function": transfer.lower(),
+        "runs": int(args.runs), "epochs": int(args.epochs), "pop_size": int(args.pop_size),
+        "objective": {"name": "AS", "mode": "minimize_metric_loss_plus_feature_ratio_v1",
+                      "weights": [0.9, 0.1], "source": source_hash(RobustClassificationFeatureSelectionProblem)},
+        "prepared_features": prepared,
+        "partition": {"mode": "prepared_train_test_v1" if args.dataset_source == "miafex" else "mafese_split_v1",
+                      "test_size": args.test_size, "random_state": args.random_state,
+                      "loader_revision": "prepared-label-encoding-v1",
+                      "loader_source": source_hash(load_miafex_feature_data),
+                      "split_source": source_hash(Data.split_train_test)},
+        "seeds": {"base": args.seed_base, "run_seeds": [args.seed_base + r for r in range(args.runs)],
+                  "policy": SEED_POLICY_REVISION,
+                  "selector_seed": "seed_base + run_id", "optimizer_seed": "selector.seed",
+                  "inner_split_random_state": 41},
+        "optimizer_parameters": parameters, "optimizer_implementation": implementation,
+        "binary_representation": {
+            "revision": BINARY_REPRESENTATION_REVISIONS.get(method, BINARY_REPRESENTATION_REVISIONS["default"]),
+            "repair_revision": OPTIMIZER_REPAIR_REVISIONS.get(method, "optimizer-native-v1"),
+            "sources": [source_hash(TransferBinaryVar), source_hash(BinaryVar),
+                        source_hash(CorrectedTransferBinaryVar)],
+        },
+        "wrapper_revision": WRAPPER_SCIENCE_REVISION,
+        "wrapper_sources": {"selector": source_hash(MhaSelector), "estimator": source_hash(get_general_estimator),
+                            "binary_binding": source_hash(corrected_transfer_binary)},
+        "packages": {name: _package_version(name) for name in
+                     ("mealpy", "mafese", "numpy", "scipy", "scikit-learn", "permetrics")},
+    }
+
+
+def legacy_cache_signatures(args: argparse.Namespace) -> List[str]:
+    # Unversioned caches cannot establish which survivor/routing science ran.
+    # This also blocks old progress, cross-EXP imports and figures-only reuse.
+    if optimizer_implementation_revisions(args):
+        return []
+    # These stage switches were execution-only even in the old format. Keep
+    # lookup bounded to hashes we can prove compatible, never arbitrary pickles.
+    payload = _legacy_cache_settings(args)
+    signatures = []
+    for train in dict.fromkeys((args.train_miafex, "auto", "yes", "no")):
+        for extract in dict.fromkeys((args.extract_miafex, "auto", "yes", "no")):
+            signatures.append(_hash_cache_settings(dict(payload, train_miafex=train, extract_miafex=extract)))
+    return signatures
+
+def build_alg_label(method: str, transfer_function: str, classifier: str, show_tf: bool, show_cls: bool) -> str:
+    parts = [method.upper()]
+    if show_tf:
+        parts.append(str(transfer_function).upper())
+    if show_cls:
+        parts.append(classifier.upper())
+    return "_".join(parts)
+
+def muted_color_palette(n: int) -> np.ndarray:
+    cmap = plt.get_cmap("turbo", max(n, 1))
+    colors = cmap(np.arange(max(n, 1)))[:, :3]
+    colors = 0.8 * colors + 0.2
+    return np.clip(colors, 0.0, 1.0)
+
+
+class RobustClassificationFeatureSelectionProblem(FeatureSelectionProblem):
+    """Classification objective that tolerates validation folds missing classes."""
+
+    def __init__(self, bounds=None, minmax=None, data=None, estimator=None, metric_class=None,
+                 obj_name=None, obj_paras=None, fit_weights=(0.9, 0.1), fit_sign=None, **kwargs):
+        super().__init__(
+            bounds=bounds,
+            minmax="min",
+            data=data,
+            estimator=estimator,
+            metric_class=metric_class,
+            obj_name=obj_name,
+            obj_paras=obj_paras,
+            fit_weights=fit_weights,
+            fit_sign=1,
+            **kwargs,
+        )
+
+    def obj_func(self, solution):
+        x = self.decode_solution(solution)["my_var"]
+        cols = np.flatnonzero(x)
+        # take produces C-contiguous subsets directly; sklearn otherwise copies
+        # the Fortran-contiguous advanced-indexing result at every evaluation.
+        self.estimator.fit(np.take(self.data.X_train, cols, axis=1), self.data.y_train)
+        y_valid_pred = self.estimator.predict(np.take(self.data.X_test, cols, axis=1))
+        obj = self._score(self.data.y_test, y_valid_pred)
+        feature_ratio = np.sum(x) / self.n_dims
+        fitness = self.fit_weights[0] * (1.0 - obj) + self.fit_weights[1] * feature_ratio
+        return [fitness, obj, np.sum(x)]
+
+    def _score(self, y_true, y_pred) -> float:
+        metric = str(self.obj_name).upper()
+        average = (self.obj_paras or {}).get("average", "macro")
+        labels = np.unique(np.concatenate((np.asarray(self.data.y_train), np.asarray(y_true), np.asarray(y_pred))))
+
+        if metric == "AS":
+            return float(accuracy_score(y_true, y_pred))
+        if metric == "PS":
+            return float(precision_score(y_true, y_pred, labels=labels, average=average, zero_division=0))
+        if metric == "RS":
+            return float(recall_score(y_true, y_pred, labels=labels, average=average, zero_division=0))
+        if metric == "F1S":
+            return float(f1_score(y_true, y_pred, labels=labels, average=average, zero_division=0))
+
+        evaluator = self.metric_class(y_true, y_pred)
+        try:
+            return float(evaluator.get_metric_by_name(self.obj_name, paras=self.obj_paras)[self.obj_name])
+        except ValueError as err:
+            if "Invalid y_pred" not in str(err):
+                raise
+            paras = dict(self.obj_paras or {})
+            paras["labels"] = labels
+            return float(evaluator.get_metric_by_name(self.obj_name, paras=paras)[self.obj_name])
+
+
+@contextmanager
+def wrapper_resources():
+    """Limit nested CPU pools for fit AND evaluation, restoring them afterwards."""
+    with threadpool_limits(limits=1), parallel_config(n_jobs=1):
+        yield
+
+
+def validate_selector_solution(selector, n_dims: int, seed: int) -> int:
+    """Check the validated winning-mask and seed contract without refitting."""
+    optimizer = selector.optimizer
+    if selector.seed != seed or optimizer.problem.seed != seed:
+        raise ValueError("Selector/problem RNG seed differs from the requested run seed")
+    solution = np.asarray(optimizer.g_best.solution)
+    if solution.shape != (n_dims,) or not np.isin(solution, (0, 1)).all() or not solution.any():
+        raise ValueError("Optimizer winning solution must be a nonempty binary mask")
+    decoded = optimizer.problem.decode_solution(solution)["my_var"]
+    columns = np.flatnonzero(solution)
+    if (not np.array_equal(decoded, solution)
+            or not np.array_equal(selector.selected_feature_solution, solution)
+            or not np.array_equal(selector.selected_feature_masks, solution.astype(bool))
+            or not np.array_equal(selector.selected_feature_indexes, columns)):
+        raise ValueError("Selector mask/indices differ from the optimizer winning solution")
+    if optimizer.g_best.target.objectives[2] != len(columns):
+        raise ValueError("Winning target feature count differs from the selected mask")
+    return len(columns)
+
+
+@wrapper_resources()
+def run_single(data: Data, estimator: str, optimizer_name: str, tf: str, args: argparse.Namespace, seed: int,
+               *, comparison_reporting: bool = False):
+    logging.disable(logging.INFO)
+    np.random.seed(seed)
+    optimizer = build_optimizer(optimizer_name, args)
+    selector_kwargs = dict(
+        problem="classification",
+        estimator=estimator,
+        optimizer=optimizer,
+        optimizer_paras=({"epoch": args.epochs, "pop_size": args.pop_size} if isinstance(optimizer, str) else None),
+        obj_name="AS",
+        seed=int(seed),
+    )
+    init_params = inspect.signature(MhaSelector.__init__).parameters
+    if "transfer_func" in init_params:
+        selector_kwargs["transfer_func"] = tf
+
+    selector = MhaSelector(**selector_kwargs)
+
+    t0 = time.time()
+    fit_params = inspect.signature(selector.fit).parameters
+    fit_kwargs = {}
+    if "transfer_func" in fit_params:
+        fit_kwargs["transfer_func"] = tf
+    if "verbose" in fit_params:
+        fit_kwargs["verbose"] = False
+    if "fs_problem" in fit_params:
+        fit_kwargs["fs_problem"] = RobustClassificationFeatureSelectionProblem
+    # MAFESE's internal fitness validation uses only these training rows.
+    # The prepared test partition is supplied only to final evaluation below.
+    with corrected_transfer_binary():
+        selector.fit(
+            data.X_train, data.y_train,
+            fit_weights=(DEFAULT_FITNESS_ALPHA, DEFAULT_FITNESS_BETA),
+            **fit_kwargs,
+        )
+    runtime = time.time() - t0
+
+    final_best = float(selector.optimizer.g_best.target.fitness)
+    fit_curve = validate_convergence_curve(
+        selector.optimizer.history.list_global_best_fit, args.epochs, final_best,
+    )
+    # Preserve the existing reported fitness; independently check it above.
+    fit_final = float(fit_curve[-1])
+
+    expected_features = validate_selector_solution(selector, data.X_train.shape[1], int(seed))
+    selected = selector.transform(data.X_train)
+    n_features = int(selected.shape[1])
+    if n_features != expected_features:
+        raise ValueError("Transformed training data does not match the winning feature mask")
+
+    if comparison_reporting:
+        # Match Selector.evaluate's full-training refit with the same estimator.
+        # Only the reported averaging changes; selection above is unchanged.
+        est = (get_general_estimator("classification", selector.estimator)
+               if isinstance(selector.estimator, str) else selector.estimator)
+        est.fit(selected, data.y_train)
+        y_pred = est.predict(selector.transform(data.X_test))
+        return {
+            **comparison_scores(data.y_test, y_pred),
+            "SelectedFeatures": n_features,
+            "Fitness": fit_final,
+            "Runtime": runtime,
+        }
+
+    try:
+        metrics = selector.evaluate(estimator=selector.estimator, data=data, metrics=["AS", "PS", "RS", "F1S"])
+        as_test = float(metrics.get("AS_test", np.nan))
+        ps_test = float(metrics.get("PS_test", np.nan))
+        rs_test = float(metrics.get("RS_test", np.nan))
+        f1_test = float(metrics.get("F1S_test", np.nan))
+    except ValueError as err:
+        # Permetrics can fail when y_pred contains labels absent in y_test.
+        if "Invalid y_pred" not in str(err):
+            raise
+        X_train_sel = selector.transform(data.X_train)
+        X_test_sel = selector.transform(data.X_test)
+        if isinstance(selector.estimator, str):
+            est = get_general_estimator("classification", selector.estimator)
+        else:
+            est = clone(selector.estimator)
+        est.fit(X_train_sel, data.y_train)
+        y_pred = est.predict(X_test_sel)
+        labels = np.unique(np.concatenate((np.asarray(data.y_test), np.asarray(y_pred))))
+        as_test = float(accuracy_score(data.y_test, y_pred))
+        ps_test = float(precision_score(data.y_test, y_pred, labels=labels, average="macro", zero_division=0))
+        rs_test = float(recall_score(data.y_test, y_pred, labels=labels, average="macro", zero_division=0))
+        f1_test = float(f1_score(data.y_test, y_pred, labels=labels, average="macro", zero_division=0))
+
+    return {
+        "as_test": 100.0 * as_test,
+        "ps_test": ps_test,
+        "rs_test": rs_test,
+        "f1_test": f1_test,
+        "fit_final": fit_final,
+        "n_features": n_features,
+        "runtime": runtime,
+        "curve": fit_curve,
+        "convergence": convergence_metadata(args.epochs, final_best),
+    }
+
+
+def comparison_scores(y_true, y_pred) -> dict:
+    """Final test reporting only: accuracy in percent, weighted scores in [0, 1]."""
+    return {
+        "Accuracy": 100.0 * float(accuracy_score(y_true, y_pred)),
+        "Precision": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "Recall": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "F1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+    }
+
+
+@wrapper_resources()
+def run_wfs_comparison(data: Data, algorithm: str, args: argparse.Namespace, seed: int) -> dict:
+    """Use the original WFS fold, native objective and threshold without repairs."""
+    jfs = WFS_ADAPTERS[algorithm]
+    X_train, y_train = data.X_train, data.y_train
+    X_test, y_test = data.X_test, data.y_test
+    # Unlike MAFESE, original WFS evaluates candidate masks on the prepared test set.
+    fold = {
+        "xt": X_train,
+        "yt": y_train,
+        "xv": X_test,
+        "yv": y_test,
+    }
+    opts = {"N": args.pop_size, "T": args.epochs, "k": WFS_K, "fold": fold}
+    opts["verbose"] = False
+    if algorithm == "MaCRO-DE-t":
+        opts.update(seed=seed, mahalanobis_q=args.dsade_mahal_q)
+    elif algorithm == "MaCRO-DE-t-v2":
+        opts.update(seed=seed, beta_min=args.macro_de_t_v2_beta_min,
+                    beta_max=args.macro_de_t_v2_beta_max,
+                    mahalanobis_q=args.macro_de_t_v2_mahal_q)
+    np.random.seed(seed)
+    t0 = time.time()
+    result = jfs(X_train, y_train, opts)
+    runtime = time.time() - t0
+    selected = result["sf"]
+    if len(selected) == 0:
+        # Do not replace the native winning mask with a different feature subset.
+        raise ValueError(f"WFS-{algorithm} returned no features for seed {seed}; native final KNN cannot fit.")
+    est = KNeighborsClassifier(n_neighbors=WFS_K)
+    est.fit(X_train[:, selected], y_train)
+    y_pred = est.predict(X_test[:, selected])
+    return {
+        **comparison_scores(y_test, y_pred),
+        "SelectedFeatures": int(result["nf"]),
+        "Fitness": float(result["c"][0, -1]),
+        # Both branches report feature-selection runtime, excluding final evaluation.
+        "Runtime": runtime,
+        "NativeCurve": np.asarray(result["c"]).tolist(),
+        "SelectedFeatureIndexes": np.asarray(selected).tolist(),
+    }
+
+
+def validate_comparison_options(args: argparse.Namespace) -> None:
+    """Keep this entry point on the requested science and isolated EXP609 outputs."""
+    if args.exp_id != 609:
+        raise ValueError("The methodology comparison requires EXP_ID=609.")
+    if args.dataset_source != "miafex" or args.pipeline_mode != "feature_selection":
+        raise ValueError("The comparison requires prepared MIAFEx CSVs in feature_selection mode.")
+    if args.miafex_artifact_tag != "exp607":
+        raise ValueError("The comparison requires the existing exp607 MIAFEx artifacts.")
+    if args.train_miafex != "no" or args.extract_miafex != "no":
+        raise ValueError("The comparison requires --train-miafex no and --extract-miafex no.")
+    if args.reuse_cache or args.reuse_cache_from_exp_id is not None:
+        raise ValueError("Framework cache switches must remain disabled; comparison cache reuse is read-only.")
+    if (args.optimizers != list(COMPARISON_ALGORITHMS) or args.estimators != ["knn"]
+            or args.transfer_functions != ["vstf_01"]):
+        raise ValueError("The comparison requires DE, PSO, MaCRO-DE-t, MaCRO-DE-t-v2, knn and vstf_01.")
+    if args.ml_backend == "cuml":
+        raise ValueError("Both comparison methodologies require their existing scikit-learn estimators.")
+    if (args.runs, args.epochs, args.pop_size, args.seed_base) != (20, 200, 30, 1234):
+        raise ValueError("EXP608 reuse requires runs=20, epochs=200, pop_size=30 and seed_base=1234.")
+    if (DEFAULT_FITNESS_ALPHA, DEFAULT_FITNESS_BETA, WFS_K) != (0.90, 0.10, 3):
+        raise ValueError("The comparison requires MAFESE fitness weights 0.90/0.10 and native WFS k=3.")
+    if "fs_problem" not in inspect.signature(MhaSelector.fit).parameters:
+        raise RuntimeError("Installed MAFESE must support RobustClassificationFeatureSelectionProblem via fs_problem.")
+
+
+def comparison_source_hash(obj) -> str:
+    return hashlib.sha256(inspect.getsource(inspect.unwrap(obj)).encode()).hexdigest()
+
+
+def read_mafese_source(scoped, dataset, algorithm, expected, source):
+    """Read validated native values without modifying or migrating a source cache."""
+    method = f"MAFESE-{algorithm}"
+    context = f"{source} | {dataset} | {method}"
+    before = scientific_cache.file_digest(source)
+    try:
+        entry = load_cache(str(source)) if source.suffix == ".pkl" else json.loads(source.read_text())
+    except (OSError, ValueError, TypeError, EOFError, pickle.UnpicklingError) as exc:
+        raise ValueError(f"{context}: unreadable final cache {source}: {exc}. No recomputation allowed.") from exc
+    if not isinstance(entry, dict) or entry.get("identity") != expected:
+        raise ValueError(f"{context}: scientific identity mismatch; no recomputation allowed.")
+    origins = {str(source): before}
+    if source.suffix == ".pkl":
+        row = entry.get("row")
+    else:
+        sources = entry.get("sources", [])
+        if len(sources) != 1:
+            raise ValueError(f"{context}: missing/ambiguous migrated final source.")
+        origin = sources[0]
+        name = origin["file"]
+        if (os.path.basename(name) != name or "/" in name or "\\" in name
+                or not name.endswith("_results.pkl")):
+            raise ValueError(f"{context}: invalid migrated final filename.")
+        original = source.parent.parent / name
+        digest = scientific_cache.file_digest(original)
+        if digest != origin["sha256"]:
+            raise ValueError(f"{context}: migrated source content changed.")
+        row = load_cache(str(original))[origin["label"]]
+        if scientific_cache.file_digest(original) != digest:
+            raise ValueError(f"{context}: migrated source changed during read.")
+        origins[str(original)] = digest
+    if scientific_cache.file_digest(source) != before:
+        raise ValueError(f"{context}: source changed during read.")
+    if not isinstance(row, dict) or str(row.get("Estimator", "")).lower() != "knn":
+        raise ValueError(f"{context}: estimator mismatch.")
+    ids = completed_run_ids(row)
+    count = len(ids)
+    if (row.get("CompletedRuns") != count or not 0 < count <= scoped.runs
+            or len(set(ids)) != count or not set(ids).issubset(range(scoped.runs))):
+        raise ValueError(f"{context}: invalid completed-run evidence.")
+    run_keys = dict(zip(COMPARISON_METRICS,
+                        ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FeatRuns", "FitRuns", "TimeRuns")))
+    for key in run_keys.values():
+        values = np.asarray(row.get(key, []))
+        if values.shape != (count,) or values.dtype.kind not in "fiu" or not np.isfinite(values).all():
+            raise ValueError(f"{context}: missing/non-finite run array {key}.")
+    invalid, aggregate = cached_convergence_errors(row, scoped.epochs)
+    if invalid or aggregate:
+        raise ValueError(f"{context}: invalid convergence histories: {invalid}; {aggregate}. No recomputation allowed.")
+    records, curves = [], {}
+    for index, run_id in enumerate(ids):
+        record = {"Dataset": dataset, "Run": int(run_id), "Seed": scoped.seed_base + int(run_id),
+                  "Method": method, "Source": f"REUSED:{source}"}
+        # Copy native run values without scaling, rounding, re-averaging or refitting.
+        record.update({metric: row[key][index].item() if isinstance(row[key][index], np.generic)
+                       else row[key][index] for metric, key in run_keys.items()})
+        records.append(record)
+        curves[int(run_id)] = np.asarray(row["CurvesAll"][index], dtype=float).copy()
+    cache_scope = source.parent.parent.parent
+    roots = (Path(scoped.output_root).resolve() / "Results", Path(__file__).resolve().parent / "Results")
+    origin_label = next((str(cache_scope.relative_to(root)) for root in roots
+                         if cache_scope.is_relative_to(root)), str(cache_scope))
+    return records, curves, {"identity": expected, "files": origins,
+                             "origin": origin_label, "metric_averaging": "MAFESE native values preserved unchanged"}
+
+
+def find_mafese_results(scoped, dataset, algorithm):
+    """EXP608 first, then existing caches; require the entire scientific identity.
+
+    Unversioned tables/pickles are never guessed compatible. Valid partial MaCRO
+    envelopes contribute completed runs, so only missing run IDs may execute.
+    DE/PSO require a complete compatible result and are never computed here.
+    """
+    expected = build_combination_identity(scoped, dataset, "knn", algorithm, "vstf_01")
+    preferred = make_paths(scoped, exp_id=MAFESE_REUSE_EXP_ID, create=False)
+    final, progress = scientific_cache.combination_files(preferred, expected)
+    reference = scientific_cache.reference_file(preferred, expected)
+    candidates = [final, reference, progress]
+    digest = scientific_cache.identity_digest(expected)
+    roots = {Path(scoped.output_root).resolve() / "Results", Path(__file__).resolve().parent / "Results"}
+    for root in sorted(roots):
+        if root.is_dir():
+            candidates.extend(sorted(root.glob(f"**/combinations_v2/{digest}_results.pkl")))
+            candidates.extend(sorted(root.glob(f"**/combinations_v2/{digest}_results.json")))
+            candidates.extend(sorted(root.glob(f"**/combinations_v2/{digest}_progress.pkl")))
+    records, curves, files, origins = {}, {}, {}, []
+    seen = set()
+    for candidate in candidates:
+        source = candidate.resolve()
+        if source in seen or not source.is_file():
+            continue
+        seen.add(source)
+        imported, history, info = read_mafese_source(scoped, dataset, algorithm, expected, source)
+        if len(imported) == scoped.runs:
+            return {row["Run"]: row for row in imported}, history, info
+        for row in imported:
+            run = row["Run"]
+            if run not in records:
+                records[run], curves[run] = row, history[run]
+        files.update(info["files"])
+        origins.append(info["origin"])
+    if algorithm in ("DE", "PSO") and len(records) != scoped.runs:
+        raise FileNotFoundError(
+            f"{dataset} | MAFESE-{algorithm}: no complete compatible 20-run cache. "
+            "Exact prepared features, seeds, optimizer parameters/implementation and wrapper science "
+            "are required. DE/PSO recomputation is disabled."
+        )
+    return records, curves, {"identity": expected, "files": files,
+                             "origin": "; ".join(dict.fromkeys(origins)) or "EXP609",
+                             "metric_averaging": "MAFESE native values preserved unchanged"}
+
+
+def wfs_scientific_source_digest(path):
+    """Retain pre-verbosity checkpoint hashes, stripping only our exact print guards.
+
+    All scientific bytes (including line endings) remain part of the identity.
+    functionHO.py and __init__.py use their full file digests separately.
+    """
+    source = Path(path).read_bytes()
+    newline = b"\r\n" if b"\r\n" in source else b"\n"
+    source = source.replace(b'    verbose = opts.get("verbose", True)' + newline, b"")
+    algorithm = Path(path).stem.upper()
+    heading = "Generation" if algorithm == "DE" else "Iteration"
+    for indent in (b"    ", b"        "):
+        prints = (indent + f'print("{heading}:", t + 1)'.encode() + newline
+                  + indent + f'print("Best ({algorithm}):", curve[0,t])'.encode() + newline)
+        guarded = (indent + b"if verbose:" + newline
+                   + b"    " + prints.replace(newline + indent, newline + b"    " + indent))
+        source = source.replace(guarded, prints)
+    return hashlib.sha256(source).hexdigest()
+
+
+def wfs_comparison_identity(scoped, dataset, algorithm) -> dict:
+    """Bind resumable runs to prepared files, native WFS sources and reporting science."""
+    adapter_name = {"DE": "de.py", "PSO": "pso.py", "MaCRO-DE-t": "macro_de_t_wfs.py",
+                    "MaCRO-DE-t-v2": "macro_de_t_v2_wfs.py"}[algorithm]
+    identity = {
+        "schema": WFS_RESUME_VERSION, "dataset": dataset, "method": f"WFS-{algorithm}",
+        "artifact_tag": scoped.miafex_artifact_tag,
+        "prepared_features": {split: {"path": os.path.realpath(path),
+                                      "sha256": scientific_cache.file_digest(path)}
+                              for split, path in miafex_feature_paths(scoped).items()},
+        "loader_source": comparison_source_hash(load_miafex_feature_data),
+        "fold": {"xt": "prepared_train", "yt": "prepared_train_labels",
+                 "xv": "prepared_test", "yv": "prepared_test_labels"},
+        "opts": {"N": scoped.pop_size, "T": scoped.epochs, "k": WFS_K},
+        "objective": {"alpha": 0.99, "beta": 1 - 0.99, "threshold": 0.5},
+        "sources": {name: (wfs_scientific_source_digest if algorithm in ("DE", "PSO") and name == adapter_name
+                           else scientific_cache.file_digest)(Path(__file__).resolve().parent / "FS" / name)
+                    for name in (adapter_name, "functionHO.py", "__init__.py")},
+        "knn_source": comparison_source_hash(KNeighborsClassifier),
+        "packages": {name: _package_version(name) for name in ("numpy", "scipy", "scikit-learn")},
+        "runs": scoped.runs, "seeds": [scoped.seed_base + run for run in range(scoped.runs)],
+        "seed_policy": "numpy.random.seed(seed_base + run_id) before each native jfs call",
+        "reporting": {"average": "weighted", "accuracy": "percent", "runtime": "selection_seconds"},
+    }
+    if algorithm not in ("DE", "PSO"):
+        from mealpy.utils.problem import Problem
+        from mealpy.utils.space import FloatVar
+        from cec_de_mc_cf import compute_backend
+        reference = build_combination_identity(scoped, dataset, "knn", algorithm, "vstf_01")
+        identity["optimizer_implementation"] = reference["optimizer_implementation"]
+        identity["optimizer_parameters"] = reference["optimizer_parameters"]
+        identity["sources"]["macro_de_t_wfs.py"] = scientific_cache.file_digest(
+            Path(__file__).resolve().parent / "FS" / "macro_de_t_wfs.py")
+        identity["sources"]["cec_de_mc_cf.compute_backend"] = scientific_cache.file_digest(compute_backend.__file__)
+        identity["binary_interface"] = {"bounds": [0.0, 1.0], "mask": "position > 0.5",
+                                        "FloatVar": comparison_source_hash(FloatVar),
+                                        "Problem": comparison_source_hash(Problem)}
+        identity["packages"]["mealpy"] = _package_version("mealpy")
+        identity["seed_policy"] = "native optimizer.solve(mode=single, seed=seed_base + run_id); no extra draws"
+        identity["stopping"] = "native solve loop: T epochs; no added termination"
+    return identity
+
+
+def validate_wfs_checkpoint(entry, identity, run_id):
+    context = f"{identity['dataset']} | {identity['method']} | run {run_id}"
+    if (not isinstance(entry, dict) or entry.get("schema") != WFS_RESUME_VERSION
+            or entry.get("identity") != identity):
+        raise ValueError(f"{context}: incompatible WFS checkpoint; it will not be overwritten or rerun.")
+    row = entry.get("row", {})
+    if not isinstance(row, dict):
+        raise ValueError(f"{context}: missing raw result row.")
+    expected = {"Dataset": identity["dataset"], "Method": identity["method"], "Run": run_id,
+                "Seed": identity["seeds"][run_id], "Source": "EXP609_WFS"}
+    if any(row.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"{context}: invalid checkpoint run/seed/source identity.")
+    if any(not isinstance(row.get(key), (int, float)) or not np.isfinite(row[key])
+           for key in COMPARISON_METRICS):
+        raise ValueError(f"{context}: invalid raw metrics.")
+    if (not 0 <= row["Accuracy"] <= 100 or any(not 0 <= row[key] <= 1
+            for key in ("Precision", "Recall", "F1", "Fitness")) or row["Runtime"] < 0):
+        raise ValueError(f"{context}: raw metrics outside their valid ranges.")
+    selected = entry.get("selected_features", [])
+    if (not selected or any(type(index) is not int or index < 0 for index in selected)
+            or len(set(selected)) != len(selected) or row["SelectedFeatures"] != len(selected)):
+        raise ValueError(f"{context}: selected-feature evidence does not match the raw result.")
+    native = np.asarray(entry.get("native_c", []), dtype=float)
+    if native.shape != (1, identity["opts"]["T"]):
+        raise ValueError(f"{context}: missing native WFS convergence history; no rerun allowed.")
+    curve = validate_convergence_curve(native[0], identity["opts"]["T"], row["Fitness"])
+    return dict(row), curve
+
+
+def read_wfs_checkpoints(res_dir, identity):
+    records, curves = {}, {}
+    for run_id in range(identity["runs"]):
+        path = wfs_checkpoint_path(res_dir, identity, run_id)
+        reject_comparison_redirect(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            entry = json.loads(open_read_text(path))
+            records[run_id], curves[run_id] = validate_wfs_checkpoint(entry, identity, run_id)
+        except (OSError, TypeError, KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid saved WFS run at {path}: {exc}. Preserved; no automatic rerun.") from exc
+    return records, curves
+
+
+def open_read_text(path):
+    with open(path, encoding="utf-8") as stream:
+        return stream.read()
+
+
+def wfs_checkpoint_path(res_dir, identity, run_id):
+    return os.path.join(res_dir, "wfs_runs", identity["dataset"], identity["method"], f"run_{run_id:03d}.json")
+
+
+def inspect_existing_comparison_csv(raw_csv, saved, mafese_saved):
+    """Preserve completed local runs and reject rows lacking scientific evidence."""
+    if not os.path.exists(raw_csv):
+        return
+    with open(raw_csv, newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        for row in reader:
+            if row.get("Method") in tuple(f"WFS-{algorithm}" for algorithm in COMPARISON_ALGORITHMS):
+                checkpoint_records = saved
+            elif row.get("Method") in COMPARISON_METHODS and row.get("Source") == "EXP609_MAFESE":
+                checkpoint_records = mafese_saved
+            else:
+                continue  # Legacy MAFESE rows require a validated scientific source.
+            key = row.get("Dataset"), row["Method"]
+            if key not in checkpoint_records:
+                continue  # Unselected datasets remain preserved in the archived CSV.
+            try:
+                run_id = int(row["Run"])
+                recorded = checkpoint_records[key][0].get(run_id)
+                if recorded is None:
+                    raise ValueError("completed CSV row has no identity/native-curve checkpoint")
+                if int(row["Seed"]) != recorded["Seed"] or any(
+                        float(row[metric]) != recorded[metric] for metric in COMPARISON_METRICS):
+                    raise ValueError("CSV values disagree with the saved run checkpoint")
+            except (TypeError, KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"Preserving existing comparison result {key}, run={row.get('Run')}: {exc}. "
+                    "Restore its recorded scientific metadata/native curve before resuming; this run will not be restarted."
+                ) from exc
+
+
+def atomic_comparison_csv(path, frame):
+    if os.path.islink(path):
+        raise ValueError(f"Comparison CSV must not redirect through a symlink: {path}")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8", delete=False,
+                                         dir=os.path.dirname(path), prefix=".comparison-", suffix=".tmp") as stream:
+            temporary = stream.name
+            frame.to_csv(stream, index=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_comparison_tables(res_dir, rows):
+    # Rebuilt from read-only MAFESE sources and durable WFS checkpoints, never a restart cache.
+    frame = pd.DataFrame(rows, columns=COMPARISON_COLUMNS)
+    order = {method: index for index, method in enumerate(COMPARISON_METHODS)}
+    frame = frame.assign(_method_order=frame["Method"].map(order)).sort_values(
+        ["Dataset", "Run", "_method_order"], kind="stable").drop(columns="_method_order")
+    atomic_comparison_csv(os.path.join(res_dir, "per_run_results.csv"), frame)
+    summary = frame.groupby(["Dataset", "Method"], sort=False)[list(COMPARISON_METRICS)].agg(["mean", "std"])
+    summary.columns = [f"{metric}_{stat.title()}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+    origins = frame.groupby(["Dataset", "Method"], sort=False)["Source"].agg(
+        lambda values: "; ".join(dict.fromkeys(values))).reset_index()
+    summary = summary.merge(origins, on=["Dataset", "Method"], how="left", validate="one_to_one")
+    summary["Pair"] = summary["Method"].str.split("-", n=1).str[1]
+    atomic_comparison_csv(os.path.join(res_dir, "summary.csv"), summary)
+
+
+def plot_methodology_comparison(fig_dir, dataset, records, histories, epochs):
+    """Use saved histories only; fitness axes are separate for the two methodologies."""
+    colors = dict(zip(COMPARISON_METHODS,
+                      ("#245781", "#16817A", "#654982", "#536D22",
+                       "#B65336", "#A98016", "#9B4265", "#476D79")))
+    style = {"font.family": "DejaVu Sans", "font.size": 10, "axes.titlesize": 12,
+             "axes.labelsize": 10, "pdf.fonttype": 42, "ps.fonttype": 42,
+             "savefig.dpi": 600, "axes.spines.top": False, "axes.spines.right": False}
+
+    def publish(fig, name):
+        try:
+            for extension in ("png", "pdf"):
+                path = os.path.join(fig_dir, f"{dataset}_{name}.{extension}")
+                if os.path.islink(path):
+                    raise ValueError(f"Comparison figure must not redirect through a symlink: {path}")
+                fig.savefig(path, bbox_inches="tight")
+        finally:
+            plt.close(fig)
+
+    with plt.rc_context(style):
+        for method in COMPARISON_METHODS:
+            curves = np.stack([validate_convergence_curve(histories[method][run], epochs)
+                               for run in range(20)])
+            mean, std = curves.mean(axis=0), curves.std(axis=0, ddof=1)
+            iterations = np.arange(1, epochs + 1)
+            fig, ax = plt.subplots(figsize=(7.2, 4.5), layout="constrained")
+            ax.plot(iterations, mean, color=colors[method], linewidth=2, label=method)
+            ax.fill_between(iterations, mean - std, mean + std,
+                            color=colors[method], alpha=0.12, linewidth=0)
+            ax.set(title=f"{dataset} — {method} convergence (20 runs)", xlabel="Iteration",
+                   ylabel=f"Native {method.split('-', 1)[0]} fitness (mean ± SD)", xlim=(1, epochs))
+            ax.grid(axis="y", color="#D7D7D7", linewidth=0.6, alpha=0.65)
+            publish(fig, f"{method.lower().replace('-', '_')}_convergence")
+
+        for family in ("WFS", "MAFESE"):
+            methods = [method for method in COMPARISON_METHODS if method.startswith(f"{family}-")]
+            fig, ax = plt.subplots(figsize=(8.5, 4.8), layout="constrained")
+            for method in methods:
+                curves = np.stack([validate_convergence_curve(histories[method][run], epochs)
+                                   for run in range(20)])
+                mean, std = curves.mean(axis=0), curves.std(axis=0, ddof=1)
+                iterations = np.arange(1, epochs + 1)
+                ax.plot(iterations, mean, label=method, color=colors[method], linewidth=2)
+                ax.fill_between(iterations, mean - std, mean + std, color=colors[method], alpha=0.12, linewidth=0)
+            ax.set(title=f"{dataset} — {family} convergence (20 runs)", xlabel="Iteration",
+                   ylabel=f"Native {family} fitness (mean ± SD)", xlim=(1, epochs))
+            ax.grid(axis="y", color="#D7D7D7", linewidth=0.6, alpha=0.65)
+            ax.legend(frameon=False)
+            publish(fig, f"{family.lower()}_convergence")
+
+        frame = pd.DataFrame(records)
+        def draw_metric(ax, metric, label):
+            values = [frame.loc[frame["Method"] == method, metric].to_numpy(dtype=float)
+                      for method in COMPARISON_METHODS]
+            x = np.arange(len(COMPARISON_METHODS))
+            ax.bar(x, [v.mean() for v in values], yerr=[v.std(ddof=1) for v in values],
+                   color=[colors[method] for method in COMPARISON_METHODS], alpha=0.85,
+                   capsize=4, width=0.65, error_kw={"elinewidth": 1})
+            for index, observations in enumerate(values):
+                ax.scatter(index + np.linspace(-0.20, 0.20, len(observations)), observations,
+                           s=12, color="#222222", alpha=0.5, linewidths=0, zorder=3)
+            ax.set_xticks(x, COMPARISON_METHODS, rotation=35, ha="right", fontsize=8)
+            ax.set_ylabel(label)
+            ax.grid(axis="y", color="#D7D7D7", linewidth=0.6, alpha=0.65)
+            ax.set_axisbelow(True)
+
+        metrics = (("Accuracy", "Accuracy (%)"), ("F1", "F1 score"),
+                   ("SelectedFeatures", "Selected features"), ("Runtime", "Selection runtime (s)"))
+        for metric, label in metrics:
+            fig, ax = plt.subplots(figsize=(10, 5.6), layout="constrained")
+            draw_metric(ax, metric, label)
+            ax.set_title(f"{dataset} — {label} (20 runs; mean ± SD)")
+            publish(fig, f"comparison_{metric.lower()}")
+
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10), layout="constrained")
+        for ax, (metric, label) in zip(axes.flat, metrics):
+            draw_metric(ax, metric, label)
+        fig.suptitle(f"{dataset} — final methodology comparison (20 runs; mean ± SD)")
+        publish(fig, "final_comparison")
+
+
+def mafese_checkpoint_path(res_dir, dataset, method, run_id):
+    return os.path.join(res_dir, "mafese_runs", dataset, method, f"run_{run_id:03d}.json")
+
+
+def validate_mafese_checkpoint(entry, identity, method, run_id):
+    """Require full MAFESE identity and independent native convergence evidence."""
+    context = f"{identity['dataset']} | {method} | run {run_id}"
+    if (not isinstance(entry, dict) or entry.get("schema") != WFS_RESUME_VERSION
+            or entry.get("identity") != identity):
+        raise ValueError(f"{context}: incompatible MAFESE checkpoint; preserved without rerun.")
+    row = entry.get("row", {})
+    expected = {"Dataset": identity["dataset"], "Method": method, "Run": run_id,
+                "Seed": identity["seeds"]["run_seeds"][run_id], "Source": "EXP609_MAFESE"}
+    if not isinstance(row, dict) or any(row.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"{context}: invalid run/seed/source evidence.")
+    if any(not isinstance(row.get(key), (int, float)) or not np.isfinite(row[key])
+           for key in COMPARISON_METRICS):
+        raise ValueError(f"{context}: invalid raw metrics.")
+    if (not 0 <= row["Accuracy"] <= 100 or any(not 0 <= row[key] <= 1
+            for key in ("Precision", "Recall", "F1", "Fitness")) or row["Runtime"] < 0
+            or type(row["SelectedFeatures"]) is not int or row["SelectedFeatures"] <= 0):
+        raise ValueError(f"{context}: raw metrics outside their valid ranges.")
+    curve = validate_convergence_curve(entry.get("native_c", []), identity["epochs"], row["Fitness"])
+    validate_convergence_metadata(entry.get("convergence"), curve, identity["epochs"])
+    return dict(row), curve
+
+
+def reject_comparison_redirect(path):
+    absolute = Path(path).absolute()
+    if any(part.is_symlink() for part in (absolute, *absolute.parents)):
+        raise ValueError(f"Comparison output must not redirect through symlinks: {path}")
+
+
+def read_mafese_checkpoints(res_dir, dataset, method, identity):
+    records, curves, files = {}, {}, {}
+    for run in range(identity["runs"]):
+        path = mafese_checkpoint_path(res_dir, dataset, method, run)
+        reject_comparison_redirect(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            records[run], curves[run] = validate_mafese_checkpoint(
+                json.loads(open_read_text(path)), identity, method, run)
+        except (OSError, TypeError, KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid MAFESE run at {path}: {exc}. Preserved; no automatic rerun.") from exc
+        files[path] = scientific_cache.file_digest(path)
+    return records, curves, files
+
+
+def print_comparison_result(dataset, method, run, runs, row):
+    print(f"[{dataset}] {method} | run {run + 1:02d}/{runs} | "
+          f"Acc={row['Accuracy']:.2f}% | F1={row['F1']:.4f} | "
+          f"Features={row['SelectedFeatures']} | Fitness={row['Fitness']:.4f} | "
+          f"Time={row['Runtime']:.1f}s", flush=True)
+
+
+def run_methodology_comparison(args: argparse.Namespace) -> None:
+    validate_comparison_options(args)
+    dataset_args = resolve_miafex_dataset_args(args)
+    csv_paths = {name: resolve_miafex_csv(scoped) for name, scoped in dataset_args.items()}
+    exp_tag = f"EXP{args.exp_id:03d}"
+    res_dir = os.path.join(args.output_root, "Results", exp_tag, COMPARISON_OUTPUT_NAME)
+    fig_dir = os.path.join(args.output_root, "Figures", exp_tag, COMPARISON_OUTPUT_NAME)
+    raw_csv = os.path.join(res_dir, "per_run_results.csv")
+    for destination in (res_dir, fig_dir):
+        reject_comparison_redirect(destination)
+
+    rows, histories, mafese_sources, identities, saved = [], {}, {}, {}, {}
+    mafese_saved = {}
+    # Search/validate every source and checkpoint before any computation or output.
+    for dataset, scoped in dataset_args.items():
+        histories[dataset], mafese_sources[dataset] = {}, {}
+        for algorithm in COMPARISON_ALGORITHMS:
+            method = f"MAFESE-{algorithm}"
+            imported, curves, source = find_mafese_results(scoped, dataset, algorithm)
+            if algorithm not in ("DE", "PSO"):
+                local, local_curves, files = read_mafese_checkpoints(
+                    res_dir, dataset, method, source["identity"])
+                for run, row in local.items():
+                    if run in imported and (any(imported[run][metric] != row[metric]
+                                               for metric in COMPARISON_METRICS)
+                                            or not np.array_equal(curves[run], local_curves[run])):
+                        raise ValueError(f"{dataset}/{method}/{run}: conflicting compatible run evidence; preserved.")
+                    if run not in imported:
+                        imported[run], curves[run] = row, local_curves[run]
+                source["files"].update(files)
+                if files and "EXP609" not in source["origin"]:
+                    source["origin"] += "; EXP609"
+            rows.extend(imported.values())
+            histories[dataset][method] = curves
+            mafese_sources[dataset][method] = source
+            mafese_saved[dataset, method] = imported, curves
+        for algorithm in COMPARISON_ALGORITHMS:
+            identity = wfs_comparison_identity(scoped, dataset, algorithm)
+            key = dataset, identity["method"]
+            identities[key] = identity
+            checkpoint_dir = Path(wfs_checkpoint_path(res_dir, identity, 0)).parent.absolute()
+            if any(part.is_symlink() for part in (checkpoint_dir, *checkpoint_dir.parents)):
+                raise ValueError(f"WFS checkpoint directory must not redirect through symlinks: {checkpoint_dir}")
+            saved[key] = read_wfs_checkpoints(res_dir, identity)
+            records, curves = saved[key]
+            rows.extend(records.values())
+            histories[dataset][identity["method"]] = curves
+    inspect_existing_comparison_csv(raw_csv, saved, mafese_saved)
+    missing = [(dataset, method, run) for (dataset, method), (records, _) in {**saved, **mafese_saved}.items()
+               for run in range(args.runs) if run not in records]
+    if (args.figures_only or args.report_only) and missing:
+        raise ValueError(f"Reporting needs completed results for all eight methods; missing {missing}. No optimization in reporting mode.")
+
+    for destination in (res_dir, fig_dir):
+        os.makedirs(destination, exist_ok=True)
+    # Preserve the entire previous raw CSV byte-for-byte, including legacy/unselected rows.
+    if os.path.isfile(raw_csv):
+        with open(raw_csv, "rb") as stream:
+            previous = stream.read()
+        archive = os.path.join(res_dir, f"previous_per_run_results_{hashlib.sha256(previous).hexdigest()}.csv")
+        if not os.path.exists(archive):
+            with open(archive, "xb") as stream:
+                stream.write(previous)
+                stream.flush()
+                os.fsync(stream.fileno())
+    def publish_saved_outputs():
+        for name in ("comparison_manifest.json", "convergence_histories.json", "summary.csv", "per_run_results.csv"):
+            reject_comparison_redirect(os.path.join(res_dir, name))
+        scientific_cache.atomic_json(os.path.join(res_dir, "comparison_manifest.json"), {
+            "schema": WFS_RESUME_VERSION, "experiment": exp_tag, "methods": COMPARISON_METHODS,
+            "method_pairs": COMPARISON_PAIRS, "mafese_sources": mafese_sources,
+            "wfs_identities": {dataset: {f"WFS-{algorithm}": identities[dataset, f"WFS-{algorithm}"]
+                                        for algorithm in COMPARISON_ALGORITHMS} for dataset in dataset_args},
+            "fitness_note": "MAFESE and WFS raw fitness/convergence are methodology-specific and not directly comparable.",
+            "metrics_note": "MAFESE native values/averaging are preserved (including new runs). WFS Precision/Recall/F1 use weighted averaging.",
+            "adapters_note": "Original MaCRO search dynamics execute unchanged; only WFS evaluation, binary interface and output format are adapted.",
+            "std": "sample standard deviation (ddof=1)",
+        })
+        scientific_cache.atomic_json(os.path.join(res_dir, "convergence_histories.json"), {
+            "method_pairs": COMPARISON_PAIRS,
+            "histories": {dataset: {method: {str(run): np.asarray(curve).tolist()
+                                             for run, curve in curves.items()}
+                                    for method, curves in methods.items()}
+                          for dataset, methods in histories.items()},
+            "note": "Native samples only; fitness scales remain separate by methodology.",
+        })
+        write_comparison_tables(res_dir, rows)
+
+    publish_saved_outputs()
+    print("MAFESE native values/averaging are preserved; WFS reports weighted Precision/Recall/F1.")
+    print("Fitness and convergence are methodology-specific; their raw values are not directly comparable.")
+    for dataset, scoped in dataset_args.items():
+        data = None  # Load prepared partitions only when a permitted run is missing.
+        for algorithm in COMPARISON_ALGORITHMS:
+            method = f"MAFESE-{algorithm}"
+            records, curves = mafese_saved[dataset, method]
+            source = mafese_sources[dataset][method]
+            if records:
+                print(f"[{dataset}] {method} | REUSE {source['origin']} | {len(records)}/{args.runs} runs", flush=True)
+            for run_id in range(args.runs):
+                if run_id in records:
+                    continue
+                if algorithm in ("DE", "PSO"):
+                    raise RuntimeError("MAFESE-DE/PSO recomputation is disabled")
+                if data is None:
+                    data = load_miafex_feature_data(csv_paths[dataset])
+                seed = args.seed_base + run_id
+                print(f"[{dataset}] {method} | run {run_id + 1:02d}/{args.runs} | seed={seed}", flush=True)
+                result = run_single(data, "knn", algorithm, "vstf_01", scoped, seed)
+                metric_keys = ("as_test", "ps_test", "rs_test", "f1_test", "n_features", "fit_final", "runtime")
+                row = {"Dataset": dataset, "Run": run_id, "Seed": seed, "Method": method,
+                       "Source": "EXP609_MAFESE",
+                       **{metric: result[key] for metric, key in zip(COMPARISON_METRICS, metric_keys)}}
+                entry = {"schema": WFS_RESUME_VERSION, "identity": source["identity"], "row": row,
+                         "native_c": np.asarray(result["curve"]).tolist(), "convergence": result["convergence"]}
+                validated, curve = validate_mafese_checkpoint(entry, source["identity"], method, run_id)
+                checkpoint = mafese_checkpoint_path(res_dir, dataset, method, run_id)
+                reject_comparison_redirect(checkpoint)
+                if os.path.exists(checkpoint):
+                    raise FileExistsError(f"MAFESE checkpoint appeared during execution; preserving {checkpoint}.")
+                scientific_cache.atomic_json(checkpoint, entry)
+                records[run_id], curves[run_id] = validated, curve
+                source["files"][checkpoint] = scientific_cache.file_digest(checkpoint)
+                if "EXP609" not in source["origin"]:
+                    source["origin"] += "; EXP609"
+                rows.append(validated)
+                publish_saved_outputs()
+                print_comparison_result(dataset, method, run_id, args.runs, row)
+        for algorithm in COMPARISON_ALGORITHMS:
+            method = f"WFS-{algorithm}"
+            records, curves = saved[dataset, method]
+            if records:
+                print(f"[{dataset}] {method} | REUSE EXP609 | {len(records)}/20 runs", flush=True)
+            identity = identities[dataset, method]
+            # Completed checkpoints (including WFS-DE run 01) never enter the pool.
+            pending_runs = [run_id for run_id in range(args.runs) if run_id not in records]
+            if not pending_runs:
+                continue
+            if data is None:
+                data = load_miafex_feature_data(csv_paths[dataset])
+
+            def checkpoint_wfs_run(run_id, result):
+                seed = scoped.seed_base + run_id
+                row = {"Dataset": dataset, "Run": run_id, "Seed": seed, "Method": method,
+                       "Source": "EXP609_WFS", **{metric: result[metric] for metric in COMPARISON_METRICS}}
+                entry = {"schema": WFS_RESUME_VERSION, "identity": identity, "row": row,
+                         "native_c": result["NativeCurve"], "selected_features": result["SelectedFeatureIndexes"]}
+                validated, curve = validate_wfs_checkpoint(entry, identity, run_id)
+                # Durable native curve + result are the commit point, before any derived CSV/report.
+                checkpoint = wfs_checkpoint_path(res_dir, identity, run_id)
+                reject_comparison_redirect(checkpoint)
+                if os.path.exists(checkpoint):
+                    raise FileExistsError(f"WFS checkpoint appeared during execution; preserving {checkpoint}.")
+                scientific_cache.atomic_json(checkpoint, entry)
+                records[run_id], curves[run_id] = validated, curve
+                rows.append(validated)
+                publish_saved_outputs()
+                print_comparison_result(dataset, method, run_id, args.runs, row)
+
+            # Block until this method's pool finishes before advancing to the next.
+            execute_pending_runs(
+                data, "knn", algorithm, "vstf_01", scoped, pending_runs,
+                on_run_complete=checkpoint_wfs_run, dataset_name=dataset,
+                completed_runs=len(records), wfs=True,
+            )
+        dataset_rows = [row for row in rows if row["Dataset"] == dataset]
+        means = pd.DataFrame(dataset_rows).groupby("Method")[["Accuracy", "F1", "SelectedFeatures", "Runtime"]].mean()
+        print(f"\n[{dataset}] Mean over {args.runs} runs")
+        print(f"  {'Method':<24} {'Accuracy':>10} {'F1':>8} {'SelectedFeatures':>17} {'Runtime':>10}")
+        for method in COMPARISON_METHODS:
+            print(f"  {method:<24} {means.loc[method, 'Accuracy']:9.2f}% "
+                  f"{means.loc[method, 'F1']:8.4f} {means.loc[method, 'SelectedFeatures']:17.2f} "
+                  f"{means.loc[method, 'Runtime']:9.1f}s")
+        print(flush=True)
+        plot_methodology_comparison(fig_dir, dataset, dataset_rows, histories[dataset], args.epochs)
+    print(f"Per-run CSV: {raw_csv}")
+    print(f"Summary CSV: {os.path.join(res_dir, 'summary.csv')}")
+    print(f"Figures (600 dpi PNG + vector PDF): {fig_dir}")
+
+
+_RUN_WORKER_DATA_SPLIT = None
+_RUN_WORKER_THREAD_LIMIT = None
+
+
+def initialize_run_worker(data_split):
+    """Install immutable dataset arrays once per spawned CPU worker."""
+    global _RUN_WORKER_DATA_SPLIT, _RUN_WORKER_THREAD_LIMIT
+    _RUN_WORKER_DATA_SPLIT = {}
+    for name, values in data_split.items():
+        array = np.asarray(values).view()
+        array.flags.writeable = False
+        _RUN_WORKER_DATA_SPLIT[name] = array
+    _RUN_WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
+
+
+def run_single_parallel_task(task: dict):
+    # Direct legacy callers may still supply their split; pool tasks never do.
+    data_split = task.get("data_split", _RUN_WORKER_DATA_SPLIT)
+    if data_split is None:
+        raise RuntimeError("Run worker has not been initialized with a dataset.")
+    data = Data()
+    data.set_train_test(
+        X_train=data_split["X_train"],
+        y_train=data_split["y_train"],
+        X_test=data_split["X_test"],
+        y_test=data_split["y_test"],
+    )
+    if task.get("wfs", False):
+        print(f"[{task['dataset_name']}] WFS-{task['method']} | "
+              f"run {task['run'] + 1:02d}/{task['args'].runs} | seed={task['seed']}", flush=True)
+        out = run_wfs_comparison(data, task["method"], task["args"], task["seed"])
+    else:
+        out = run_single(
+            data,
+            task["estimator"],
+            task["method"],
+            task["tf"],
+            task["args"],
+            task["seed"],
+        )
+    return task["run"], out
+
+
+def execute_pending_runs(
+    data: Data,
+    estimator: str,
+    method: str,
+    tf: str,
+    args: argparse.Namespace,
+    pending_runs: List[int],
+    on_run_complete=None,
+    dataset_name: str = "",
+    completed_runs: int = 0,
+    started_at: float | None = None,
+    wfs: bool = False,
+):
+    if args.parallel != "yes" or len(pending_runs) <= 1:
+        completed = []
+        for run in pending_runs:
+            if wfs:
+                seed = args.seed_base + run
+                print(f"[{dataset_name}] WFS-{method} | run {run + 1:02d}/{args.runs} | seed={seed}", flush=True)
+                item = (run, run_wfs_comparison(data, method, args, seed))
+            else:
+                item = (run, run_single(data, estimator, method, tf, args, args.seed_base + run))
+            if on_run_complete is not None:
+                on_run_complete(*item)
+            completed.append(item)
+        return completed
+
+    data_split = {
+        "X_train": data.X_train,
+        "y_train": data.y_train,
+        "X_test": data.X_test,
+        "y_test": data.y_test,
+    }
+    max_workers = min(args.n_workers, len(pending_runs))
+    tasks = [
+        {
+            "run": run,
+            "estimator": estimator,
+            "method": method,
+            "tf": tf,
+            "args": args,
+            "seed": args.seed_base + run,
+            "wfs": wfs,
+            "dataset_name": dataset_name,
+        }
+        for run in pending_runs
+    ]
+    completed = []
+    started_at = time.monotonic() if started_at is None else started_at
+    next_heartbeat = time.monotonic() + PROGRESS_INTERVAL_SECONDS
+    progress_label = f"WFS-{method}" if wfs else build_alg_label(
+        optimizer_display_label(method), tf, estimator, len(args.transfer_functions) > 1, True,
+    )
+    # Forking after PyTorch/OpenMP initialization can inherit locked native pools.
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=get_context("spawn"),
+                             initializer=initialize_run_worker, initargs=(data_split,)) as executor:
+        futures = {executor.submit(run_single_parallel_task, task) for task in tasks}
+        worker_failure = None
+        while futures:
+            ready, _ = wait(
+                futures, timeout=max(0.0, next_heartbeat - time.monotonic()),
+                return_when=FIRST_COMPLETED,
+            )
+            failure = None
+            for future in ready:
+                futures.remove(future)
+                try:
+                    item = future.result()
+                except Exception as exc:
+                    failure = exc
+                    continue
+                if on_run_complete is not None:
+                    on_run_complete(*item)
+                completed.append(item)
+            # Save successful completions in this batch before propagating a worker failure.
+            if failure is not None:
+                if not wfs:
+                    raise failure
+                # Drain the WFS pool so successful in-flight runs are checkpointed
+                # even if another independent run fails. Never retry a failed run here.
+                if worker_failure is None:
+                    worker_failure = failure
+            now = time.monotonic()
+            if futures and now >= next_heartbeat:
+                # ProcessPoolExecutor marks prefetched work as running too; cap by worker slots.
+                active = min(max_workers, len(futures))
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] PROGRESS | {dataset_name} | {progress_label} | "
+                    f"completed={completed_runs + len(completed)}/{args.runs} | active={active} | "
+                    f"pending={len(futures) - active} | elapsed={format_elapsed(now - started_at)} | status=running",
+                    flush=True,
+                )
+                next_heartbeat = now + PROGRESS_INTERVAL_SECONDS
+        if worker_failure is not None:
+            raise worker_failure
+    return sorted(completed, key=lambda item: item[0])
+
+
+def format_elapsed(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def format_run_ids(run_ids: List[int]) -> str:
+    """Display zero-based cache IDs as compact, one-based run ranges."""
+    ranges = []
+    for run in sorted(run_ids):
+        if ranges and run == ranges[-1][1] + 1:
+            ranges[-1][1] = run
+        else:
+            ranges.append([run, run])
+    return ",".join(str(start + 1) if start == end else f"{start + 1}..{end + 1}"
+                    for start, end in ranges) or "none"
+
+
+def completed_run_ids(payload: dict) -> List[int]:
+    """Legacy checkpoints contain a contiguous prefix; new ones identify each row."""
+    count = len(payload.get("AccRuns", []))
+    run_ids = list(payload.get("CompletedRunIDs", range(count)))
+    if (len(run_ids) != count or any(not isinstance(run, (int, np.integer)) or run < 0 for run in run_ids)
+            or len(set(run_ids)) != len(run_ids)):
+        raise ValueError("Invalid checkpoint: CompletedRunIDs must uniquely identify every result row.")
+    return run_ids
+
+
+CONVERGENCE_VERSION = 1  # Per-run evidence only; deliberately outside scientific signatures.
+
+
+def convergence_metadata(epochs: int, final_best: float) -> dict:
+    return {
+        "version": CONVERGENCE_VERSION,
+        "epochs": epochs,
+        "history_source": "optimizer.history.list_global_best_fit",
+        "final_best_source": "optimizer.g_best.target.fitness",
+        "final_best": float(final_best),
+    }
+
+
+def validate_convergence_curve(curve, epochs: int, final_best=None) -> np.ndarray:
+    """Validate without padding, truncating, smoothing or correcting fitness."""
+    curve = np.asarray(curve, dtype=float)
+    if epochs < 1 or curve.shape != (epochs,):
+        raise ValueError(f"curve shape {curve.shape}; expected ({epochs},), non-empty")
+    if not np.isfinite(curve).all():
+        raise ValueError("curve contains non-finite values")
+    if np.any(np.diff(curve) > 0):
+        raise ValueError("minimization best-so-far curve increases")
+    if final_best is not None:
+        final_best = float(final_best)
+        if not np.isfinite(final_best) or curve[-1] != final_best:
+            raise ValueError(f"curve endpoint {curve[-1]} does not match final fitness {final_best}")
+    return curve.copy()
+
+
+def validate_convergence_metadata(metadata, curve, epochs):
+    if not isinstance(metadata, dict):
+        raise ValueError("missing independent convergence evidence")
+    expected = convergence_metadata(epochs, 0.0)
+    if any(metadata.get(key) != value for key, value in expected.items() if key != "final_best"):
+        raise ValueError("unsupported or inconsistent convergence metadata")
+    if metadata.get("final_best") is None:
+        raise ValueError("missing independent final-best value")
+    validate_convergence_curve(curve, epochs, metadata["final_best"])
+
+
+def pad_mean_curves(curves: List[np.ndarray], target_len: int) -> np.ndarray:
+    """Compatibility name: strict mean of validated, equal-length histories."""
+    if len(curves) == 0:
+        raise ValueError("cannot average an empty collection of convergence curves")
+    validated = [validate_convergence_curve(curve, target_len) for curve in curves]
+    return np.mean(np.stack(validated), axis=0)
+
+
+def cached_convergence_errors(row: dict, epochs: int) -> tuple[dict, list]:
+    """Return per-run failures and aggregate failures; legacy evidence is optional."""
+    ids = completed_run_ids(row)
+    curves = row.get("CurvesAll", [])
+    fitness = row.get("FitRuns", [])
+    evidence = row.get("ConvergenceRuns", {})
+    if not isinstance(evidence, dict) or set(evidence) - set(ids):
+        raise ValueError("ConvergenceRuns must map recorded run IDs to evidence")
+    if len(curves) > len(ids):
+        raise ValueError("extra individual curves cannot be aligned with run IDs")
+    for key in ("PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns"):
+        if len(row.get(key, [])) > len(ids):
+            raise ValueError(f"extra {key} entries cannot be aligned with run IDs")
+    invalid = {}
+    for index, run in enumerate(ids):
+        try:
+            # Keep all cached metrics aligned when recovering a particular run.
+            for key in ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns"):
+                if index >= len(row.get(key, [])):
+                    raise ValueError(f"missing {key} entry")
+            if index >= len(curves):
+                raise ValueError("missing individual curve")
+            if fitness[index] is None:
+                raise ValueError("missing FitRuns value")
+            validate_convergence_curve(curves[index], epochs, fitness[index])
+            if run in evidence:
+                validate_convergence_metadata(evidence[run], curves[index], epochs)
+        except (TypeError, ValueError, OverflowError) as exc:
+            invalid[run] = str(exc)
+    aggregate = []
+    if not ids:
+        aggregate.append("no individual curves stored")
+    elif not invalid:
+        try:
+            mean = pad_mean_curves(curves, epochs)
+            stored = validate_convergence_curve(row.get("Curve", []), epochs)
+            if not np.array_equal(stored, mean):
+                raise ValueError("stored Curve differs from mean of individual curves")
+            mean_fitness = float(np.mean(fitness))
+            if not np.isclose(stored[-1], mean_fitness, rtol=1e-12, atol=1e-15):
+                raise ValueError("mean curve endpoint differs from mean FitRuns")
+            if not np.isclose(row.get("FitMean", np.nan), mean_fitness, rtol=1e-12, atol=1e-15):
+                raise ValueError("FitMean differs from mean FitRuns")
+        except (TypeError, ValueError, OverflowError) as exc:
+            aggregate.append(str(exc))
+    return invalid, aggregate
+
+
+def report_cached_convergence(payload, epochs, context, *, figures_only=False):
+    problems = []
+    for label, row in payload.items():
+        try:
+            invalid, aggregate = cached_convergence_errors(row, epochs)
+            problems.extend(f"{label} run {run + 1}: {reason}" for run, reason in invalid.items())
+            problems.extend(f"{label}: {reason}" for reason in aggregate)
+        except (TypeError, ValueError) as exc:
+            problems.append(f"{label}: {exc}")
+    if problems:
+        message = f"Invalid convergence cache ({context}): " + "; ".join(problems)
+        if figures_only:
+            raise ValueError(message + ". FIGURES_ONLY will not rerun or rewrite cached runs.")
+        print(f"[convergence-cache] {message}", flush=True)
+    return bool(problems)
+
+
+def prepare_cached_convergence(row, epochs):
+    """Keep valid rows, remove only invalid run IDs, rebuild derived aggregates."""
+    if not row:
+        return row
+    invalid, aggregate = cached_convergence_errors(row, epochs)
+    if not invalid and not aggregate:
+        return row
+    ids = completed_run_ids(row)
+    keep = [index for index, run in enumerate(ids) if run not in invalid]
+    if not keep:
+        return {}
+    kept_ids = [ids[index] for index in keep]
+    return build_label_payload(
+        row["Estimator"],
+        *[[row[key][index] for index in keep] for key in (
+            "AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns", "CurvesAll",
+        )], epochs, completed_run_ids=kept_ids,
+        convergence_runs={run: meta for run, meta in row.get("ConvergenceRuns", {}).items() if run in kept_ids},
+    )
+
+def build_label_payload(
+    estimator: str,
+    acc_runs: List[float],
+    ps_runs: List[float],
+    rs_runs: List[float],
+    f1_runs: List[float],
+    fit_runs: List[float],
+    feat_runs: List[float],
+    time_runs: List[float],
+    curves: List[np.ndarray],
+    epochs: int,
+    completed_run_ids: List[int] | None = None,
+    convergence_runs: dict | None = None,
+):
+    if any(len(values) != len(acc_runs) for values in
+           (ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves)):
+        raise ValueError("run metrics and individual curves must have equal counts")
+    if completed_run_ids is not None:
+        # Completion order must not change the scientific aggregation or exported run order.
+        order = np.argsort(completed_run_ids)
+        acc_runs, ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves = (
+            [values[i] for i in order]
+            for values in (acc_runs, ps_runs, rs_runs, f1_runs, fit_runs, feat_runs, time_runs, curves)
+        )
+    curve_mean = pad_mean_curves(curves, epochs)
+    payload = {
+        "Estimator": estimator,
+        "AccMean": float(np.nanmean(acc_runs)),
+        "F1Mean": float(np.nanmean(f1_runs)),
+        "PSMean": float(np.nanmean(ps_runs)),
+        "RSMean": float(np.nanmean(rs_runs)),
+        "FitMean": float(np.nanmean(fit_runs)),
+        "FeatMean": float(np.nanmean(feat_runs)),
+        "TimeMean": float(np.nanmean(time_runs)),
+        "AccBest": float(np.nanmax(acc_runs)),
+        "AccRuns": np.array(acc_runs, dtype=float),
+        "F1Runs": np.array(f1_runs, dtype=float),
+        "PSRuns": np.array(ps_runs, dtype=float),
+        "RSRuns": np.array(rs_runs, dtype=float),
+        "FitRuns": np.array(fit_runs, dtype=float),
+        "FeatRuns": np.array(feat_runs, dtype=float),
+        "TimeRuns": np.array(time_runs, dtype=float),
+        "Curve": curve_mean,
+        "CurvesAll": curves,
+        "CompletedRuns": len(acc_runs),
+    }
+    if completed_run_ids is not None:
+        payload["CompletedRunIDs"] = sorted(completed_run_ids)
+    if convergence_runs:
+        # Only newly executed runs carry independent evidence, including mixed caches.
+        payload["ConvergenceRuns"] = dict(convergence_runs)
+    invalid, aggregate = cached_convergence_errors(payload, epochs)
+    if invalid or aggregate:
+        raise ValueError(f"Invalid convergence payload: runs={invalid}; aggregates={aggregate}")
+    return payload
+
+def save_cache(path: str, payload: dict):
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=os.path.dirname(os.path.abspath(path)),
+            prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            pickle.dump(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+def load_cache(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def load_cache_safe(path: str, label: str):
+    if not os.path.exists(path):
+        return None
+    try:
+        return load_cache(path)
+    except Exception as exc:
+        print(f"[cache-warning] No se pudo cargar {label} '{path}': {exc}")
+        return None
+
+
+def cache_files(paths: Paths, dataset_name: str, estimator: str, signature: str) -> tuple[str, str]:
+    prefix = os.path.join(paths.cache_dir, f"{paths.exp_tag}_{dataset_name}_{estimator.lower()}_{signature}")
+    return f"{prefix}_results.pkl", f"{prefix}_progress.pkl"
+
+
+def save_combination(paths, identity, row):
+    """Publish one scientific combination with its identity, atomically."""
+    final, progress = scientific_cache.combination_files(paths, identity)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"identity": identity, "row": row}
+    save_cache(str(progress), entry)
+    save_cache(str(final), entry)
+
+
+def merge_cached_runs(rows, epochs):
+    """Union run IDs; earlier (current EXP/progress) valid evidence wins ties."""
+    if not rows:
+        return None
+    # Preserve the original row and all aggregates exactly when it covers the union.
+    ids = [set(completed_run_ids(row)) for row in rows]
+    union = set.union(*ids)
+    if (ids[0] == union and not any(cached_convergence_errors(rows[0], epochs))) or all(
+            pickle.dumps(row) == pickle.dumps(rows[0]) for row in rows[1:]):
+        return rows[0]
+    selected = {}
+    for row in rows:
+        invalid, _ = cached_convergence_errors(row, epochs)
+        for index, run in enumerate(completed_run_ids(row)):
+            if run not in invalid:
+                selected.setdefault(run, (row, index))
+    if not selected:
+        return rows[0]  # Existing convergence validation reports/repairs invalid runs.
+    ordered = sorted(selected)
+    keys = ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns", "CurvesAll")
+    return build_label_payload(
+        rows[0]["Estimator"],
+        *[[selected[run][0][key][selected[run][1]] for run in ordered] for key in keys],
+        epochs, completed_run_ids=ordered,
+        convergence_runs={run: selected[run][0]["ConvergenceRuns"][run] for run in ordered
+                          if run in selected[run][0].get("ConvergenceRuns", {})},
+    )
+
+
+def resolve_cached_payload(paths: Paths, args: argparse.Namespace, dataset_name: str,
+                           estimator: str, signature: str = "", *, figures_only: bool = False):
+    """Resolve each requested combination independently; source is always read-only.
+
+    Unversioned group caches require explicit migration. Never infer compatibility
+    from a filename, the current optimizer list, or an experiment number.
+    """
+    use_final = args.reuse_cache or figures_only
+    source_id = args.reuse_cache_from_exp_id
+    source = None
+    payload = {}
+    for method in args.optimizers:
+        for transfer in args.transfer_functions:
+            label = build_alg_label(method, transfer, estimator,
+                                    len(args.transfer_functions) > 1, len(args.estimators) > 1)
+            context = f"{dataset_name} / {estimator} / {method} / {transfer}"
+            try:
+                identity = build_combination_identity(args, dataset_name, estimator, method, transfer)
+            except FileNotFoundError as exc:
+                print(f"CACHE MISS | {context} | prepared feature identity unavailable: {exc}", flush=True)
+                continue
+            required = set(range(args.runs))
+
+            def read_rows(location, final=True):
+                rows = []
+                for candidate in scientific_cache.read_candidates(location, identity, use_final=final):
+                    try:
+                        if candidate.get("Estimator", "").lower() != estimator.lower():
+                            raise ValueError("classifier does not match identity")
+                        if not set(completed_run_ids(candidate)).issubset(required):
+                            raise ValueError("run IDs are outside the identity's seed schedule")
+                        cached_convergence_errors(candidate, args.epochs)
+                        rows.append(candidate)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        print(f"[cache-warning] {location.exp_tag} / {context}: {exc}", flush=True)
+                return rows
+
+            candidates = read_rows(paths, use_final)
+            row = merge_cached_runs(candidates, args.epochs)
+            complete = row is not None and required.issubset(completed_run_ids(row)) and not any(
+                cached_convergence_errors(row, args.epochs))
+            imported = False
+            if not complete and use_final and source_id is not None and source_id != args.exp_id:
+                if source is None:
+                    source = make_paths(args, exp_id=source_id, create=False)
+                extra = read_rows(source)
+                if extra:
+                    merged = merge_cached_runs([*candidates, *extra], args.epochs)
+                    imported = row is None or pickle.dumps(merged) != pickle.dumps(row)
+                    row = merged
+            if row is None:
+                print(f"CACHE MISS | {paths.exp_tag} | {context}", flush=True)
+                continue
+            report_cached_convergence({label: row}, args.epochs, context, figures_only=figures_only)
+            if imported and not figures_only:
+                save_combination(paths, identity, row)
+            status = f"CACHE IMPORTED | {source.exp_tag} -> {paths.exp_tag}" if imported else f"CACHE HIT CURRENT | {paths.exp_tag}"
+            print(f"{status} | {context}", flush=True)
+            missing = sorted(required - set(completed_run_ids(row)))
+            if missing:
+                print(f"CACHE MISSING RUNS | {context} | {format_run_ids(missing)}", flush=True)
+            payload[label] = row
+    return payload or None
+
+
+def load_results_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str],
+                            *, statistical_results: Dict[str, Dict] | None = None) -> Dict[str, Dict]:
+    results_struct = {}
+    missing = []
+    metadata_args = argparse.Namespace(**vars(args))
+    metadata_args.figures_only = True
+    dataset_args = resolve_miafex_dataset_args(metadata_args) if args.dataset_source == "miafex" else {}
+    for dataset_name in dataset_names:
+        results_struct[dataset_name] = {}
+        if statistical_results is not None:
+            statistical_results[dataset_name] = {}
+        dataset_cache_sig = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
+        for estimator in args.estimators:
+            payload = resolve_cached_payload(
+                paths, dataset_args.get(dataset_name, args), dataset_name, estimator, dataset_cache_sig,
+                figures_only=True,
+            )
+            if payload is None:
+                missing.append(f"{dataset_name}/{estimator}")
+                continue
+            results_struct[dataset_name].update(payload)
+            if statistical_results is not None:
+                statistical_results[dataset_name].update(statistical_classifier_rows(payload, estimator, args))
+
+    if missing:
+        print("[figures-only] Missing dataset/classifier results: " + ", ".join(missing), flush=True)
+    if not any(results_struct.values()):
+        raise FileNotFoundError("No compatible combinations available; FIGURES_ONLY never runs experiments.")
+    return results_struct
+
+def payload_completed_runs(payload: dict) -> int:
+    total = 0
+    for row in payload.values():
+        if not isinstance(row, dict):
+            continue
+        total += (len(row["CompletedRunIDs"]) if "CompletedRunIDs" in row
+                  else int(row.get("CompletedRuns", len(row.get("AccRuns", [])))))
+    return total
+
+
+def experiment_cache_is_complete(paths, args, dataset_names, cache_sig, dataset_args=None):
+    """Check requested run IDs in compatible current-EXP caches, never source EXPs."""
+    if not dataset_names or not args.optimizers or not args.estimators or not args.transfer_functions or args.runs < 1:
+        return False
+    required_ids = set(range(args.runs))
+    run_keys = ("AccRuns", "PSRuns", "RSRuns", "F1Runs", "FitRuns", "FeatRuns", "TimeRuns")
+    for dataset in dataset_names:
+        scoped = argparse.Namespace(**vars((dataset_args or {}).get(dataset, args)))
+        scoped.reuse_cache_from_exp_id = None
+        signature = cache_sig[dataset] if isinstance(cache_sig, dict) else cache_sig
+        for classifier in args.estimators:
+            payload = resolve_cached_payload(paths, scoped, dataset, classifier, signature)
+            if not payload:
+                return False
+            groups = statistical_run_groups(
+                {dataset: statistical_classifier_rows(payload, classifier, args)}, [dataset], args,
+            )
+            for method in args.optimizers:
+                for transfer in args.transfer_functions:
+                    rows = groups.get((dataset, (optimizer_acronym(method), classifier.lower(), transfer.lower())), [])
+                    complete = False
+                    for row in rows:
+                        try:
+                            ids = completed_run_ids(row)
+                            complete = required_ids.issubset(ids) and all(
+                                len(row.get(key, [])) == len(ids) for key in run_keys
+                            )
+                            invalid, aggregate = cached_convergence_errors(row, args.epochs)
+                            complete = complete and not invalid and not aggregate
+                        except (TypeError, ValueError):
+                            complete = False
+                        if complete:
+                            break
+                    if not complete:
+                        return False
+    return True
+
+
+def parse_result_label(label: str, args: argparse.Namespace) -> dict:
+    """Decode cached METHOD[_TRANSFER][_CLASSIFIER] independently of OPTIMIZERS."""
+    method = str(label).strip()
+    estimator = ""
+    classifiers = set(SUPPORTED_ESTIMATORS) | {str(e).lower() for e in args.estimators}
+    for est in sorted(classifiers, key=lambda value: (-len(value), value)):
+        suffix = f"_{est.upper()}"
+        if method.upper().endswith(suffix):
+            estimator = est.lower()
+            method = method[:-len(suffix)]
+            break
+
+    transfer_function = ""
+    for tf in sorted(SUPPORTED_TRANSFER_FUNCTIONS, key=len, reverse=True):
+        suffix = f"_{tf.upper()}"
+        if method.upper().endswith(suffix):
+            transfer_function = tf.lower()
+            method = method[:-len(suffix)]
+            break
+
+    # Resolve aliases through the full registry, not the current experiment list.
+    try:
+        method = resolve_optimizer_name(method)
+    except ValueError:
+        # Preserve unrecognized cached identities rather than guessing another method.
+        pass
+    return {"method": method, "transfer_function": transfer_function, "estimator": estimator}
+
+
+def optimizer_display_label(name: str) -> str:
+    return optimizer_acronym(name)
+
+
+def optimizer_plot_color(name: str) -> str:
+    """Central presentation palette; stable across subsets and all figure types."""
+    from full_plot_style import palette
+    return palette([name], PLOT_COLOR_PALETTE)[name]
+
+
+def optimizer_plot_style(name: str) -> dict:
+    """Central deterministic presentation line/marker styles."""
+    from full_plot_style import line_style
+    return line_style(name)
+
+
+def _macro_t_underlay(line):
+    """Outline the existing artist without adding or modifying curve samples."""
+    line.set_path_effects([
+        patheffects.Stroke(linewidth=line.get_linewidth() + 0.6, foreground="black"),
+        patheffects.Normal(),
+    ])
+
+
+def optimizer_order_key(name: str) -> tuple:
+    label = optimizer_display_label(name).upper()
+    if label == "MACRO-DE":
+        return (0, "")
+    if label in {"DSA-DE", "DSADE"}:
+        return (1, "")
+    if label == "MACRO-DE-T":
+        return (2, "")
+    if label == "MACRO-DE-T-V2":
+        return (2, "v2")
+    return (3, label)
+
+def is_dsade_method(name: str) -> bool:
+    return str(name).upper() in {"MACRO-DE", "MACRO-DE-T", "MACRO-DE-T-V2", "DSA-DE", "DSADE", "DSA_DE"}
+
+def is_exact_dsade_method(name: str) -> bool:
+    return str(name).upper() in {"DSA-DE", "DSADE", "DSA_DE"}
+
+def prepare_plot_groups(df: pd.DataFrame, opt_order: List[str]) -> tuple[pd.DataFrame, List[str], Dict[str, str], Dict[str, str]]:
+    if df.empty:
+        return df.copy(), [], {}, {}
+
+    plot_df = df.copy()
+    if "FuncionTransferencia" not in plot_df.columns:
+        plot_df["FuncionTransferencia"] = ""
+    plot_df["FuncionTransferencia"] = plot_df["FuncionTransferencia"].fillna("").astype(str).str.lower()
+
+    tf_counts = plot_df[plot_df["FuncionTransferencia"] != ""].groupby("Optimizador")["FuncionTransferencia"].nunique()
+    variant_methods = set(tf_counts[tf_counts > 1].index)
+
+    def make_group(row):
+        opt = str(row["Optimizador"])
+        tf = str(row["FuncionTransferencia"]).lower()
+        return f"{opt}_{tf.upper()}" if opt in variant_methods and tf else opt
+
+    plot_df["GrupoGrafica"] = plot_df.apply(make_group, axis=1)
+    group_meta = (
+        plot_df[["GrupoGrafica", "Optimizador", "FuncionTransferencia"]]
+        .drop_duplicates()
+        .set_index("GrupoGrafica")
+        .to_dict("index")
+    )
+
+    method_order = list(dict.fromkeys([str(o) for o in opt_order] + [str(meta["Optimizador"]) for meta in group_meta.values()]))
+    method_order = sorted([opt for opt in method_order if opt in {meta["Optimizador"] for meta in group_meta.values()}], key=optimizer_order_key)
+
+    opts = []
+    for opt in method_order:
+        opt_groups = sorted(
+            [g for g, meta in group_meta.items() if meta["Optimizador"] == opt],
+            key=lambda g: (str(group_meta[g]["FuncionTransferencia"]), g),
+        )
+        opts.extend(opt_groups)
+    opts.extend(sorted((g for g in group_meta if g not in set(opts)), key=lambda g: optimizer_order_key(group_meta[g]["Optimizador"])))
+
+    color_map = {}
+    label_map = {}
+    for group in opts:
+        meta = group_meta[group]
+        method = meta["Optimizador"]
+        tf = meta["FuncionTransferencia"]
+        color_map[group] = optimizer_plot_color(method)
+        base_label = optimizer_display_label(method)
+        label_map[group] = f"{base_label} {tf.upper()}" if tf and method in variant_methods else base_label
+
+    return plot_df, opts, color_map, label_map
+
+def export_global_excel(results_struct: Dict[str, Dict], dataset_names: List[str], out_path: str):
+    all_labels = sorted(set().union(*[set(v.keys()) for v in results_struct.values()])) if results_struct else []
+    if not all_labels:
+        return []
+    idx = pd.Index(dataset_names, name="Dataset")
+    acc = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    ps = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    rs = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    f1 = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    fit = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    feat = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+    tim = pd.DataFrame(np.nan, index=idx, columns=all_labels)
+
+    for ds, alg_data in results_struct.items():
+        for lbl, row in alg_data.items():
+            acc.loc[ds, lbl] = row.get("AccMean", np.nan)
+            ps.loc[ds, lbl] = row.get("PSMean", np.nan)
+            rs.loc[ds, lbl] = row.get("RSMean", np.nan)
+            f1.loc[ds, lbl] = row.get("F1Mean", np.nan)
+            fit.loc[ds, lbl] = row.get("FitMean", np.nan)
+            feat.loc[ds, lbl] = row.get("FeatMean", np.nan)
+            tim.loc[ds, lbl] = row.get("TimeMean", np.nan)
+
+    try:
+        with pd.ExcelWriter(out_path) as writer:
+            acc.to_excel(writer, sheet_name="Accuracy")
+            ps.to_excel(writer, sheet_name="Precision")
+            rs.to_excel(writer, sheet_name="Recall")
+            f1.to_excel(writer, sheet_name="F1Score")
+            fit.to_excel(writer, sheet_name="Fitness")
+            feat.to_excel(writer, sheet_name="Features")
+            tim.to_excel(writer, sheet_name="Time")
+        return [out_path]
+    except ModuleNotFoundError:
+        base = os.path.splitext(out_path)[0]
+        paths = [
+            f"{base}_Accuracy.csv",
+            f"{base}_Precision.csv",
+            f"{base}_Recall.csv",
+            f"{base}_F1Score.csv",
+            f"{base}_Fitness.csv",
+            f"{base}_Features.csv",
+            f"{base}_Time.csv",
+        ]
+        acc.to_csv(paths[0])
+        ps.to_csv(paths[1])
+        rs.to_csv(paths[2])
+        f1.to_csv(paths[3])
+        fit.to_csv(paths[4])
+        feat.to_csv(paths[5])
+        tim.to_csv(paths[6])
+        return paths
+
+def statistical_classifier_rows(payload: dict, estimator: str, args: argparse.Namespace) -> dict:
+    """Qualify legacy labels in a reporting-only view; never rewrite cache records."""
+    return {
+        label if parse_result_label(label, args)["estimator"] else f"{label}_{estimator.upper()}":
+            dict(row, Estimator=row.get("Estimator") or estimator)
+        for label, row in payload.items()
+    }
+
+
+def _run_stats(values, best_mode: str) -> Dict[str, float]:
+    """Summarize available finite runs without changing cached aggregates."""
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {stat: np.nan for stat in ("Best", "Worst", "Mean", "Std")}
+    best, worst = (arr.min(), arr.max()) if best_mode == "min" else (arr.max(), arr.min())
+    return {
+        "Best": float(best),
+        "Worst": float(worst),
+        "Mean": float(arr.mean()),
+        "Std": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+    }
+
+
+def statistical_run_groups(results_struct, dataset_names, args):
+    """Group cached records without mixing classifiers or transfer functions."""
+    grouped = {}
+    for dataset in dataset_names:
+        for label, row in results_struct.get(dataset, {}).items():
+            parsed = parse_result_label(label, args)
+            classifier = str(row.get("Estimator") or parsed["estimator"] or (
+                args.estimators[0] if len(args.estimators) == 1 else "unknown"
+            )).lower()
+            transfer = parsed["transfer_function"] or (
+                args.transfer_functions[0] if len(args.transfer_functions) == 1 else "unknown_tf"
+            )
+            combination = (optimizer_acronym(parsed["method"]), classifier, transfer.lower())
+            grouped.setdefault((dataset, combination), []).append(row)
+    return grouped
+
+
+def export_statistical_excel(
+    results_struct: Dict[str, Dict],
+    dataset_names: List[str],
+    optimizer_order: List[str],
+    args: argparse.Namespace,
+    out_path: str,
+):
+    """Export run statistics separately for every optimizer/classifier/TF combination."""
+    metrics = {
+        "Accuracy": ("AccRuns", "max"),
+        "Precision": ("PSRuns", "max"),
+        "Recall": ("RSRuns", "max"),
+        "F1Score": ("F1Runs", "max"),
+        "Fitness": ("FitRuns", "min"),
+        "Features": ("FeatRuns", "min"),
+        "Time": ("TimeRuns", "min"),
+    }
+    stats = ["Best", "Worst", "Mean", "Std"]
+    grouped = statistical_run_groups(results_struct, dataset_names, args)
+    present = list(dict.fromkeys(combination for _, combination in grouped))
+    orders = [
+        list(dict.fromkeys(optimizer_acronym(opt) for opt in optimizer_order)),
+        list(dict.fromkeys(str(est).lower() for est in args.estimators)),
+        list(dict.fromkeys(str(tf).lower() for tf in args.transfer_functions)),
+    ]
+    for axis, order in enumerate(orders):
+        order.extend(value for value in dict.fromkeys(group[axis] for group in present) if value not in order)
+    configured = [(optimizer_acronym(method), str(classifier).lower(), str(tf).lower())
+                  for method in optimizer_order for classifier in args.estimators for tf in args.transfer_functions]
+    combinations = sorted(dict.fromkeys(configured + present),
+                          key=lambda group: tuple(order.index(value) for order, value in zip(orders, group)))
+    headers = [f"{method} | {classifier.upper()} | {transfer.upper()}"
+               for method, classifier, transfer in combinations]
+    index = pd.MultiIndex.from_product([dataset_names, stats], names=["Dataset", "Statistic"])
+    with pd.ExcelWriter(out_path) as writer:
+        for sheet_name, (run_key, best_mode) in metrics.items():
+            frame = pd.DataFrame(np.nan, index=index, columns=headers)
+            for dataset in dataset_names:
+                for combination, header in zip(combinations, headers):
+                    chunks = [np.asarray(row.get(run_key, []), dtype=float).ravel()
+                              for row in grouped.get((dataset, combination), [])]
+                    values = np.concatenate(chunks) if chunks else []
+                    for stat, value in _run_stats(values, best_mode).items():
+                        frame.loc[(dataset, stat), header] = value
+            if headers:
+                frame.to_excel(writer, sheet_name=sheet_name, merge_cells=True)
+            else:
+                frame.reset_index().to_excel(writer, sheet_name=sheet_name, index=False)
+    return out_path
+
+
+def _holm_adjusted_pvalues(p_values: List[float]) -> np.ndarray:
+    """Return Holm step-down adjusted p-values in their original order."""
+    raw = np.asarray(p_values, dtype=float)
+    if raw.size == 0:
+        return raw
+    order = np.argsort(raw)
+    sorted_raw = raw[order]
+    multipliers = np.arange(raw.size, 0, -1, dtype=float)
+    sorted_adjusted = np.minimum(1.0, np.maximum.accumulate(sorted_raw * multipliers))
+    adjusted = np.empty_like(sorted_adjusted)
+    adjusted[order] = sorted_adjusted
+    return adjusted
+
+def calculate_friedman_analysis(
+    fitness_matrix: pd.DataFrame,
+    mode: str,
+    alpha: float = 0.05,
+) -> Dict[str, pd.DataFrame]:
+    """Calculate one Friedman test and conditional Wilcoxon-Holm post-hoc."""
+    mode_label = str(mode).upper()
+    complete = fitness_matrix.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how="any")
+    optimizers = list(fitness_matrix.columns)
+    enough_data = len(optimizers) >= 3 and complete.shape[0] >= 2
+
+    rank_matrix = pd.DataFrame(
+        index=complete.index,
+        columns=optimizers,
+        dtype=float,
+    )
+    for block_name, row in complete.iterrows():
+        rank_matrix.loc[block_name] = rankdata(row.to_numpy(dtype=float), method="average")
+    average_ranks = rank_matrix.mean(axis=0)
+
+    statistic = np.nan
+    p_value = np.nan
+    significant = False
+    status = "Insufficient complete blocks or optimizers"
+    all_tied = not complete.empty and bool((complete.nunique(axis=1) == 1).all())
+    if enough_data and all_tied:
+        status = "Friedman undefined: all optimizers tied in every complete block"
+    if enough_data and not all_tied:
+        samples = [complete[optimizer].to_numpy(dtype=float) for optimizer in optimizers]
+        statistic, p_value = friedmanchisquare(*samples)
+        statistic = float(statistic)
+        p_value = float(p_value)
+        significant = bool(np.isfinite(p_value) and p_value < alpha)
+        status = ("Significant differences detected" if significant else "No significant differences detected")
+        if not np.isfinite(statistic) or not np.isfinite(p_value):
+            status = "Friedman undefined for these blocks"
+
+    finite_ranks = average_ranks.dropna()
+    if finite_ranks.empty:
+        best_rank = np.nan
+        best_optimizers = []
+    else:
+        best_rank = float(finite_ranks.min())
+        best_optimizers = finite_ranks.index[np.isclose(finite_ranks, best_rank)].tolist()
+
+    summary = pd.DataFrame([{
+        "Mode": mode_label,
+        "Metric": "Final fitness (lower is better)",
+        "Aggregation": "Mean final fitness across independent runs per dataset/function and optimizer",
+        "Configured optimizers": len(optimizers),
+        "Available blocks": int(fitness_matrix.shape[0]),
+        "Complete blocks used": int(complete.shape[0]),
+        "Friedman statistic": statistic,
+        "p-value": p_value,
+        "Alpha": float(alpha),
+        "Significant": "YES" if significant else "NO",
+        "Conclusion": status,
+        "Best average rank optimizer(s)": ", ".join(map(str, best_optimizers)),
+        "Best average rank": best_rank,
+        "Post-hoc method": "Pairwise Wilcoxon signed-rank with Holm correction" if significant else "Not performed",
+    }])
+
+    ranks = pd.DataFrame({
+        "Optimizer": optimizers,
+        "Average rank": [float(average_ranks.get(opt, np.nan)) for opt in optimizers],
+        "Best average rank": ["YES" if opt in best_optimizers else "NO" for opt in optimizers],
+        "Complete blocks used": int(complete.shape[0]),
+    }).sort_values(["Average rank", "Optimizer"], na_position="last", ignore_index=True)
+
+    posthoc_columns = [
+        "Optimizer A",
+        "Optimizer B",
+        "Wilcoxon statistic",
+        "Raw p-value",
+        "Holm adjusted p-value",
+        f"Significant at alpha={alpha:g}",
+        "Better average rank",
+        "Note",
+    ]
+    posthoc_rows = []
+    if significant:
+        raw_p_values = []
+        pair_results = []
+        for left_idx, left in enumerate(optimizers[:-1]):
+            for right in optimizers[left_idx + 1:]:
+                left_values = complete[left].to_numpy(dtype=float)
+                right_values = complete[right].to_numpy(dtype=float)
+                if np.allclose(left_values, right_values, rtol=0.0, atol=0.0):
+                    pair_statistic, pair_p = 0.0, 1.0
+                else:
+                    pair_statistic, pair_p = wilcoxon(
+                        left_values,
+                        right_values,
+                        alternative="two-sided",
+                        method="auto",
+                    )
+                pair_results.append((left, right, float(pair_statistic), float(pair_p)))
+                raw_p_values.append(float(pair_p))
+
+        adjusted_p_values = _holm_adjusted_pvalues(raw_p_values)
+        for (left, right, pair_statistic, pair_p), adjusted_p in zip(pair_results, adjusted_p_values):
+            left_rank = float(average_ranks[left])
+            right_rank = float(average_ranks[right])
+            if np.isclose(left_rank, right_rank):
+                better_rank = "TIE"
+            else:
+                better_rank = left if left_rank < right_rank else right
+            posthoc_rows.append({
+                "Optimizer A": left,
+                "Optimizer B": right,
+                "Wilcoxon statistic": pair_statistic,
+                "Raw p-value": pair_p,
+                "Holm adjusted p-value": float(adjusted_p),
+                f"Significant at alpha={alpha:g}": "YES" if adjusted_p < alpha else "NO",
+                "Better average rank": better_rank,
+                "Note": "",
+            })
+    else:
+        posthoc_rows.append({
+            f"Significant at alpha={alpha:g}": "NO",
+            "Note": "Post-hoc not performed because the Friedman test was not significant or lacked sufficient data.",
+        })
+    posthoc = pd.DataFrame(posthoc_rows, columns=posthoc_columns)
+
+    return {
+        "summary": summary,
+        "ranks": ranks,
+        "posthoc": posthoc,
+        "blocks": fitness_matrix,
+        "block_ranks": rank_matrix,
+    }
+
+def build_friedman_fitness_matrix(results_struct, dataset_names, optimizer_order, args,
+                                 *, classifier, transfer_function):
+    """Mean finite FitRuns per dataset/method within one classifier/TF stratum."""
+    methods = list(dict.fromkeys(optimizer_acronym(method) for method in optimizer_order))
+    matrix = pd.DataFrame(np.nan, index=pd.Index(dataset_names, name="Dataset/Function"),
+                          columns=pd.Index(methods, name="Optimizer"))
+    grouped = statistical_run_groups(results_struct, dataset_names, args)
+    for dataset in dataset_names:
+        for method in methods:
+            rows = grouped.get((dataset, (method, classifier.lower(), transfer_function.lower())), [])
+            chunks = [np.asarray(row.get("FitRuns", []), dtype=float).ravel() for row in rows]
+            values = np.concatenate(chunks) if chunks else []
+            matrix.loc[dataset, method] = _run_stats(values, "min")["Mean"]
+    return matrix
+
+
+def export_friedman_analysis(results_struct, dataset_names, optimizer_order, args, out_path, alpha=0.05):
+    """Independent FULL comparisons per classifier/TF; Holm correction within each."""
+    tables = {key: [] for key in ("summary", "ranks", "posthoc", "blocks", "block_ranks")}
+    for classifier in dict.fromkeys(args.estimators):
+        for transfer in dict.fromkeys(args.transfer_functions):
+            matrix = build_friedman_fitness_matrix(
+                results_struct, dataset_names, optimizer_order, args,
+                classifier=classifier, transfer_function=transfer,
+            )
+            analysis = calculate_friedman_analysis(matrix, "FULL", alpha=alpha)
+            for key, frame in analysis.items():
+                frame = frame.reset_index() if key in {"blocks", "block_ranks"} else frame.copy()
+                frame.insert(0, "TransferFunction", transfer)
+                frame.insert(0, "Classifier", classifier)
+                tables[key].append(frame)
+    sheet_names = {
+        "summary": "FULL_Friedman", "ranks": "FULL_Average_Ranks",
+        "posthoc": "FULL_PostHoc_Holm", "blocks": "FULL_Block_Fitness",
+        "block_ranks": "FULL_Block_Ranks",
+    }
+    with pd.ExcelWriter(out_path) as writer:
+        for key, frames in tables.items():
+            frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            frame.to_excel(writer, sheet_name=sheet_names[key], index=False)
+    return out_path
+
+
+def generate_summary_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace) -> pd.DataFrame:
+    rows = []
+    for dataset_name, alg_data in results_struct.items():
+        for label, row in alg_data.items():
+            parsed = parse_result_label(label, args)
+            method = parsed["method"]
+            estimator = parsed["estimator"] or None
+            estimator = estimator or (row.get("Estimator") if isinstance(row, dict) else None) or (
+                args.estimators[0] if len(args.estimators) == 1 else ""
+            )
+            rows.append(
+                {
+                    "Archivo": dataset_name,
+                    "Estimador": estimator,
+                    "Optimizador": method,
+                    "FuncionTransferencia": parsed["transfer_function"],
+                    "Configuracion": label,
+                    "F1_test": float(row.get("F1Mean", np.nan)),
+                    "AS_test": float(row.get("AccMean", np.nan)) / 100.0,
+                    "PS_test": float(row.get("PSMean", np.nan)),
+                    "RS_test": float(row.get("RSMean", np.nan)),
+                    "N_Features_Selected": float(row.get("FeatMean", np.nan)),
+                    "Runtime": float(row.get("TimeMean", np.nan)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_run_index(row, context="plot"):
+    """Choose one positional run by final fitness; ties keep stored run order."""
+    if PLOT_RUN_AGGREGATION not in {"best", "worst", "mean"}:
+        raise ValueError('PLOT_RUN_AGGREGATION must be "best", "worst" or "mean".')
+    if PLOT_RUN_AGGREGATION == "mean":
+        return None
+    fitness = np.asarray(row.get("FitRuns", []), dtype=float)
+    ids = row.get("CompletedRunIDs", list(range(fitness.size)))
+    if (fitness.ndim != 1 or not fitness.size or not np.isfinite(fitness).all()
+            or len(ids) != fitness.size
+            or any(not isinstance(run, (int, np.integer)) or run < 0 for run in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError(f"{context}: representative figures require aligned run IDs and finite FitRuns.")
+    return int(np.argmin(fitness) if PLOT_RUN_AGGREGATION == "best" else np.argmax(fitness))
+
+
+def generate_plot_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace) -> pd.DataFrame:
+    """Figure-only view; summary tables and stored scientific rows keep their means."""
+    plot_rows = {}
+    for dataset, rows in results_struct.items():
+        plot_rows[dataset] = {}
+        for label, row in rows.items():
+            context = f"{dataset}/{label}"
+            index = _plot_run_index(row, context)
+            selected = dict(row)
+            if index is not None:
+                count = len(row["FitRuns"])
+                for metric in ("Acc", "PS", "RS", "F1", "Fit", "Feat", "Time"):
+                    values = np.asarray(row.get(f"{metric}Runs", []), dtype=float)
+                    if values.ndim != 1 or len(values) != count:
+                        raise ValueError(f"{context}: {metric}Runs must align with FitRuns.")
+                    selected[f"{metric}Mean"] = float(values[index])
+            plot_rows[dataset][label] = selected
+    return generate_summary_dataframe(plot_rows, args)
+
+
+def _representative_figure_dataframe(df, results_struct, args):
+    """Retain the caller's dataset/classifier/configuration selection."""
+    keys = ["Archivo", "Estimador", "Configuracion"]
+    selected = set(zip(df["Archivo"], df["Configuracion"]))
+    rows = {dataset: {label: row for label, row in algorithms.items() if (dataset, label) in selected}
+            for dataset, algorithms in results_struct.items()}
+    representative = generate_plot_dataframe(rows, args)
+    return representative.merge(df[keys].drop_duplicates(), on=keys, how="inner")
+
+
+def _plot_legend_patches(opts: List[str], color_map: Dict[str, str], label_map: Dict[str, str]) -> List[mpatches.Patch]:
+    return [mpatches.Patch(color=color_map.get(o, "#888"), label=label_map.get(o, o)) for o in opts]
+
+
+def _force_white_background(fig):
+    fig.patch.set_facecolor("white")
+    fig.patch.set_alpha(1.0)
+    for ax in fig.get_axes():
+        ax.set_facecolor("white")
+
+
+def _save_chart(fig, out_dir: str, filename: str):
+    path = os.path.join(out_dir, filename)
+    _force_white_background(fig)
+    # Preserve identical exported canvases for individual radars/convergence.
+    fixed_canvas = filename.startswith(("02_radar_", "05_convergence_")) and "_por_dataset_" not in filename
+    fig.savefig(path, dpi=150, bbox_inches=None if fixed_canvas else "tight", facecolor="white")
+    plt.close(fig)
+
+
+def generate_classifier_metric_grid_chart(
+    df: pd.DataFrame, out_dir: str, opt_order: List[str], *,
+    estimator_filter: str | None = None,
+    filename: str = "09_resultados_clasificador_metrica_todos_datasets.png",
+    title: str | None = None,
+):
+    if df.empty:
+        return None
+
+    plot_df = df.copy()
+    plot_df["Estimador"] = plot_df["Estimador"].astype(str).str.lower()
+    plot_df = plot_df[plot_df["Estimador"].isin(PLOT_ESTIMATORS)]
+    if estimator_filter is not None:
+        plot_df = plot_df[plot_df["Estimador"] == estimator_filter.lower()]
+    plot_df, opts, color_map, label_map = prepare_plot_groups(plot_df, opt_order)
+    if not opts:
+        return None
+    method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
+
+    metric_cols = ["AS_test", "PS_test", "RS_test", "F1_test"]
+    metric_labels = ["Accuracy", "Precision", "Recall", "F1-Score"]
+    metric_header_styles = [
+        ("#d8e8f3", "#b8d3e6"),
+        ("#d2efee", "#abd9d7"),
+        ("#f7efd8", "#ead9ad"),
+        ("#f9d5d9", "#edaeb8"),
+    ]
+
+    present_estimators = [str(e).lower() for e in plot_df["Estimador"].dropna().unique()]
+    required_estimators = [e for e in DEFAULT_ESTIMATORS if e in SUPPORTED_ESTIMATORS and e in PLOT_ESTIMATORS]
+    if estimator_filter is not None:
+        required_estimators = [e for e in required_estimators if e == estimator_filter.lower()]
+    estimators = [e for e in SUPPORTED_ESTIMATORS if e in set(required_estimators + present_estimators)]
+    estimators += sorted(e for e in present_estimators if e not in set(estimators))
+    if not estimators:
+        return None
+
+    grouped = plot_df.groupby(["Estimador", "GrupoGrafica"])[metric_cols].mean()
+    n_rows = len(estimators)
+    n_cols = len(metric_cols)
+    fig_w = max(16.0, 4.2 * n_cols)
+    fig_h = max(4.5, 2.75 * n_rows + 2.2)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), squeeze=False, facecolor="#f7f9fc")
+    x = np.arange(len(opts))
+    colors = [color_map.get(opt, "#888888") for opt in opts]
+    xlabels = [label_map.get(opt, opt) for opt in opts]
+
+    for r, estimator in enumerate(estimators):
+        for c, (metric, metric_label) in enumerate(zip(metric_cols, metric_labels)):
+            ax = axes[r, c]
+            ax.set_facecolor("#f3f6fa")
+            vals = [
+                float(grouped.loc[(estimator, opt), metric])
+                if (estimator, opt) in grouped.index
+                else np.nan
+                for opt in opts
+            ]
+            edges = ["black" if is_dsade_method(method_by_group.get(opt)) else "none" for opt in opts]
+            widths = [1.8 if is_dsade_method(method_by_group.get(opt)) else 0.0 for opt in opts]
+            bars = ax.bar(x, vals, color=colors, edgecolor=edges, linewidth=widths, width=0.68)
+
+            mean_val = float(np.nanmean(vals)) if np.isfinite(vals).any() else np.nan
+            if np.isfinite(mean_val):
+                ax.axhline(mean_val, color="#d76c6c", linestyle="--", linewidth=0.9, alpha=0.8)
+
+            for bar, value in zip(bars, vals):
+                if not np.isfinite(value):
+                    continue
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    value + 0.006,
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=6.5,
+                    rotation=90,
+                    color="#333333",
+                )
+
+            if not np.isfinite(vals).any():
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Sin datos",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                    color="#777777",
+                )
+
+            ax.set_ylim(0.0, 1.10)
+            ax.set_xticks(x)
+            ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=8)
+            ax.tick_params(axis="y", labelsize=8)
+            ax.grid(axis="y", alpha=0.24, linewidth=0.8)
+            ax.set_axisbelow(True)
+
+            if c == 0:
+                ax.set_ylabel(estimator.upper(), fontsize=12, fontweight="bold", color="#19365f")
+            if r == 0:
+                face, edge = metric_header_styles[c]
+                ax.set_title(
+                    metric_label,
+                    fontsize=12,
+                    fontweight="bold",
+                    color="#19365f",
+                    pad=12,
+                    bbox=dict(boxstyle="round,pad=0.22", facecolor=face, edgecolor=edge),
+                )
+
+    legend = _plot_legend_patches(opts, color_map, label_map)
+    if any(is_exact_dsade_method(method_by_group.get(opt)) for opt in opts):
+        legend.append(mpatches.Patch(facecolor="#333333", edgecolor="black", label="DSA-DE: borde negro"))
+    fig.legend(handles=legend, loc="lower center", ncol=min(len(legend), 6), fontsize=9, framealpha=0.95)
+    if title:
+        fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0.0, 0.04, 1.0, 0.92 if title else 1.0])
+    _save_chart(fig, out_dir, filename)
+    return filename
+
+
+def build_run_level_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace, estimator_filter: str = "knn") -> pd.DataFrame:
+    rows = []
+    for dataset_name, alg_data in results_struct.items():
+        for label, row in alg_data.items():
+            parsed = parse_result_label(label, args)
+            estimator = parsed["estimator"] or row.get("Estimator", "")
+            if str(estimator).lower() != estimator_filter.lower():
+                continue
+            runs_by_metric = {
+                "AS_test": np.asarray(row.get("AccRuns", []), dtype=float) / 100.0,
+                "F1_test": np.asarray(row.get("F1Runs", []), dtype=float),
+                "PS_test": np.asarray(row.get("PSRuns", []), dtype=float),
+                "RS_test": np.asarray(row.get("RSRuns", []), dtype=float),
+                "N_Features_Selected": np.asarray(row.get("FeatRuns", []), dtype=float),
+                "Runtime": np.asarray(row.get("TimeRuns", []), dtype=float),
+            }
+            n_runs = max((values.size for values in runs_by_metric.values()), default=0)
+            for run_idx in range(n_runs):
+                out = {
+                    "Archivo": dataset_name,
+                    "Estimador": estimator_filter.lower(),
+                    "Optimizador": parsed["method"],
+                    "FuncionTransferencia": parsed["transfer_function"],
+                    "Configuracion": label,
+                    "Run": run_idx + 1,
+                }
+                for metric, values in runs_by_metric.items():
+                    out[metric] = float(values[run_idx]) if run_idx < values.size else np.nan
+                rows.append(out)
+    return pd.DataFrame(rows)
+
+
+def build_curve_dataframe(results_struct: Dict[str, Dict], args: argparse.Namespace, estimator_filter: str = "svm") -> pd.DataFrame:
+    rows = []
+    for dataset_name, alg_data in results_struct.items():
+        for label, row in alg_data.items():
+            parsed = parse_result_label(label, args)
+            estimator = parsed["estimator"] or row.get("Estimator", "")
+            if str(estimator).lower() != estimator_filter.lower():
+                continue
+            fitness = np.asarray(row.get("FitRuns", []), dtype=float)
+            curves = row.get("CurvesAll", [])
+            ids = row.get("CompletedRunIDs", list(range(len(curves))))
+            if (fitness.ndim != 1 or not fitness.size or not np.isfinite(fitness).all()
+                    or len(curves) != fitness.size or len(ids) != fitness.size
+                    or any(not isinstance(run, (int, np.integer)) or run < 0 for run in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError(f"{dataset_name}/{label}: convergence requires aligned run IDs, finite FitRuns and CurvesAll.")
+            validated = [validate_convergence_curve(c, args.epochs, fit) for c, fit in zip(curves, fitness)]
+            # Share the same fitness-selected run as every representative metric.
+            index = _plot_run_index(row, f"{dataset_name}/{label}")
+            curve = np.mean(np.stack(validated), axis=0) if index is None else validated[index]
+            rows.append(
+                {
+                    "Archivo": dataset_name,
+                    "Estimador": estimator_filter.lower(),
+                    "Optimizador": parsed["method"],
+                    "FuncionTransferencia": parsed["transfer_function"],
+                    "Configuracion": label,
+                    "Curve": curve,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _grid_shape(n_items: int) -> tuple[int, int]:
+    n_cols = min(4, max(1, int(np.ceil(np.sqrt(max(1, n_items))))))
+    n_rows = int(np.ceil(max(1, n_items) / n_cols))
+    return n_rows, n_cols
+
+
+def plot_original_feature_counts(args, datasets):
+    """Read original input widths for figures only, without preparing any data."""
+    if args.dataset_source != "miafex":
+        return {dataset: int(get_dataset(dataset).X.shape[1]) for dataset in datasets}
+    scoped = argparse.Namespace(**vars(args))
+    scoped.figures_only = True
+    scoped.miafex_datasets = list(datasets)
+    dataset_args = resolve_miafex_dataset_args(scoped)
+    counts = {}
+    for dataset in datasets:
+        columns = []
+        for path in miafex_feature_paths(dataset_args[dataset]).values():
+            # The loader treats 'label' (or the last column) as the target.
+            # Headers suffice: never load, concatenate, split or rewrite features.
+            header = pd.read_csv(path, nrows=0)
+            if header.shape[1] < 2:
+                raise ValueError(f"{dataset}: prepared features need an input and a label.")
+            label = "label" if "label" in header.columns else header.columns[-1]
+            columns.append(list(header.drop(columns=[label]).columns))
+        if columns[0] != columns[1]:
+            raise ValueError(f"{dataset}: train/test feature columns must match.")
+        counts[dataset] = len(columns[0])
+    return counts
+
+
+def selected_feature_ratio(selected_features, original_features):
+    """Absolute figure coordinate; invalid counts fail instead of being clipped."""
+    original = float(original_features)
+    selected = np.asarray(selected_features, dtype=float)
+    if (not np.isfinite(original) or original <= 0 or not original.is_integer()
+            or not np.isfinite(selected).all() or np.any(selected < 0)
+            or np.any(selected > original)):
+        raise ValueError("Selected features must be within [0, original features], with a positive original width.")
+    return selected / original
+
+
+def _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group, *, original_features):
+    categories = ["Accuracy", "Precision", "Recall", "F1-Score", "Selected Feature Ratio"]
+    angles = [n / 5.0 * 2 * np.pi for n in range(5)]
+    angles += angles[:1]
+    sub = plot_df[plot_df["Archivo"] == dataset]
+    medias = sub.groupby("GrupoGrafica")[["AS_test", "PS_test", "RS_test", "F1_test", "N_Features_Selected"]].mean()
+    for opt in opts:
+        if opt not in medias.index:
+            continue
+        row = medias.loc[opt]
+        vals = [row["AS_test"], row["PS_test"], row["RS_test"], row["F1_test"],
+                float(selected_feature_ratio(row["N_Features_Selected"], original_features))]
+        vals += vals[:1]
+        is_dsade = is_dsade_method(method_by_group.get(opt))
+        is_macro = method_by_group.get(opt) == "MaCRO-DE"
+        is_macro_t = optimizer_display_label(method_by_group[opt]).upper() == "MACRO-DE-T"
+        highlighted = is_macro or is_macro_t
+
+        line, = ax.plot(
+            angles,
+            vals,
+            color=color_map.get(opt, "#888"),
+            linewidth=2.0 if is_macro_t else (4.0 if is_macro else (2.4 if is_dsade else 1.1)),
+            **optimizer_plot_style(method_by_group[opt]),
+            markersize=3.5, markerfacecolor="white", markeredgewidth=0.8,
+            label=opt,
+            zorder=10 if highlighted else 2
+        )
+        if is_macro_t:
+            _macro_t_underlay(line)
+
+        ax.fill(
+            angles,
+            vals,
+            color=color_map.get(opt, "#888"),
+            alpha=0.20 if highlighted else (0.12 if is_dsade else 0.04)
+        )
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=8)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(dataset, fontsize=11, fontweight="bold", pad=14)
+
+
+def _draw_dataset_features_runtime(ax1, dataset, plot_df, opts, color_map, label_map):
+    ax2 = ax1.twinx()
+    sub = plot_df[plot_df["Archivo"] == dataset].groupby("GrupoGrafica")[["N_Features_Selected", "Runtime"]].mean()
+    x = np.arange(len(opts))
+    feat_vals = [sub.loc[o, "N_Features_Selected"] if o in sub.index else np.nan for o in opts]
+    rt_vals = [sub.loc[o, "Runtime"] if o in sub.index else np.nan for o in opts]
+    colors = [color_map.get(o, "#888") for o in opts]
+    ax1.bar(x - 0.18, feat_vals, 0.36, color=colors, alpha=0.85)
+    ax2.bar(x + 0.18, rt_vals, 0.36, color=colors, alpha=0.40, hatch="///")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([label_map.get(o, o) for o in opts], rotation=45, ha="right", fontsize=7)
+    ax1.set_ylabel("Features", fontsize=9)
+    ax2.set_ylabel("Runtime (s)", fontsize=9)
+    ax1.set_title(dataset, fontsize=11, fontweight="bold")
+    ax1.grid(axis="y", alpha=0.25)
+
+
+def _convergence_zoom_window(curves):
+    """Final 25% of iterations, with y limits from a separated low-fitness group.
+
+    The x window depends only on history length (200 epochs -> 151–200).
+    A gap larger than three times the lower group's final envelope separates
+    that group from high outliers. Require at least two low curves; otherwise
+    use all curves. This changes axis limits only, never recorded samples.
+    """
+    if not len(curves):
+        return None
+    length = min(len(curve) for curve in curves)
+    if length < 8 or any(len(curve) != length for curve in curves):
+        return None
+    values = np.asarray(curves, dtype=float)
+    if not np.isfinite(values).all():
+        return None
+    start = int(np.floor(0.75 * length))
+    final = values[:, start:]
+    tolerance = 32 * np.finfo(float).eps * max(float(np.abs(final).max()), np.finfo(float).tiny)
+    order = np.argsort(np.median(final, axis=1), kind="stable")
+    cluster = final
+    for count in range(2, len(order)):
+        lower = final[order[:count]]
+        upper = final[order[count:]]
+        separation = float(upper.min() - lower.max())
+        spread = float(np.ptp(lower))
+        if separation > 3.0 * max(spread, tolerance):
+            cluster = lower
+            break
+    low, high = float(cluster.min()), float(cluster.max())
+    if high - low <= tolerance:
+        return None
+    padding = 0.08 * (high - low)
+    return start + 1, length, low - padding, high + padding
+
+
+def _convergence_marker_indices(length, count=9):
+    """Evenly spaced original sample indices, including both endpoints."""
+    return np.unique(np.linspace(0, length - 1, min(count, length), dtype=int)).tolist()
+
+
+def _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map, *, classifier=None):
+    from full_plot_style import highlight_macro_t_convergence
+    sub = curve_plot_df[curve_plot_df["Archivo"] == dataset] if not curve_plot_df.empty else pd.DataFrame()
+    plotted = []
+    ax.set_facecolor("white")
+    ax.figure.patch.set_facecolor("white")
+    ax.set_axisbelow(True)
+    for opt in curve_opts:
+        rows_opt = sub[sub["GrupoGrafica"] == opt] if not sub.empty else pd.DataFrame()
+        if rows_opt.empty:
+            continue
+        curve = np.asarray(rows_opt.iloc[0]["Curve"], dtype=float)
+        if curve.size == 0:
+            continue
+        context = f"{dataset} / {opt}"
+        assert curve.ndim == 1, f"{context}: expected a one-dimensional convergence curve"
+        x = np.arange(1, len(curve) + 1)
+        assert len(x) == len(curve), f"{context}: iteration/curve lengths differ"
+        assert np.all(np.diff(x) > 0), f"{context}: iterations must strictly increase"
+        is_macro_t = optimizer_display_label(rows_opt.iloc[0]["Optimizador"]).upper() == "MACRO-DE-T"
+        style = dict(color=optimizer_plot_color(rows_opt.iloc[0]["Optimizador"]),
+                     **optimizer_plot_style(rows_opt.iloc[0]["Optimizador"]),
+                     markerfacecolor="white", markeredgewidth=0.8,
+                     zorder=10 if is_macro_t else 2,
+                     label=opt)
+        line, = ax.plot(x, curve, markevery=_convergence_marker_indices(len(curve)), markersize=3.5,
+                        linewidth=2.0 if is_macro_t else 1.3, **style)
+        if is_macro_t:
+            highlight_macro_t_convergence(line)
+            _macro_t_underlay(line)
+        plotted.append((curve, style, is_macro_t))
+    window = _convergence_zoom_window([curve for curve, _, _ in plotted])
+    classifier = classifier or (str(sub.iloc[0]["Estimador"]) if not sub.empty else "unknown")
+    if window is not None:
+        start, end, low, high = window
+        zoom_ax = ax.inset_axes([0.54, 0.18, 0.42, 0.32], zorder=20)
+        zoom_ax.set_facecolor("white")
+        zoom_ax.set_axisbelow(True)
+        zoom_ax.set_title(f"Final stage ({start}–{end})", fontsize=7, pad=3)
+        zoom_ax.set_xlim(start, end)
+        zoom_ax.set_ylim(low, high)
+        zoom_ax.set_xticks(np.unique(np.linspace(start, end, 4, dtype=int)))
+        zoom_ax.tick_params(labelsize=6, pad=1)
+        zoom_ax.grid(color="#d9d9d9", linewidth=0.5, alpha=0.65)
+        for curve, style, is_macro_t in plotted:
+            samples = curve[start - 1:end]
+            zoom_line, = zoom_ax.plot(np.arange(start, end + 1), samples,
+                                     markevery=_convergence_marker_indices(len(samples), 4), markersize=2.5,
+                                     linewidth=1.4 if is_macro_t else 0.9, **style)
+            if is_macro_t:
+                highlight_macro_t_convergence(zoom_line)
+                _macro_t_underlay(zoom_line)
+        ax.indicate_inset_zoom(zoom_ax, edgecolor="#777777", alpha=0.5)
+    else:
+        start = end = None
+    print(f"[convergence-zoom] dataset={dataset} classifier={classifier} "
+          f"aggregation={PLOT_RUN_AGGREGATION} start_iteration={start} end_iteration={end}"
+          + (" (no additional final-stage detail)" if window is None else ""), flush=True)
+    if not plotted:
+        ax.text(0.5, 0.5, "Sin curvas", transform=ax.transAxes, ha="center", va="center", color="#777")
+    ax.set_title(dataset, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Iteration", fontsize=9)
+    ax.set_ylabel("Fitness", fontsize=9)
+    ax.grid(color="#d9d9d9", linewidth=0.6, alpha=0.65)
+
+
+def generate_individual_dataset_charts(df, results_struct, out_dir, opt_order, args):
+    """Export standalone panels using the combined plots' data and drawing code."""
+    saved = []
+    if df.empty:
+        return saved
+    df = _representative_figure_dataframe(df, results_struct, args)
+    original_counts = plot_original_feature_counts(args, df["Archivo"].unique())
+    out_dir = os.path.join(out_dir, "individual")
+    os.makedirs(out_dir, exist_ok=True)
+    for estimator in dict.fromkeys(PLOT_ESTIMATORS):
+        selected = df[df["Estimador"].astype(str).str.lower() == estimator]
+        plot_df, opts, color_map, label_map = prepare_plot_groups(selected, opt_order)
+        if not opts:
+            continue
+        method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
+        curve_df = build_curve_dataframe(results_struct, args, estimator)
+        if curve_df.empty:
+            curve_plot_df = pd.DataFrame()
+            curve_opts, curve_color_map, curve_label_map = opts, color_map, label_map
+        else:
+            curve_plot_df, curve_opts, curve_color_map, curve_label_map = prepare_plot_groups(curve_df, opt_order)
+
+        for dataset in sorted(plot_df["Archivo"].dropna().unique()):
+            filename = generate_classifier_metric_grid_chart(
+                selected[selected["Archivo"] == dataset], out_dir, opt_order,
+                estimator_filter=estimator,
+                filename=f"01_resultados_clasificador_{dataset}_{estimator}.png",
+                title=f"{dataset} — {estimator.upper()}",
+            )
+            if filename:
+                saved.append(os.path.join("individual", filename))
+
+            fig, ax = plt.subplots(figsize=INDIVIDUAL_POLAR_CURVE_SIZE, subplot_kw=dict(polar=True))
+            _draw_dataset_radar(ax, dataset, plot_df, opts, color_map, method_by_group,
+                                original_features=original_counts[dataset])
+            _convergence_legend(fig, opts, color_map, label_map)
+            filename = f"02_radar_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(os.path.join("individual", filename))
+
+            fig, ax = plt.subplots(figsize=(max(7.0, 0.5 * len(opts)), 5.0))
+            _draw_dataset_features_runtime(ax, dataset, plot_df, opts, color_map, label_map)
+            fig.tight_layout()
+            filename = f"03_features_runtime_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(os.path.join("individual", filename))
+
+            fig, ax = plt.subplots(figsize=INDIVIDUAL_POLAR_CURVE_SIZE)
+            _draw_dataset_convergence(ax, dataset, curve_plot_df, curve_opts, curve_color_map, classifier=estimator)
+            _convergence_legend(fig, curve_opts, curve_color_map, curve_label_map)
+            filename = f"05_convergence_{dataset}_{estimator}.png"
+            _save_chart(fig, out_dir, filename)
+            saved.append(os.path.join("individual", filename))
+    return saved
+
+
+def _convergence_legend(fig, opts, color_map, label_map):
+    lines = {line.get_label(): line for ax in fig.axes for line in ax.lines}
+    present = [opt for opt in opts if opt in lines]
+    _individual_dataset_legend(fig, present, color_map, label_map,
+                               handles=[lines[opt] for opt in present])
+
+
+def _individual_dataset_legend(fig, opts, color_map, label_map, *, handles=None):
+    if not opts:
+        fig.tight_layout()
+        return
+    legend = fig.legend(handles=handles if handles is not None else _plot_legend_patches(opts, color_map, label_map),
+                        labels=[label_map.get(opt, opt) for opt in opts],
+                        loc="lower center", ncol=len(opts), fontsize=8,
+                        handlelength=2.4 if handles is not None else 1.2, handletextpad=0.4, columnspacing=0.8,
+                        borderpad=0.4)
+    fig.canvas.draw()
+    bounds = legend.get_window_extent(fig.canvas.get_renderer()).transformed(fig.dpi_scale_trans.inverted())
+    # Fit a single horizontal row below the panel, including a small outer margin.
+    fig.set_size_inches(max(fig.get_figwidth(), bounds.width + 0.4), fig.get_figheight())
+    fig.tight_layout(rect=[0.0, (bounds.height + 0.25) / fig.get_figheight(), 1.0, 1.0])
+
+
+def _save_metric_heatmap(plot_df, opts, label_map, out_dir, filename, metric, title):
+    """Shared F1/Accuracy style, order, annotation and optimizer highlighting."""
+    datasets = sorted(plot_df["Archivo"].dropna().unique())
+    method_by_group = plot_df.drop_duplicates("GrupoGrafica").set_index("GrupoGrafica")["Optimizador"].to_dict()
+    pivot = plot_df.groupby(["GrupoGrafica", "Archivo"])[metric].mean().unstack()
+    mat = pivot.reindex(index=opts, columns=datasets).values
+    fig, ax = plt.subplots(figsize=(max(10, 0.9 * len(datasets) + 4), max(5, 0.45 * len(opts) + 2)))
+    im = ax.imshow(mat, cmap="Blues", vmin=0.0, vmax=1.0, aspect="auto")
+    plt.colorbar(im, ax=ax, label=title, shrink=0.8)
+    ax.set_xticks(range(len(datasets)))
+    ax.set_xticklabels(datasets, rotation=35, ha="right")
+    ax.set_yticks(range(len(opts)))
+    ax.set_yticklabels([label_map.get(o, o) for o in opts])
+    # for tick, opt in zip(ax.get_yticklabels(), opts):
+    #     if str(method_by_group.get(opt)).upper() == "MACRO-DE":
+    #         tick.set_color("red")
+    #         tick.set_fontweight("bold")
+    macro_idx = next(
+        (i for i, opt in enumerate(opts)
+         if str(method_by_group.get(opt)).upper() == "MACRO-DE"),
+        None,
+    )
+
+    if macro_idx is not None:
+        rect = plt.Rectangle((-0.5, macro_idx - 0.5), len(datasets),1, fill=False, edgecolor="black", linewidth=2.5, zorder=100)
+        ax.add_patch(rect)
+
+    ax.set_xlabel("Dataset")
+    ax.set_ylabel("Metaheuristics")
+    for i in range(len(opts)):
+        for j in range(len(datasets)):
+            value = mat[i, j]
+            if np.isfinite(value):
+                ax.text(j, i, f"{value:.4f}", ha="center", va="center", color="white" if value > 0.80 else "#222", fontsize=8)
+    fig.tight_layout()
+    _save_chart(fig, out_dir, filename)
+    return filename
+
+
+def _save_metric_violin(run_plot_df, run_opts, run_color_map, run_label_map, out_dir, filename, metric, title):
+    """Distribution of every dataset/run observation, independent of aggregation."""
+    data_violin = [run_plot_df[run_plot_df["GrupoGrafica"] == opt][metric].dropna().values for opt in run_opts]
+    fig, ax = plt.subplots(figsize=(max(12, 0.85 * len(run_opts) + 5), 6.5))
+    for position, (values, opt) in enumerate(zip(data_violin, run_opts), start=1):
+        if values.size > 1 and np.ptp(values) > 0:
+            parts = ax.violinplot([values], positions=[position], showmeans=False, showmedians=False, widths=0.78)
+            body = parts["bodies"][0]
+            body.set_facecolor(run_color_map.get(opt, "#888"))
+            body.set_edgecolor(run_color_map.get(opt, "#888"))
+            body.set_alpha(0.22)
+    for i, (opt, values) in enumerate(zip(run_opts, data_violin), start=1):
+        if values.size == 0:
+            continue
+        jitter = np.linspace(-0.08, 0.08, values.size) if values.size > 1 else np.array([0.0])
+        ax.scatter(np.full(values.size, i) + jitter, values, color=run_color_map.get(opt, "#888"), edgecolor="white", linewidth=0.5, s=35, zorder=3)
+        mean_val = float(np.nanmean(values))
+        median_val = float(np.nanmedian(values))
+        ax.scatter(i, mean_val, marker="D", color="black", edgecolor="white", linewidth=1.2, s=140, zorder=4)
+        ax.hlines(median_val, i - 0.25, i + 0.25, colors="black", linestyles="--", linewidth=1.2)
+        ax.text(i, mean_val + 0.018, f"{mean_val:.3f}", ha="center", va="bottom", fontsize=8, color="#333")
+    ax.set_xticks(range(1, len(run_opts) + 1))
+    ax.set_xticklabels([run_label_map.get(o, o) for o in run_opts], rotation=35, ha="right")
+    ax.set_ylabel(title)
+    ax.set_ylim(0.0, 1.08)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(
+        handles=[
+            plt.Line2D([0], [0], marker="D", color="w", markerfacecolor="#555", label="Mean"),
+            plt.Line2D([0], [0], color="#555", linestyle="--", label="Median"),
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#555", label="Value per dataset/run"),
+        ],
+        loc="lower right",
+        framealpha=0.9,
+    )
+    fig.tight_layout()
+    _save_chart(fig, out_dir, filename)
+    return filename
+
+
+def generate_accuracy_charts(results_struct, args, out_dir, opt_order):
+    saved = []
+    representative = generate_plot_dataframe(results_struct, args)
+    for estimator in dict.fromkeys(PLOT_ESTIMATORS):
+        selected = representative[representative["Estimador"].astype(str).str.lower() == estimator]
+        plot_df, opts, colors, labels = prepare_plot_groups(selected, opt_order)
+        if not opts:
+            continue
+        relative_dir = "" if estimator == "knn" else "individual"
+        metric_dir = os.path.join(out_dir, relative_dir)
+        os.makedirs(metric_dir, exist_ok=True)
+        filename = _save_metric_heatmap(
+            plot_df, opts, labels, metric_dir, f"06_heatmap_accuracy_{estimator}.png",
+            "AS_test", "Accuracy (test)",
+        )
+        saved.append(os.path.join(relative_dir, filename))
+        runs = build_run_level_dataframe(results_struct, args, estimator)
+        run_df, run_opts, run_colors, run_labels = prepare_plot_groups(runs, opt_order)
+        if run_opts:
+            filename = _save_metric_violin(
+                run_df, run_opts, run_colors, run_labels, metric_dir,
+                f"07_violin_accuracy_{estimator}.png", "AS_test", "Accuracy (test)",
+            )
+            saved.append(os.path.join(relative_dir, filename))
+    return saved
+
+
+def generate_secondary_metric_charts(results_struct, args, out_dir, opt_order):
+    """Keep the existing KNN F1/recall panels independent of global selection."""
+    if "knn" not in PLOT_ESTIMATORS:
+        return []
+    representative = generate_plot_dataframe(results_struct, args)
+    selected = representative[representative["Estimador"].astype(str).str.lower() == "knn"]
+    plot_df, opts, _, labels = prepare_plot_groups(selected, opt_order)
+    if not opts:
+        return []
+    metric_dir = os.path.join(out_dir, "individual")
+    os.makedirs(metric_dir, exist_ok=True)
+    saved = [_save_metric_heatmap(
+        plot_df, opts, labels, metric_dir, "06_heatmap_f1_knn.png", "F1_test", "F1-Score (test)",
+    )]
+    runs = build_run_level_dataframe(results_struct, args, "knn")
+    run_df, run_opts, colors, run_labels = prepare_plot_groups(runs, opt_order)
+    if run_opts:
+        saved.append(_save_metric_violin(
+            run_df, run_opts, colors, run_labels, metric_dir,
+            "07_violin_recall_knn.png", "RS_test", "Recall (test)",
+        ))
+    return [os.path.join("individual", name) for name in saved]
+
+
+def generate_seven_global_charts(
+    df: pd.DataFrame,
+    results_struct: Dict[str, Dict],
+    out_dir: str,
+    opt_order: List[str],
+    args: argparse.Namespace,
+    *,
+    estimator_filter: str,
+):
+    """Compatibility entry point for the shared nine-figure publication pipeline."""
+    from reporting.figures import report_from_results, generate
+    if df.empty:
+        return []
+    selected = set(zip(df["Archivo"], df["Configuracion"]))
+    results = {dataset: {label: row for label, row in rows.items() if (dataset, label) in selected}
+               for dataset, rows in results_struct.items()}
+    results = {dataset: rows for dataset, rows in results.items() if rows}
+    plot_args = argparse.Namespace(**{**vars(args), "optimizers": list(opt_order),
+                                     "plot_global_estimator": estimator_filter.lower()})
+    report = report_from_results(plot_args, results)
+    generated = []
+    skipped = generate(report, out_dir, generated=generated)
+    for item in skipped:
+        print(f"[plot-skipped] {item['output']}: {item['reason']}", flush=True)
+    return generated
+
+def generate_global_accuracy_boxplot(df, out_dir, opt_order):
+
+    plot_df, opts, color_map, label_map = prepare_plot_groups(df, opt_order)
+
+    fig, ax = plt.subplots(
+        figsize=(max(12, 0.8 * len(opts) + 5), 6)
+    )
+
+    data_box = [
+        plot_df[plot_df["GrupoGrafica"] == opt]["AS_test"].values
+        for opt in opts
+    ]
+
+    bp = ax.boxplot(
+        data_box,
+        patch_artist=True,
+        widths=0.55,
+        showmeans=True
+    )
+
+    for patch, opt in zip(bp["boxes"], opts):
+
+        patch.set_facecolor(color_map.get(opt, "#888"))
+        patch.set_alpha(0.70)
+
+        if label_map.get(opt) == "MaCRO-DE":
+            patch.set_edgecolor("black")
+            patch.set_linewidth(3.0)
+
+    for i, opt in enumerate(opts):
+
+        vals = plot_df[
+            plot_df["GrupoGrafica"] == opt
+        ]["AS_test"]
+
+        if len(vals) > 0:
+            ax.text(
+                i + 1,
+                np.mean(vals) + 0.01,
+                f"{np.mean(vals):.3f}",
+                ha="center",
+                fontsize=10,
+                fontweight="bold"
+            )
+
+    ax.set_ylabel("Accuracy (test)")
+    ax.set_xlabel("Metaheuristics")
+    ax.set_ylim(0.50, 1.05)
+
+    ax.set_xticks(range(1, len(opts)+1))
+    ax.set_xticklabels(
+        [label_map[o] for o in opts],
+        rotation=45,
+        ha="right"
+    )
+
+    ax.grid(axis="y", alpha=0.3)
+
+    fig.tight_layout()
+
+    _save_chart(
+        fig,
+        out_dir,
+        "08_global_accuracy_distribution.png"
+    )
+
+def generate_global_features_runtime(df, out_dir, opt_order):
+
+    plot_df, opts, color_map, label_map = prepare_plot_groups(df, opt_order)
+
+    feat_med = (
+        plot_df.groupby("GrupoGrafica")
+        ["N_Features_Selected"]
+        .mean()
+    )
+
+    rt_med = (
+        plot_df.groupby("GrupoGrafica")
+        ["Runtime"]
+        .mean()
+    )
+
+    feat_vals = [feat_med[o] for o in opts]
+    rt_vals   = [rt_med[o] for o in opts]
+
+    x = np.arange(len(opts))
+    w = 0.38
+
+    fig, ax1 = plt.subplots(figsize=(12,6))
+
+    ax2 = ax1.twinx()
+
+    bars1 = ax1.bar(
+        x - w/2,
+        feat_vals,
+        w,
+        alpha=0.85
+    )
+
+    bars2 = ax2.bar(
+        x + w/2,
+        rt_vals,
+        w,
+        alpha=0.45,
+        hatch="///"
+    )
+
+    for bar, opt in zip(bars1, opts):
+
+        bar.set_color(color_map.get(opt, "#888"))
+
+        if label_map.get(opt) == "MaCRO-DE":
+            bar.set_edgecolor("black")
+            bar.set_linewidth(3)
+
+    for bar, opt in zip(bars2, opts):
+
+        bar.set_color(color_map.get(opt, "#888"))
+
+        if label_map.get(opt) == "MaCRO-DE":
+            bar.set_edgecolor("black")
+            bar.set_linewidth(3)
+
+    for i, v in enumerate(feat_vals):
+
+        ax1.text(
+            i - w/2,
+            v + 0.2,
+            f"{v:.2f}",
+            ha="center",
+            fontsize=9,
+            fontweight="bold"
+        )
+
+    for i, v in enumerate(rt_vals):
+
+        ax2.text(
+            i + w/2,
+            v + 0.5,
+            f"{v:.1f}s",
+            ha="center",
+            fontsize=9
+        )
+
+    ax1.set_ylabel("Average selected features")
+    ax2.set_ylabel("Average runtime (sec)")
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(
+        [label_map[o] for o in opts],
+        rotation=45,
+        ha="right"
+    )
+
+    ax1.grid(axis="y", alpha=0.3)
+
+    fig.tight_layout()
+
+    _save_chart(
+        fig,
+        out_dir,
+        "09_global_features_runtime_tradeoff.png"
+    )
+
+def export_reporting_outputs(paths, args, dataset_names, results_struct, statistical_results):
+    """The same complete set of derived outputs for fresh and cached results."""
+    selected_estimators = [e for e in args.estimators if e in PLOT_ESTIMATORS]
+    if not selected_estimators:
+        raise ValueError("PLOT_ESTIMATORS must include at least one experiment classifier for reporting.")
+
+    def selected_results(source):
+        return {
+            dataset: {
+                label: row for label, row in rows.items()
+                if (parse_result_label(label, args)["estimator"] or row.get("Estimator", "")
+                    or (args.estimators[0] if len(args.estimators) == 1 else "")).lower() in selected_estimators
+            }
+            for dataset, rows in source.items()
+        }
+
+    results_struct = selected_results(results_struct)
+    statistical_results = selected_results(statistical_results)
+    # A reporting-only copy leaves experiment arguments and cache identity untouched.
+    args = argparse.Namespace(**{**vars(args), "estimators": selected_estimators})
+    excel_path = os.path.join(paths.res_dir, f"Global_Results_{paths.exp_tag}.xlsx")
+    exported = export_global_excel(results_struct, dataset_names, excel_path)
+    statistical_path = os.path.join(paths.res_dir, f"Statistical_Results_{paths.exp_tag}.xlsx")
+    export_statistical_excel(statistical_results, dataset_names, list(args.optimizers), args, statistical_path)
+    analysis_path = os.path.join(paths.res_dir, f"Full_Friedman_Analysis_{paths.exp_tag}.xlsx")
+    export_friedman_analysis(statistical_results, dataset_names, list(args.optimizers), args, analysis_path)
+    print(f"Global results: {', '.join(exported)}")
+    print(f"Statistical results: {statistical_path}")
+    print(f"Friedman analysis: {analysis_path}")
+    summary_df = generate_summary_dataframe(results_struct, args)
+    summary_csv = os.path.join(paths.res_dir, f"RESUMEN_GRAFICAS_{paths.exp_tag}.csv")
+    summary_df.to_csv(summary_csv, index=False)
+    generated_charts = generate_seven_global_charts(
+        generate_plot_dataframe(results_struct, args),
+        results_struct,
+        os.path.join(paths.fig_dir, "full"),
+        list(args.optimizers),
+        args,
+        estimator_filter=getattr(args, "plot_global_estimator", PLOT_GLOBAL_ESTIMATOR),
+    )
+    from reporting.figures import report_from_results
+    from reporting.statistics import export as export_matched_statistics
+    statistical_report = report_from_results(args, statistical_results)
+    export_matched_statistics(statistical_report,
+                              os.path.join(paths.fig_dir, "full", "statistics"),
+                              os.path.join(paths.res_dir, "statistics"))
+    return exported, summary_csv, generated_charts
+
+
+def regenerate_figures_from_cache(paths: Paths, args: argparse.Namespace, dataset_names: List[str], cache_sig: str | Dict[str, str]):
+    statistical_results = {}
+    results_struct = load_results_from_cache(paths, args, dataset_names, cache_sig, statistical_results=statistical_results)
+    _, summary_csv, generated_charts = export_reporting_outputs(
+        paths, args, dataset_names, results_struct, statistical_results,
+    )
+    return summary_csv, generated_charts
+
+
+def _summary_value(items: List[str], label_func=str) -> str:
+    return ", ".join(label_func(item) for item in items)
+
+
+def print_experiment_summary(args: argparse.Namespace, paths: Paths, dataset_names: List[str], cache_sig: str | Dict[str, str], miafex_csv_path: Dict[str, Dict[str, str]] | None):
+    print("=" * 60)
+    print(" MIAFEx + Metaheuristic Feature Selection Framework")
+    print("=" * 60)
+    print(f"{'Experiment':<18}: {paths.exp_tag}")
+    print(f"{'Dataset source':<18}: {args.dataset_source}")
+    print(f"{'Pipeline mode':<18}: {args.pipeline_mode}")
+    if args.dataset_source == "mafese":
+        print(f"{'Dataset suite':<18}: {args.dataset_suite} ({len(dataset_names)} datasets)")
+        print(f"{'Datasets':<18}: {_summary_value(dataset_names)}")
+    else:
+        print(f"{'Datasets':<18}: {_summary_value(dataset_names)}")
+        print(f"{'MIAFEx training':<18}: {args.train_miafex}")
+        print(f"{'Feature extraction':<18}: {args.extract_miafex}")
+        print(f"{'MIAFEx epochs':<18}: {args.miafex_epochs} (neural-network training)")
+        for name, csv_paths in (miafex_csv_path or {}).items():
+            for split, csv_path in csv_paths.items():
+                print(f"{'Features CSV':<18}: {name}/{split} -> {csv_path}")
+    print(f"{'Optimizers':<18}: {_summary_value(args.optimizers, optimizer_display_label)}")
+    print(f"{'Classifiers':<18}: {_summary_value(args.estimators, lambda x: str(x).upper())}")
+    print(f"{'Transfer functions':<18}: {_summary_value(args.transfer_functions, lambda x: str(x).upper())}")
+    print(f"{'Runs':<18}: {args.runs}")
+    print(f"{'FS iterations':<18}: {args.epochs} (metaheuristic)")
+    print(f"{'Population':<18}: {args.pop_size}")
+    print(f"{'Parallel':<18}: {args.parallel}")
+    print(f"{'Worker limit':<18}: {args.n_workers}")
+    print(f"{'Cache source EXP':<18}: {args.reuse_cache_from_exp_id}")
+    print(f"{'Cache signature':<18}: {cache_sig}")
+    print("=" * 60)
+
+
+def framework_main():
+    started_at = time.monotonic()
+    args = parse_args()
+    print(f"EXP_ID: {args.exp_id}")
+    print(f"MIAFEX_ARTIFACT_TAG: {args.miafex_artifact_tag}")
+    print(f"MIAFEx checkpoint root: {args.miafex_checkpoint_root}")
+    print(f"MIAFEx feature-dataset root: {args.feature_dataset_root}")
+    print(f"MIAFEx provenance root: {args.miafex_provenance_root}")
+    logging.disable(logging.INFO)
+    logging.getLogger("mealpy").setLevel(logging.WARNING)
+
+    if args.report_only:
+        from reporting.core import run_report, run_full_figures
+        if args.figures_only:
+            return run_full_figures(args)
+        return run_report(args)
+
+    if args.exp_id == 604:
+        raise ValueError("EXP604 is read-only. Use a new EXP ID for scientific execution.")
+
+    execution_config = resolve_execution_config(args)
+    print_backend_report(execution_config)
+    validate_execution_config(execution_config)
+    args.miafex_device = execution_config.miafex_device
+
+    if args.show_backends:
+        return
+
+    if args.list_miafex_datasets:
+        print_miafex_datasets(discover_miafex_datasets(args.miafex_dataset_root), args.miafex_dataset_root)
+        return
+    if args.list_optimizers:
+        print(list_available_optimizers())
+        return
+
+    paths = make_paths(args)
+    if args.dataset_source == "miafex" and args.pipeline_mode in {"full", "extract"} and not args.figures_only:
+        audit_miafex_datasets(args)
+
+    if args.pipeline_mode == "extract":
+        if args.dataset_source != "miafex":
+            raise ValueError("--pipeline-mode extract requires --dataset-source miafex; MAFESE already supplies feature datasets.")
+        if args.figures_only:
+            raise ValueError("--figures-only cannot be combined with --pipeline-mode extract.")
+    else:
+        validate_selection_options(args)
+        args.optimizers = resolve_optimizers(args)
+        if args.runs < 1:
+            raise ValueError("--runs debe ser >= 1")
+        if args.n_workers < 1:
+            raise ValueError("--n-workers debe ser >= 1")
+
+    if args.dataset_source == "mafese":
+        dataset_names = resolve_mafese_dataset_names(args)
+        miafex_csv_path = None
+        cache_sig = build_cache_signature(args)
+    else:
+        metadata_args = argparse.Namespace(**vars(args))
+        if args.pipeline_mode != "extract":
+            # Resolve paths without requiring images to remain online for reporting.
+            metadata_args.figures_only = True
+            if (args.pipeline_mode == "full" and not args.figures_only
+                    and args.dataset_name is None and args.miafex_datasets is None and not args.dataset_root):
+                discovered = discover_miafex_datasets(args.miafex_dataset_root)
+                if discovered:
+                    metadata_args.miafex_datasets = sorted(discovered, key=str.lower)
+        dataset_args = resolve_miafex_dataset_args(metadata_args)
+        dataset_names = list(dataset_args)
+        miafex_csv_path = {name: miafex_feature_paths(scoped) for name, scoped in dataset_args.items()}
+        # Read-only validation also covers cache-complete reporting; all
+        # downstream repetitions consume this one fixed artifact version.
+        for scoped in dataset_args.values():
+            if args.pipeline_mode != "extract":
+                validation_args = argparse.Namespace(**{**vars(scoped), "pipeline_mode": "feature_selection"})
+                miafex_artifacts.validate_existing(validation_args, report=True)
+        if args.pipeline_mode == "extract":
+            for name, scoped in dataset_args.items():
+                miafex_csv_path[name] = resolve_miafex_csv(scoped)
+            print("Completed MIAFEx feature preparation; feature selection was not run.")
+            for name, csv_path in miafex_csv_path.items():
+                print(f"  {name}: {csv_path}")
+            return
+        cache_sig = {name: build_cache_signature(scoped) for name, scoped in dataset_args.items()}
+
+    show_tf = len(args.transfer_functions) > 1
+    show_cls = len(args.estimators) > 1
+
+    print_experiment_summary(args, paths, dataset_names, cache_sig, miafex_csv_path)
+
+    complete = not args.figures_only and experiment_cache_is_complete(
+        paths, args, dataset_names, cache_sig,
+        dataset_args if args.dataset_source == "miafex" else None,
+    )
+    if args.figures_only or complete:
+        if complete:
+            print("[experiment-complete] All requested run IDs are cached in the current EXP; "
+                  "skipping training, extraction and feature selection.")
+        summary_csv, generated_charts = regenerate_figures_from_cache(paths, args, dataset_names, cache_sig)
+        print("Completed cache-only reporting." if complete else "Completed figures-only.")
+        print(f"Cache dir: {paths.cache_dir}")
+        print(f"Figures dir: {paths.fig_dir}")
+        print(f"Charts summary CSV: {summary_csv}")
+        if generated_charts:
+            print("Charts:")
+            for name in generated_charts:
+                print(f"  - {os.path.join(paths.fig_dir, name)}")
+        return
+
+    # Load before neural preparation so convergence repairs reuse the original features.
+    cached_payloads = {}
+    convergence_repair_datasets = set()
+    for dataset_name in dataset_names:
+        signature = cache_sig[dataset_name] if isinstance(cache_sig, dict) else cache_sig
+        for estimator in args.estimators:
+            payload = resolve_cached_payload(
+                paths, dataset_args[dataset_name] if args.dataset_source == "miafex" else args,
+                dataset_name, estimator, signature,
+            ) or {}
+            cached_payloads[dataset_name, estimator] = payload
+            if any(any(cached_convergence_errors(row, args.epochs)) for row in payload.values()):
+                convergence_repair_datasets.add(dataset_name)
+
+    if args.dataset_source == "miafex":
+        # Retain normal discovery/validation and neural preparation when incomplete.
+        if not convergence_repair_datasets:
+            dataset_args = resolve_miafex_dataset_args(args)
+        for name, scoped in dataset_args.items():
+            if any(cached_payloads[name, est] for est in args.estimators):
+                # A repair must not retrain even the unaffected cached datasets.
+                scoped = argparse.Namespace(**{**vars(scoped), "pipeline_mode": "feature_selection"})
+                print(f"[cache] {name}: retaining prepared features for compatible recovered runs.")
+            miafex_csv_path[name] = resolve_miafex_csv(scoped)
+
+    results_struct = {}
+    statistical_results = {}
+    for dataset_name in dataset_names:
+        results_struct[dataset_name] = {}
+        statistical_results[dataset_name] = {}
+        if args.dataset_source == "mafese":
+            mafese_data = get_dataset(dataset_name)
+            if mafese_data is None:
+                raise ValueError(
+                    f"mafese no pudo cargar '{dataset_name}'. "
+                    "Verifica que exista en la suite 'test14' de mafese."
+                )
+            X = np.asarray(mafese_data.X, dtype=np.float64)
+            y = np.asarray(mafese_data.y).astype(np.int32)
+            data = Data(X, y)
+            try:
+                data.split_train_test(test_size=args.test_size, random_state=args.random_state, stratify=y)
+            except ValueError:
+                data.split_train_test(test_size=args.test_size, random_state=args.random_state)
+        else:
+            data = load_miafex_feature_data(miafex_csv_path[dataset_name])
+
+        for estimator in args.estimators:
+            cls_payload = dict(cached_payloads[dataset_name, estimator])
+            for method in args.optimizers:
+                for tf in args.transfer_functions:
+                    label = build_alg_label(method, tf, estimator, show_tf, show_cls)
+                    scoped = dataset_args[dataset_name] if args.dataset_source == "miafex" else args
+                    identity = build_combination_identity(scoped, dataset_name, estimator, method, tf)
+                    original = cls_payload.get(label, {})
+                    prev = prepare_cached_convergence(original, args.epochs)
+                    if prev is not original:
+                        if prev:
+                            cls_payload[label] = prev
+                        else:
+                            cls_payload.pop(label, None)
+                    acc_runs = list(np.asarray(prev.get("AccRuns", []), dtype=float))
+                    ps_runs = list(np.asarray(prev.get("PSRuns", []), dtype=float))
+                    rs_runs = list(np.asarray(prev.get("RSRuns", []), dtype=float))
+                    f1_runs = list(np.asarray(prev.get("F1Runs", []), dtype=float))
+                    fit_runs = list(np.asarray(prev.get("FitRuns", []), dtype=float))
+                    feat_runs = list(np.asarray(prev.get("FeatRuns", []), dtype=float))
+                    time_runs = list(np.asarray(prev.get("TimeRuns", []), dtype=float))
+                    curves = list(prev.get("CurvesAll", []))
+
+                    run_ids = completed_run_ids(prev)
+                    convergence_runs = dict(prev.get("ConvergenceRuns", {}))
+                    pending_runs = [run for run in range(args.runs) if run not in run_ids]
+                    progress_label = build_alg_label(optimizer_display_label(method), tf, estimator, show_tf, True)
+                    print(
+                        f"[resume] {dataset_name} | {progress_label} | completed={len(run_ids)}/{args.runs} | "
+                        f"recovered={format_run_ids(run_ids)} | missing={format_run_ids(pending_runs)}",
+                        flush=True,
+                    )
+                    if not pending_runs:
+                        if prev is not original:
+                            save_combination(paths, identity, prev)
+                        print(f"Running {dataset_name} | {label} | runs={args.runs} (already complete)")
+                        continue
+                    print(f"Running {dataset_name} | {label} | runs={args.runs} (recovered {len(run_ids)})", flush=True)
+
+                    def checkpoint_run(run, out):
+                        validate_convergence_curve(out["curve"], args.epochs, out["fit_final"])
+                        validate_convergence_metadata(out.get("convergence"), out["curve"], args.epochs)
+                        acc_runs.append(out["as_test"])
+                        ps_runs.append(out["ps_test"])
+                        rs_runs.append(out["rs_test"])
+                        f1_runs.append(out["f1_test"])
+                        fit_runs.append(out["fit_final"])
+                        feat_runs.append(out["n_features"])
+                        time_runs.append(out["runtime"])
+                        curves.append(out["curve"])
+                        run_ids.append(run)
+                        convergence_runs[run] = out["convergence"]
+
+                        cls_payload[label] = build_label_payload(
+                            estimator,
+                            acc_runs,
+                            ps_runs,
+                            rs_runs,
+                            f1_runs,
+                            fit_runs,
+                            feat_runs,
+                            time_runs,
+                            curves,
+                            args.epochs,
+                            completed_run_ids=run_ids,
+                            convergence_runs=convergence_runs,
+                        )
+                        save_combination(paths, identity, cls_payload[label])
+                        print(
+                            f"  {dataset_name} | {progress_label} | Run {run + 1:02d}/{args.runs} | "
+                            f"Accuracy={out['as_test']:.2f}% | F1={out['f1_test']:.4f} | "
+                            f"Fitness={out['fit_final']:.4f} | Features={out['n_features']} | "
+                            f"run time={out['runtime']:.2f}s | total elapsed={format_elapsed(time.monotonic() - started_at)}",
+                            flush=True,
+                        )
+
+                    if args.parallel == "yes" and len(pending_runs) > 1:
+                        print(f"  Parallel: yes | workers={min(args.n_workers, len(pending_runs))}")
+                        execute_pending_runs(
+                            data,
+                            estimator,
+                            method,
+                            tf,
+                            args,
+                            pending_runs,
+                            on_run_complete=checkpoint_run,
+                            dataset_name=dataset_name,
+                            completed_runs=len(run_ids),
+                            started_at=started_at,
+                        )
+                    else:
+                        for run in pending_runs:
+                            checkpoint_run(
+                                run,
+                                run_single(data, estimator, method, tf, args, args.seed_base + run),
+                            )
+
+                    cls_payload[label] = build_label_payload(
+                        estimator,
+                        acc_runs,
+                        ps_runs,
+                        rs_runs,
+                        f1_runs,
+                        fit_runs,
+                        feat_runs,
+                        time_runs,
+                        curves,
+                        args.epochs,
+                        completed_run_ids=run_ids,
+                        convergence_runs=convergence_runs,
+                    )
+                    save_combination(paths, identity, cls_payload[label])
+
+            results_struct[dataset_name].update(cls_payload)
+            statistical_results[dataset_name].update(statistical_classifier_rows(cls_payload, estimator, args))
+
+    exported, summary_csv, generated_charts = export_reporting_outputs(
+        paths, args, dataset_names, results_struct, statistical_results,
+    )
+    chart_dir = paths.fig_dir
+
+    print("Completed.")
+    print(f"Cache dir: {paths.cache_dir}")
+    print(f"Figures dir: {paths.fig_dir}")
+    print(f"Charts summary CSV: {summary_csv}")
+    print(f"Charts dir: {chart_dir}")
+    if generated_charts:
+        print("Notebook-style charts:")
+        for name in generated_charts:
+            print(f"  - {os.path.join(chart_dir, name)}")
+    print("Global results:")
+    for p in exported:
+        print(f"  - {p}")
+
+def main():
+    """Focused comparison; copied framework helpers remain available above."""
+    args = parse_args()
+    if args.show_backends:
+        print_backend_report(resolve_execution_config(args))
+        return
+    if args.list_miafex_datasets:
+        print_miafex_datasets(discover_miafex_datasets(args.miafex_dataset_root), args.miafex_dataset_root)
+        return
+    if args.list_optimizers:
+        print(list_available_optimizers())
+        return
+    logging.disable(logging.INFO)
+    logging.getLogger("mealpy").setLevel(logging.WARNING)
+    run_methodology_comparison(args)
+
+
+if __name__ == "__main__":
+    main()

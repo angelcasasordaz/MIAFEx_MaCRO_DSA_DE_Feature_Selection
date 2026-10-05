@@ -60,6 +60,7 @@ def jfs(xtrain, ytrain, opts):
     
     N        = opts['N']
     max_iter = opts['T']
+    verbose = opts.get("verbose", True)
     if 'w' in opts:
         w    = opts['w']
     if 'c1' in opts:
@@ -102,8 +103,9 @@ def jfs(xtrain, ytrain, opts):
         
         # Store result
         curve[0,t] = fitG.copy()
-        print("Iteration:", t + 1)
-        print("Best (PSO):", curve[0,t])
+        if verbose:
+            print("Iteration:", t + 1)
+            print("Best (PSO):", curve[0,t])
         t += 1
         
         for i in range(N):

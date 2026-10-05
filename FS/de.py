@@ -45,6 +45,7 @@ def jfs(xtrain, ytrain, opts):
     
     N        = opts['N']
     max_iter = opts['T']
+    verbose = opts.get("verbose", True)
     if 'CR' in opts:
         CR   = opts['CR'] 
     if 'F' in opts:
@@ -78,8 +79,9 @@ def jfs(xtrain, ytrain, opts):
     t     = 0
     
     curve[0,t] = fitG.copy()
-    print("Generation:", t + 1)
-    print("Best (DE):", curve[0,t])
+    if verbose:
+        print("Generation:", t + 1)
+        print("Best (DE):", curve[0,t])
     t += 1
 
     while t < max_iter:  
@@ -129,8 +131,9 @@ def jfs(xtrain, ytrain, opts):
                 
         # Store result
         curve[0,t] = fitG.copy()
-        print("Generation:", t + 1)
-        print("Best (DE):", curve[0,t])
+        if verbose:
+            print("Generation:", t + 1)
+            print("Best (DE):", curve[0,t])
         t += 1            
 
             
