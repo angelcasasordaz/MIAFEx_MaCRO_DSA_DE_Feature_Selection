@@ -15,7 +15,7 @@ import tempfile
 import time
 import warnings
 
-# Prepared artifacts and existing Python caches are read-only in this test main.
+# Keep existing Python caches read-only in this test main.
 sys.dont_write_bytecode = True
 
 import scientific_cache
@@ -109,7 +109,7 @@ def automatic_worker_count() -> int:
     return min(cpu_limit, ram_limit)
 
 # User-editable configuration: the active experiment used by PyCharm's Run action.
-# EXP610 internal fitness-weight diagnostic (prepared exp607 features only).
+# EXP610 internal fitness-weight diagnostic (prepare/reuse exp610_office features).
 EXPERIMENT_MODE = "sensitivity_weights"
 EXP_ID = 610
 
@@ -137,12 +137,12 @@ MAFESE_DATASET_SUITE = "test14"
 
 # MIAFEx artifacts and neural-network settings
 MIAFEX_DATASET_ROOT = "datasets"
-MIAFEX_ARTIFACT_TAG = "exp607"  # Neural artifact identity; independent of downstream EXP_ID.
+MIAFEX_ARTIFACT_TAG = "exp610_office"  # Neural artifact identity; independent of downstream EXP_ID.
 MIAFEX_CHECKPOINT_ROOT = f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}"
 FEATURE_DATASET_ROOT = f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}"
 MIAFEX_PROVENANCE_ROOT = f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}"
-MIAFEX_TRAIN = "no"  # Comparison consumes existing exp607 artifacts read-only.
-MIAFEX_EXTRACT = "no"
+MIAFEX_TRAIN = "auto"  # Prepare missing artifacts; reuse validated artifacts for this tag.
+MIAFEX_EXTRACT = "auto"
 MIAFEX_EPOCHS = 50  # Neural-network training epochs.
 MIAFEX_BATCH_SIZE = 8
 MIAFEX_LEARNING_RATE = 1e-4
@@ -4956,11 +4956,24 @@ def run_weight_ablation(output_root, workers, validate_only=False, resume=False)
     """Normal Run is incremental; --resume remains a backwards-compatible alias."""
     settings = ablation_settings()
     project = Path(__file__).resolve().parent
-    feature_dir = project / "datasets_features/miafex_exp607" / settings.dataset_name
-    paths = {split: str(feature_dir / f"{split}_features.csv") for split in ("train", "test")}
-    settings.train_features_csv, settings.test_features_csv = paths["train"], paths["test"]
     print_sensitivity_weight_configuration(settings)
     res_dir, fig_dir = ablation_output_dirs(output_root, require_empty=False)
+    preparation = parse_args([])
+    preparation.dataset_name = settings.dataset_name
+    # Validation stays read-only; normal Run prepares artifacts before loading.
+    preparation.pipeline_mode = "feature_selection" if validate_only else "full"
+    preparation.dataset_root = str(project / preparation.miafex_dataset_root / settings.dataset_name)
+    preparation.miafex_output = str(project / preparation.miafex_checkpoint_root / settings.dataset_name)
+    preparation.miafex_provenance_root = str(project / preparation.miafex_provenance_root)
+    feature_dir = project / preparation.feature_dataset_root / settings.dataset_name
+    preparation.train_features_csv = str(feature_dir / "train_features.csv")
+    preparation.test_features_csv = str(feature_dir / "test_features.csv")
+    if not validate_only:
+        execution_config = resolve_execution_config(preparation)
+        validate_execution_config(execution_config)
+        preparation.miafex_device = execution_config.miafex_device
+    paths = resolve_miafex_csv(preparation)
+    settings.train_features_csv, settings.test_features_csv = paths["train"], paths["test"]
     data = ablation_preflight(settings, paths)
     manifest = ablation_make_manifest(settings, paths, data)
     store = ablation_read_store(res_dir)
