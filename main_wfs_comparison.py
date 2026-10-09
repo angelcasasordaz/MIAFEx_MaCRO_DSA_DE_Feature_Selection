@@ -109,9 +109,8 @@ def automatic_worker_count() -> int:
     return min(cpu_limit, ram_limit)
 
 # User-editable configuration: the active experiment used by PyCharm's Run action.
-# EXP610 internal fitness-weight diagnostic (prepare/reuse exp610_office features).
-EXPERIMENT_MODE = "sensitivity_weights"
-EXP_ID = 610
+# EXP611 WFS-only comparison using the existing prepared feature partitions.
+EXP_ID = 611
 
 SENSITIVITY_WEIGHT_DATASET = "Histological_Biopsy"
 SENSITIVITY_WEIGHT_OPTIMIZERS = [
@@ -126,10 +125,11 @@ SENSITIVITY_WEIGHT_PAIRS = [
     (0.90, 0.10),
 ]
 
-# Shared framework settings below; the active diagnostic uses the block above.
+# Shared framework settings for the active WFS comparison.
 # Dataset and pipeline
 DATASET_SOURCE = "miafex"  # Options: "miafex", "mafese"
-PIPELINE_MODE = "feature_selection"  # Options: "extract", "feature_selection", "full"
+PIPELINE_MODE = "wfs_comparison"
+# Options: "extract", "feature_selection", "full", "wfs_comparison", "sensitivity_weights"
 MIAFEX_DATASETS = None
 # ["Brain_MRI"]
 # None: all valid discovered datasets.
@@ -137,11 +137,11 @@ MAFESE_DATASET_SUITE = "test14"
 
 # MIAFEx artifacts and neural-network settings
 MIAFEX_DATASET_ROOT = "datasets"
-MIAFEX_ARTIFACT_TAG = "exp610_office"  # Neural artifact identity; independent of downstream EXP_ID.
+MIAFEX_ARTIFACT_TAG = "exp611_office"  # Neural artifact identity; independent of downstream EXP_ID.
 MIAFEX_CHECKPOINT_ROOT = f"checkpoints/miafex_{MIAFEX_ARTIFACT_TAG}"
 FEATURE_DATASET_ROOT = f"datasets_features/miafex_{MIAFEX_ARTIFACT_TAG}"
 MIAFEX_PROVENANCE_ROOT = f"artifact_provenance/miafex_{MIAFEX_ARTIFACT_TAG}"
-MIAFEX_TRAIN = "auto"  # Prepare missing artifacts; reuse validated artifacts for this tag.
+MIAFEX_TRAIN = "auto"  # Prepare missing checkpoints; reuse validated artifacts for this tag.
 MIAFEX_EXTRACT = "auto"
 MIAFEX_EPOCHS = 50  # Neural-network training epochs.
 MIAFEX_BATCH_SIZE = 8
@@ -154,9 +154,8 @@ OPTIMIZERS = ["DE", "PSO", "MaCRO-DE-t", "MaCRO-DE-t-v2"]
 ESTIMATORS = ["knn"]
 TRANSFER_FUNCTIONS = ["vstf_01"]
 COMPARISON_ALGORITHMS = ("DE", "PSO", "MaCRO-DE-t", "MaCRO-DE-t-v2")
-COMPARISON_METHODS = tuple(f"{family}-{algorithm}" for family in ("MAFESE", "WFS")
-                           for algorithm in COMPARISON_ALGORITHMS)
-COMPARISON_PAIRS = {algorithm: [f"MAFESE-{algorithm}", f"WFS-{algorithm}"]
+COMPARISON_METHODS = tuple(f"WFS-{algorithm}" for algorithm in COMPARISON_ALGORITHMS)
+COMPARISON_PAIRS = {algorithm: [f"WFS-{algorithm}"]
                     for algorithm in COMPARISON_ALGORITHMS}
 WFS_ADAPTERS = {"DE": wfs_de_jfs, "PSO": wfs_pso_jfs,
                 "MaCRO-DE-t": wfs_macro_de_t_jfs, "MaCRO-DE-t-v2": wfs_macro_de_t_v2_jfs}
@@ -419,8 +418,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     general = parser.add_argument_group("General")
     general.add_argument("--exp-id", type=int, default=EXP_ID, help="ID numerico del experimento")
     general.add_argument("--output-root", default=OUTPUT_ROOT, help="Raiz para Figures/Results")
-    general.add_argument("--pipeline-mode", default=PIPELINE_MODE, choices=["extract", "feature_selection", "full"],
-                         help="extract: prepare/reuse features only; feature_selection: existing CSVs only; full: both stages")
+    general.add_argument("--pipeline-mode", default=PIPELINE_MODE,
+                         choices=["extract", "feature_selection", "full", "wfs_comparison", "sensitivity_weights"],
+                         help="extract: prepare/reuse features only; feature_selection: existing CSVs only; full: both stages; wfs_comparison: native WFS comparison; sensitivity_weights: EXP610 diagnostic")
+    general.add_argument("--validate-only", action="store_true",
+                         help="Sensitivity diagnostic: read-only preflight without expensive runs or outputs")
+    general.add_argument("--resume", action="store_true",
+                         help="Sensitivity diagnostic compatibility alias; incremental resume is automatic")
 
     dataset = parser.add_argument_group("Dataset")
     dataset.add_argument("--dataset-source", default=DATASET_SOURCE, choices=["mafese", "miafex"], help="Origen de datasets")
@@ -1398,28 +1402,26 @@ def run_wfs_comparison(data: Data, algorithm: str, args: argparse.Namespace, see
 
 
 def validate_comparison_options(args: argparse.Namespace) -> None:
-    """Keep this entry point on the requested science and isolated EXP609 outputs."""
-    if args.exp_id != 609:
-        raise ValueError("The methodology comparison requires EXP_ID=609.")
+    """Keep this entry point on native WFS science and isolated EXP611 outputs."""
+    if args.exp_id != 611:
+        raise ValueError("The WFS comparison requires EXP_ID=611.")
     if args.dataset_source != "miafex" or args.pipeline_mode != "feature_selection":
         raise ValueError("The comparison requires prepared MIAFEx CSVs in feature_selection mode.")
-    if args.miafex_artifact_tag != "exp607":
-        raise ValueError("The comparison requires the existing exp607 MIAFEx artifacts.")
+    if args.miafex_artifact_tag != MIAFEX_ARTIFACT_TAG:
+        raise ValueError(f"The comparison requires the existing {MIAFEX_ARTIFACT_TAG} MIAFEx artifacts.")
     if args.train_miafex != "no" or args.extract_miafex != "no":
         raise ValueError("The comparison requires --train-miafex no and --extract-miafex no.")
     if args.reuse_cache or args.reuse_cache_from_exp_id is not None:
-        raise ValueError("Framework cache switches must remain disabled; comparison cache reuse is read-only.")
+        raise ValueError("Framework cache switches must remain disabled; WFS checkpoints resume automatically.")
     if (args.optimizers != list(COMPARISON_ALGORITHMS) or args.estimators != ["knn"]
             or args.transfer_functions != ["vstf_01"]):
         raise ValueError("The comparison requires DE, PSO, MaCRO-DE-t, MaCRO-DE-t-v2, knn and vstf_01.")
     if args.ml_backend == "cuml":
-        raise ValueError("Both comparison methodologies require their existing scikit-learn estimators.")
+        raise ValueError("The WFS comparison requires its existing scikit-learn KNN estimator.")
     if (args.runs, args.epochs, args.pop_size, args.seed_base) != (20, 200, 30, 1234):
-        raise ValueError("EXP608 reuse requires runs=20, epochs=200, pop_size=30 and seed_base=1234.")
-    if (DEFAULT_FITNESS_ALPHA, DEFAULT_FITNESS_BETA, WFS_K) != (0.90, 0.10, 3):
-        raise ValueError("The comparison requires MAFESE fitness weights 0.90/0.10 and native WFS k=3.")
-    if "fs_problem" not in inspect.signature(MhaSelector.fit).parameters:
-        raise RuntimeError("Installed MAFESE must support RobustClassificationFeatureSelectionProblem via fs_problem.")
+        raise ValueError("EXP611 requires runs=20, epochs=200, pop_size=30 and seed_base=1234.")
+    if WFS_K != 3:
+        raise ValueError("The comparison requires native WFS k=3.")
 
 
 def comparison_source_hash(obj) -> str:
@@ -1610,7 +1612,7 @@ def validate_wfs_checkpoint(entry, identity, run_id):
     if not isinstance(row, dict):
         raise ValueError(f"{context}: missing raw result row.")
     expected = {"Dataset": identity["dataset"], "Method": identity["method"], "Run": run_id,
-                "Seed": identity["seeds"][run_id], "Source": "EXP609_WFS"}
+                "Seed": identity["seeds"][run_id], "Source": "EXP611_WFS"}
     if any(row.get(key) != value for key, value in expected.items()):
         raise ValueError(f"{context}: invalid checkpoint run/seed/source identity.")
     if any(not isinstance(row.get(key), (int, float)) or not np.isfinite(row[key])
@@ -1654,7 +1656,7 @@ def wfs_checkpoint_path(res_dir, identity, run_id):
     return os.path.join(res_dir, "wfs_runs", identity["dataset"], identity["method"], f"run_{run_id:03d}.json")
 
 
-def inspect_existing_comparison_csv(raw_csv, saved, mafese_saved):
+def inspect_existing_comparison_csv(raw_csv, saved):
     """Preserve completed local runs and reject rows lacking scientific evidence."""
     if not os.path.exists(raw_csv):
         return
@@ -1663,10 +1665,8 @@ def inspect_existing_comparison_csv(raw_csv, saved, mafese_saved):
         for row in reader:
             if row.get("Method") in tuple(f"WFS-{algorithm}" for algorithm in COMPARISON_ALGORITHMS):
                 checkpoint_records = saved
-            elif row.get("Method") in COMPARISON_METHODS and row.get("Source") == "EXP609_MAFESE":
-                checkpoint_records = mafese_saved
             else:
-                continue  # Legacy MAFESE rows require a validated scientific source.
+                continue  # Unselected methods remain preserved in the archived CSV.
             key = row.get("Dataset"), row["Method"]
             if key not in checkpoint_records:
                 continue  # Unselected datasets remain preserved in the archived CSV.
@@ -1703,7 +1703,7 @@ def atomic_comparison_csv(path, frame):
 
 
 def write_comparison_tables(res_dir, rows):
-    # Rebuilt from read-only MAFESE sources and durable WFS checkpoints, never a restart cache.
+    # Rebuilt from durable WFS checkpoints, never a restart cache.
     frame = pd.DataFrame(rows, columns=COMPARISON_COLUMNS)
     order = {method: index for index, method in enumerate(COMPARISON_METHODS)}
     frame = frame.assign(_method_order=frame["Method"].map(order)).sort_values(
@@ -1720,7 +1720,7 @@ def write_comparison_tables(res_dir, rows):
 
 
 def plot_methodology_comparison(fig_dir, dataset, records, histories, epochs):
-    """Use saved histories only; fitness axes are separate for the two methodologies."""
+    """Use saved native WFS histories only."""
     colors = dict(zip(COMPARISON_METHODS,
                       ("#245781", "#16817A", "#654982", "#536D22",
                        "#B65336", "#A98016", "#9B4265", "#476D79")))
@@ -1753,7 +1753,7 @@ def plot_methodology_comparison(fig_dir, dataset, records, histories, epochs):
             ax.grid(axis="y", color="#D7D7D7", linewidth=0.6, alpha=0.65)
             publish(fig, f"{method.lower().replace('-', '_')}_convergence")
 
-        for family in ("WFS", "MAFESE"):
+        for family in ("WFS",):
             methods = [method for method in COMPARISON_METHODS if method.startswith(f"{family}-")]
             fig, ax = plt.subplots(figsize=(8.5, 4.8), layout="constrained")
             for method in methods:
@@ -1796,7 +1796,7 @@ def plot_methodology_comparison(fig_dir, dataset, records, histories, epochs):
         fig, axes = plt.subplots(2, 2, figsize=(15, 10), layout="constrained")
         for ax, (metric, label) in zip(axes.flat, metrics):
             draw_metric(ax, metric, label)
-        fig.suptitle(f"{dataset} — final methodology comparison (20 runs; mean ± SD)")
+        fig.suptitle(f"{dataset} — final WFS comparison (20 runs; mean ± SD)")
         publish(fig, "final_comparison")
 
 
@@ -1867,31 +1867,10 @@ def run_methodology_comparison(args: argparse.Namespace) -> None:
     for destination in (res_dir, fig_dir):
         reject_comparison_redirect(destination)
 
-    rows, histories, mafese_sources, identities, saved = [], {}, {}, {}, {}
-    mafese_saved = {}
-    # Search/validate every source and checkpoint before any computation or output.
+    rows, histories, identities, saved = [], {}, {}, {}
+    # Validate every WFS checkpoint before any computation or output.
     for dataset, scoped in dataset_args.items():
-        histories[dataset], mafese_sources[dataset] = {}, {}
-        for algorithm in COMPARISON_ALGORITHMS:
-            method = f"MAFESE-{algorithm}"
-            imported, curves, source = find_mafese_results(scoped, dataset, algorithm)
-            if algorithm not in ("DE", "PSO"):
-                local, local_curves, files = read_mafese_checkpoints(
-                    res_dir, dataset, method, source["identity"])
-                for run, row in local.items():
-                    if run in imported and (any(imported[run][metric] != row[metric]
-                                               for metric in COMPARISON_METRICS)
-                                            or not np.array_equal(curves[run], local_curves[run])):
-                        raise ValueError(f"{dataset}/{method}/{run}: conflicting compatible run evidence; preserved.")
-                    if run not in imported:
-                        imported[run], curves[run] = row, local_curves[run]
-                source["files"].update(files)
-                if files and "EXP609" not in source["origin"]:
-                    source["origin"] += "; EXP609"
-            rows.extend(imported.values())
-            histories[dataset][method] = curves
-            mafese_sources[dataset][method] = source
-            mafese_saved[dataset, method] = imported, curves
+        histories[dataset] = {}
         for algorithm in COMPARISON_ALGORITHMS:
             identity = wfs_comparison_identity(scoped, dataset, algorithm)
             key = dataset, identity["method"]
@@ -1903,11 +1882,11 @@ def run_methodology_comparison(args: argparse.Namespace) -> None:
             records, curves = saved[key]
             rows.extend(records.values())
             histories[dataset][identity["method"]] = curves
-    inspect_existing_comparison_csv(raw_csv, saved, mafese_saved)
-    missing = [(dataset, method, run) for (dataset, method), (records, _) in {**saved, **mafese_saved}.items()
+    inspect_existing_comparison_csv(raw_csv, saved)
+    missing = [(dataset, method, run) for (dataset, method), (records, _) in saved.items()
                for run in range(args.runs) if run not in records]
     if (args.figures_only or args.report_only) and missing:
-        raise ValueError(f"Reporting needs completed results for all eight methods; missing {missing}. No optimization in reporting mode.")
+        raise ValueError(f"Reporting needs completed results for all four WFS methods; missing {missing}. No optimization in reporting mode.")
 
     for destination in (res_dir, fig_dir):
         os.makedirs(destination, exist_ok=True)
@@ -1926,11 +1905,11 @@ def run_methodology_comparison(args: argparse.Namespace) -> None:
             reject_comparison_redirect(os.path.join(res_dir, name))
         scientific_cache.atomic_json(os.path.join(res_dir, "comparison_manifest.json"), {
             "schema": WFS_RESUME_VERSION, "experiment": exp_tag, "methods": COMPARISON_METHODS,
-            "method_pairs": COMPARISON_PAIRS, "mafese_sources": mafese_sources,
+            "method_pairs": COMPARISON_PAIRS,
             "wfs_identities": {dataset: {f"WFS-{algorithm}": identities[dataset, f"WFS-{algorithm}"]
                                         for algorithm in COMPARISON_ALGORITHMS} for dataset in dataset_args},
-            "fitness_note": "MAFESE and WFS raw fitness/convergence are methodology-specific and not directly comparable.",
-            "metrics_note": "MAFESE native values/averaging are preserved (including new runs). WFS Precision/Recall/F1 use weighted averaging.",
+            "fitness_note": "All four methods use the unchanged native WFS objective and binary threshold.",
+            "metrics_note": "WFS Precision/Recall/F1 use weighted averaging; accuracy is reported in percent.",
             "adapters_note": "Original MaCRO search dynamics execute unchanged; only WFS evaluation, binary interface and output format are adapted.",
             "std": "sample standard deviation (ddof=1)",
         })
@@ -1940,55 +1919,20 @@ def run_methodology_comparison(args: argparse.Namespace) -> None:
                                              for run, curve in curves.items()}
                                     for method, curves in methods.items()}
                           for dataset, methods in histories.items()},
-            "note": "Native samples only; fitness scales remain separate by methodology.",
+            "note": "Native WFS samples only; all methods share the WFS fitness scale.",
         })
         write_comparison_tables(res_dir, rows)
 
     publish_saved_outputs()
-    print("MAFESE native values/averaging are preserved; WFS reports weighted Precision/Recall/F1.")
-    print("Fitness and convergence are methodology-specific; their raw values are not directly comparable.")
+    print("WFS reports weighted Precision/Recall/F1 and accuracy in percent.")
+    print("All four methods use the unchanged native WFS fitness and threshold.")
     for dataset, scoped in dataset_args.items():
         data = None  # Load prepared partitions only when a permitted run is missing.
-        for algorithm in COMPARISON_ALGORITHMS:
-            method = f"MAFESE-{algorithm}"
-            records, curves = mafese_saved[dataset, method]
-            source = mafese_sources[dataset][method]
-            if records:
-                print(f"[{dataset}] {method} | REUSE {source['origin']} | {len(records)}/{args.runs} runs", flush=True)
-            for run_id in range(args.runs):
-                if run_id in records:
-                    continue
-                if algorithm in ("DE", "PSO"):
-                    raise RuntimeError("MAFESE-DE/PSO recomputation is disabled")
-                if data is None:
-                    data = load_miafex_feature_data(csv_paths[dataset])
-                seed = args.seed_base + run_id
-                print(f"[{dataset}] {method} | run {run_id + 1:02d}/{args.runs} | seed={seed}", flush=True)
-                result = run_single(data, "knn", algorithm, "vstf_01", scoped, seed)
-                metric_keys = ("as_test", "ps_test", "rs_test", "f1_test", "n_features", "fit_final", "runtime")
-                row = {"Dataset": dataset, "Run": run_id, "Seed": seed, "Method": method,
-                       "Source": "EXP609_MAFESE",
-                       **{metric: result[key] for metric, key in zip(COMPARISON_METRICS, metric_keys)}}
-                entry = {"schema": WFS_RESUME_VERSION, "identity": source["identity"], "row": row,
-                         "native_c": np.asarray(result["curve"]).tolist(), "convergence": result["convergence"]}
-                validated, curve = validate_mafese_checkpoint(entry, source["identity"], method, run_id)
-                checkpoint = mafese_checkpoint_path(res_dir, dataset, method, run_id)
-                reject_comparison_redirect(checkpoint)
-                if os.path.exists(checkpoint):
-                    raise FileExistsError(f"MAFESE checkpoint appeared during execution; preserving {checkpoint}.")
-                scientific_cache.atomic_json(checkpoint, entry)
-                records[run_id], curves[run_id] = validated, curve
-                source["files"][checkpoint] = scientific_cache.file_digest(checkpoint)
-                if "EXP609" not in source["origin"]:
-                    source["origin"] += "; EXP609"
-                rows.append(validated)
-                publish_saved_outputs()
-                print_comparison_result(dataset, method, run_id, args.runs, row)
         for algorithm in COMPARISON_ALGORITHMS:
             method = f"WFS-{algorithm}"
             records, curves = saved[dataset, method]
             if records:
-                print(f"[{dataset}] {method} | REUSE EXP609 | {len(records)}/20 runs", flush=True)
+                print(f"[{dataset}] {method} | REUSE {exp_tag} | {len(records)}/20 runs", flush=True)
             identity = identities[dataset, method]
             # Completed checkpoints (including WFS-DE run 01) never enter the pool.
             pending_runs = [run_id for run_id in range(args.runs) if run_id not in records]
@@ -2000,7 +1944,7 @@ def run_methodology_comparison(args: argparse.Namespace) -> None:
             def checkpoint_wfs_run(run_id, result):
                 seed = scoped.seed_base + run_id
                 row = {"Dataset": dataset, "Run": run_id, "Seed": seed, "Method": method,
-                       "Source": "EXP609_WFS", **{metric: result[metric] for metric in COMPARISON_METRICS}}
+                       "Source": "EXP611_WFS", **{metric: result[metric] for metric in COMPARISON_METRICS}}
                 entry = {"schema": WFS_RESUME_VERSION, "identity": identity, "row": row,
                          "native_c": result["NativeCurve"], "selected_features": result["SelectedFeatureIndexes"]}
                 validated, curve = validate_wfs_checkpoint(entry, identity, run_id)
@@ -4045,9 +3989,10 @@ def print_experiment_summary(args: argparse.Namespace, paths: Paths, dataset_nam
     print("=" * 60)
 
 
-def framework_main():
+def framework_main(args=None):
     started_at = time.monotonic()
-    args = parse_args()
+    if args is None:
+        args = parse_args()
     print(f"EXP_ID: {args.exp_id}")
     print(f"MIAFEX_ARTIFACT_TAG: {args.miafex_artifact_tag}")
     print(f"MIAFEx checkpoint root: {args.miafex_checkpoint_root}")
@@ -4334,8 +4279,7 @@ def framework_main():
     for p in exported:
         print(f"  - {p}")
 
-# Isolated diagnostic. The copied comparison/framework helpers above are not
-# entry points: no EXP cache, WFS, neural training or extraction path is called.
+# Isolated EXP610 diagnostic, selected through PIPELINE_MODE.
 ABLATION_NAME = f"FS_WEIGHT_ABLATION_{SENSITIVITY_WEIGHT_DATASET}"
 ABLATION_METRICS = ("Accuracy", "Precision", "Recall", "F1", "SelectedFeatures",
                     "SelectedFeatureRatio", "Fitness", "Runtime")
@@ -4357,7 +4301,7 @@ def print_sensitivity_weight_configuration(settings):
     """Show the active user-editable experiment before any preflight or runs."""
     print("=" * 60)
     print(f"EXP{EXP_ID}")
-    print(f"Mode: {EXPERIMENT_MODE}")
+    print("Mode: sensitivity_weights")
     print(f"Dataset: {SENSITIVITY_WEIGHT_DATASET}")
     print("Optimizers:")
     for optimizer in SENSITIVITY_WEIGHT_OPTIMIZERS:
@@ -4731,7 +4675,7 @@ def ablation_run_identity(manifest, row):
 
 def ablation_make_manifest(settings, paths, data):
     return {
-        "store_schema": 2, "experiment": f"EXP{EXP_ID}", "exp_id": EXP_ID, "mode": EXPERIMENT_MODE,
+        "store_schema": 2, "experiment": f"EXP{EXP_ID}", "exp_id": EXP_ID, "mode": "sensitivity_weights",
         "diagnostic": ABLATION_NAME, "purpose": "Internal fitness-weight diagnostic",
         "dataset": settings.dataset_name, "input_feature_count": data.X_train.shape[1],
         "prepared_partitions": {split: {"path": path, "sha256": scientific_cache.file_digest(path)}
@@ -5067,24 +5011,40 @@ def run_weight_ablation(output_root, workers, validate_only=False, resume=False)
 
 
 def main():
-    """Run only the isolated fitness-weight diagnostic from this test main."""
+    """Route the selected pipeline mode to its existing experiment protocol."""
     sys.dont_write_bytecode = True
-    parser = argparse.ArgumentParser(description="Histological_Biopsy MAFESE fitness-weight ablation")
-    parser.add_argument("--validate-only", action="store_true", help="Read-only preflight; no expensive runs or outputs")
-    parser.add_argument("--resume", action="store_true", help="Compatibility alias: incremental resume is automatic on normal Run")
-    parser.add_argument("--output-root", default=str(Path(__file__).resolve().parent),
-                        help="Fresh parent for separate Results/Figures diagnostic directories")
-    parser.add_argument("--n-workers", type=int, default=N_WORKERS,
-                        help="Independent run processes; 1 runs sequentially (science is fixed)")
-    args = parser.parse_args()
+    args = parse_args()
     if args.n_workers < 1:
-        parser.error("--n-workers must be positive")
+        raise ValueError("--n-workers must be positive")
     logging.disable(logging.INFO)
     logging.getLogger("mealpy").setLevel(logging.WARNING)
-    if EXPERIMENT_MODE == "sensitivity_weights":
-        run_weight_ablation(args.output_root, args.n_workers, args.validate_only, args.resume)
+    if args.pipeline_mode == "wfs_comparison":
+        # Prepare every selected dataset before the comparison consumes its CSVs.
+        # Reporting keeps its existing read-only requirement for prepared features.
+        preparation = argparse.Namespace(**{
+            **vars(args),
+            "pipeline_mode": "feature_selection" if args.figures_only or args.report_only else "full",
+        })
+        comparison = argparse.Namespace(**{
+            **vars(args), "pipeline_mode": "feature_selection",
+            "train_miafex": "no", "extract_miafex": "no",
+        })
+        validate_comparison_options(comparison)
+        execution_config = resolve_execution_config(preparation)
+        validate_execution_config(execution_config)
+        preparation.miafex_device = execution_config.miafex_device
+        dataset_args = resolve_miafex_dataset_args(preparation)
+        for scoped in dataset_args.values():
+            resolve_miafex_csv(scoped)
+        # Keep exactly the datasets selected for preparation, including on resume.
+        if comparison.dataset_name is None:
+            comparison.miafex_datasets = list(dataset_args)
+        return run_methodology_comparison(comparison)
+    elif args.pipeline_mode == "sensitivity_weights":
+        # The diagnostic selects full preparation or read-only feature selection internally.
+        return run_weight_ablation(args.output_root, args.n_workers, args.validate_only, args.resume)
     else:
-        parser.error(f"Unsupported EXP610 experiment mode: {EXPERIMENT_MODE}")
+        return framework_main(args)
 
 
 if __name__ == "__main__":
